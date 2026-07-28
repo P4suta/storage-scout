@@ -1,0 +1,62 @@
+[package]
+name = "storage-scout"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+authors = ["storage-scout contributors"]
+description = "Fast Windows disk-usage scanner and safety-first interactive build-artifact cleaner."
+keywords = ["disk-usage", "storage", "cli", "du", "cleanup"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+inquire = "0.7"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+wildcard_imports = "deny"
+mod_module_files = "deny"
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "warn"
+dbg_macro = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+allow_attributes_without_reason = "deny"
+
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+cargo_common_metadata = "allow"
+# `pub(crate)` in a private module is "redundant", but the alternative (`pub`)
+# trips the more valuable `unreachable_pub`. Keep `unreachable_pub`, drop this.
+redundant_pub_crate = "allow"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+missing_docs = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3

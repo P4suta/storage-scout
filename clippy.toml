@@ -1,0 +1,15 @@
+avoid-breaking-exported-api = false
+cognitive-complexity-threshold = 15
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250
+too-many-lines-threshold = 120
+trivial-copy-size-limit = 128
+pass-by-value-size-limit = 256
+
+# Tests legitimately use `unwrap`/`expect`/`panic`/`println`/`dbg` — gate them
+# only outside the test boundary.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true

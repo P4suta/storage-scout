@@ -1,0 +1,26 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@nextest
+      - name: Format
+        run: cargo fmt --check
+      - name: Test all targets with nextest
+        run: cargo nextest run --all-targets --all-features --profile ci
+      - name: Test documentation
+        run: cargo test --doc --all-features
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
