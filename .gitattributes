@@ -1,0 +1,4 @@
+# Keep LF in every checkout: rustfmt.toml enforces newline_style = "Unix",
+# and Windows CI runners default to core.autocrlf=true.
+* text=auto eol=lf
+*.exe binary
