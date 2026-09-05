@@ -5,7 +5,13 @@ use std::io::{self, Write};
 use serde::Serialize;
 
 use crate::artifact::ALL_KINDS;
-use crate::{CleanupPlan, CleanupStatus, CleanupSummary, RiskTier, ScanReport, Usage};
+use crate::{
+    AutoEvaluation, AutoPolicy, CleanupPlan, CleanupStatus, CleanupSummary, Decision, RiskTier,
+    ScanReport, Usage,
+};
+
+/// Program name and version, as printed at the top of human reports.
+const BANNER: &str = concat!("storage-scout ", env!("CARGO_PKG_VERSION"));
 
 /// Render any versioned storage-scout JSON document.
 ///
@@ -21,7 +27,7 @@ pub fn render_json<T: Serialize>(value: &T, out: &mut dyn Write) -> io::Result<(
 /// # Errors
 /// Returns output I/O errors.
 pub fn render_scan_human(report: &ScanReport, color: bool, out: &mut dyn Write) -> io::Result<()> {
-    writeln!(out, "storage-scout 0.2 — read-only scan")?;
+    writeln!(out, "{BANNER} — read-only scan")?;
     writeln!(
         out,
         "Roots: {}",
@@ -131,7 +137,16 @@ pub fn render_clean_human(
     } else {
         "dry-run (nothing deleted)"
     };
-    writeln!(out, "storage-scout 0.2 — {mode}")?;
+    writeln!(out, "{BANNER} — {mode}")?;
+    write_outcomes(plan, summary, color, out)
+}
+
+fn write_outcomes(
+    plan: &CleanupPlan,
+    summary: &CleanupSummary,
+    color: bool,
+    out: &mut dyn Write,
+) -> io::Result<()> {
     for outcome in &summary.outcomes {
         let status = match &outcome.status {
             CleanupStatus::DryRun => "would delete".to_owned(),
@@ -162,6 +177,83 @@ pub fn render_clean_human(
             Some(value) => writeln!(out, "Observed volume free-space increase: {value}")?,
             None => writeln!(out, "Observed volume free-space increase: unavailable")?,
         }
+    }
+    Ok(())
+}
+
+/// Render an unattended-cleanup evaluation and, when a plan was applied, its
+/// outcome.
+///
+/// # Errors
+/// Returns output I/O errors.
+pub fn render_auto_human(
+    policy: &AutoPolicy,
+    evaluation: &AutoEvaluation,
+    summary: Option<&CleanupSummary>,
+    color: bool,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let mode = match (&evaluation.decision, summary) {
+        (Decision::Idle { .. }, _) => "auto: idle",
+        (Decision::NoCandidates { .. }, _) => "auto: nothing eligible",
+        (Decision::Reclaim { .. }, Some(summary)) if summary.executed => "auto: executed cleanup",
+        (Decision::Reclaim { .. }, _) => "auto: dry-run (nothing deleted)",
+    };
+    writeln!(out, "{BANNER} — {mode}")?;
+    let trigger = &policy.trigger;
+    let target = trigger.target_free.map_or_else(
+        || "everything eligible".to_owned(),
+        |value| value.to_string(),
+    );
+    match &evaluation.decision {
+        Decision::Idle { free } => {
+            writeln!(
+                out,
+                "Volume {}: {free} free, at or above the {} trigger; nothing scanned.",
+                trigger.volume.display(),
+                trigger.min_free
+            )?;
+            return Ok(());
+        },
+        Decision::NoCandidates { free, deficit } | Decision::Reclaim { free, deficit, .. } => {
+            writeln!(
+                out,
+                "Volume {}: {free} free, below the {} trigger; target {target} (deficit {deficit}).",
+                trigger.volume.display(),
+                trigger.min_free
+            )?;
+        },
+    }
+    writeln!(
+        out,
+        "Considered {} candidates under {} roots ({} withheld).",
+        evaluation.candidates.len(),
+        policy.selection.roots.len(),
+        evaluation.withheld.len()
+    )?;
+    for withheld in &evaluation.withheld {
+        writeln!(
+            out,
+            "  withheld: {} ({})",
+            withheld.path.display(),
+            withheld.reason
+        )?;
+    }
+    let Decision::Reclaim {
+        selected,
+        projected_free,
+        ..
+    } = &evaluation.decision
+    else {
+        return Ok(());
+    };
+    writeln!(
+        out,
+        "Selected {} stalest candidates; projected free space {projected_free}.",
+        selected.len()
+    )?;
+    if let (Some(plan), Some(summary)) = (&evaluation.plan, summary) {
+        write_outcomes(plan, summary, color, out)?;
     }
     Ok(())
 }

@@ -11,7 +11,7 @@ use std::time::{Instant, UNIX_EPOCH};
 use rayon::prelude::*;
 
 use crate::artifact::{self, Evidence};
-use crate::safety::{self, is_reparse_point};
+use crate::safety::{self, Classification, is_reparse_point};
 use crate::windows::{self, FileIdentity};
 use crate::{
     ArtifactCandidate, Bytes, DirectoryUsage, MAX_ISSUES, Measure, SCHEMA_VERSION, ScanIssue,
@@ -253,22 +253,25 @@ fn walk(
     };
     collector.directory_count.fetch_add(1, Ordering::Relaxed);
 
-    let kind = if !inside_artifact && depth > 0 {
+    let classification = if !inside_artifact && depth > 0 {
         parent_evidence.and_then(|(parent_files, parent_dirs)| {
             let name = directory.file_name()?.to_str()?;
-            artifact::classify(
-                name,
-                &Evidence {
-                    parent_files: parent_files.clone(),
-                    parent_dirs: parent_dirs.clone(),
-                    child_files: entries.file_names.clone(),
-                },
-            )
+            let evidence = Evidence {
+                parent_files: parent_files.clone(),
+                parent_dirs: parent_dirs.clone(),
+                child_files: entries.file_names.clone(),
+                child_dirs: entries.directory_names.clone(),
+                cache_tag: safety::read_cache_tag(directory, &entries.file_names),
+            };
+            artifact::classify(name, &evidence).map(|kind| Classification {
+                kind,
+                provenance: artifact::provenance(&evidence),
+            })
         })
     } else {
         None
     };
-    let now_inside = inside_artifact || kind.is_some();
+    let now_inside = inside_artifact || classification.is_some();
 
     let mut local = measure_files(&entries.files, collector);
     let child_total = entries
@@ -286,8 +289,8 @@ fn walk(
         .reduce(|| Subtree::empty(collector.options.measure), Subtree::merge);
     local = local.merge(child_total);
 
-    if let Some(kind) = kind {
-        record_candidate(directory, kind, &local, collector);
+    if let Some(classification) = classification {
+        record_candidate(directory, classification, &local, collector);
     } else if !inside_artifact
         && collector
             .options
@@ -400,14 +403,15 @@ fn measure_files(files: &[(PathBuf, Metadata)], collector: &Collector<'_>) -> Su
 
 fn record_candidate(
     path: &Path,
-    kind: crate::ArtifactKind,
+    classification: Classification,
     subtree: &Subtree,
     collector: &Collector<'_>,
 ) {
+    let Classification { kind, provenance } = classification;
     let usage = subtree.usage();
     if usage.logical < collector.options.min_size
         || safety::is_excluded(path, &collector.excludes).is_some()
-        || safety::protected_reason(path).is_some()
+        || safety::protected_reason(path, provenance).is_some()
     {
         return;
     }
@@ -431,6 +435,7 @@ fn record_candidate(
             id,
             path: canonical,
             kind,
+            provenance,
             tier: kind.tier(),
             usage,
             newest_mtime: u64::try_from(subtree.newest / 1_000_000_000).unwrap_or(u64::MAX),

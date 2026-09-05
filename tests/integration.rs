@@ -1,4 +1,4 @@
-//! v0.2 API and CLI integration tests. Real deletion is confined to temporary
+//! API and CLI integration tests. Real deletion is confined to temporary
 //! directories created under this repository.
 #![allow(
     clippy::expect_used,
@@ -15,7 +15,7 @@ use std::str::FromStr;
 
 use storage_scout::{
     ApplyOptions, ArtifactCandidate, ArtifactKind, Bytes, CandidateId, CleanupStatus, Measure,
-    RiskTier, SCHEMA_VERSION, ScanOptions, apply_cleanup_plan, create_cleanup_plan,
+    Provenance, RiskTier, SCHEMA_VERSION, ScanOptions, apply_cleanup_plan, create_cleanup_plan,
     discover_cleanup_candidates, scan,
 };
 
@@ -95,6 +95,25 @@ fn make_all_artifacts(root: &Path) {
     write_sized(&root.join("unity/Library/cache.bin"), 112);
     write_sized(&root.join("unity/Temp/temp.bin"), 113);
     write_sized(&root.join("unity/obj/game.dll"), 114);
+
+    write_cache_tag(&root.join("tagged"));
+    write_sized(&root.join("tagged/blob.bin"), 115);
+}
+
+fn write_cache_tag(directory: &Path) {
+    fs::create_dir_all(directory).unwrap();
+    fs::write(
+        directory.join("CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55
+# test cache",
+    )
+    .unwrap();
+}
+
+/// A Cargo target directory identified only by its own contents.
+fn write_orphan_target(directory: &Path, size: u64) {
+    write_sized(&directory.join(".rustc_info.json"), 2);
+    write_sized(&directory.join("debug/app.exe"), size);
 }
 
 fn find_candidate(candidates: &[ArtifactCandidate], kind: ArtifactKind) -> &ArtifactCandidate {
@@ -127,10 +146,23 @@ fn detects_every_artifact_family_and_tier() {
         ArtifactKind::NodeModules,
         ArtifactKind::PythonVenv,
         ArtifactKind::UnityOutput,
+        ArtifactKind::TaggedCache,
     ]
     .into_iter()
     .collect::<HashSet<_>>();
     assert_eq!(found, expected);
+    assert_eq!(
+        find_candidate(&report.candidates, ArtifactKind::TaggedCache).tier,
+        RiskTier::Reinstallable
+    );
+    assert_eq!(
+        find_candidate(&report.candidates, ArtifactKind::TaggedCache).provenance,
+        Provenance::Declared
+    );
+    assert_eq!(
+        find_candidate(&report.candidates, ArtifactKind::RustTarget).provenance,
+        Provenance::Inferred
+    );
     assert_eq!(
         find_candidate(&report.candidates, ArtifactKind::NodeModules).tier,
         RiskTier::Reinstallable
@@ -468,11 +500,6 @@ fn current_directory_and_profile_roots_are_refused_for_clean() {
             discover_cleanup_candidates(&ScanOptions::new(vec![PathBuf::from(profile)])).is_err()
         );
     }
-    if let Some(app_data) = std::env::var_os("LOCALAPPDATA") {
-        assert!(
-            discover_cleanup_candidates(&ScanOptions::new(vec![PathBuf::from(app_data)])).is_err()
-        );
-    }
     for variable in [
         "SystemRoot",
         "ProgramFiles",
@@ -751,4 +778,279 @@ fn cli_kind_and_age_filters_are_explicit() {
         cli(&["scan", root, "--threads", "0"]).status.code(),
         Some(2)
     );
+}
+
+#[test]
+fn orphan_targets_and_tagged_caches_are_declared_candidates() {
+    let temp = tempdir();
+    write_orphan_target(&temp.path().join("sbt"), 4096);
+    write_cache_tag(&temp.path().join("registry"));
+    write_sized(&temp.path().join("registry/crate.crate"), 2048);
+    write_sized(&temp.path().join("info-only/.rustc_info.json"), 2);
+    write_sized(&temp.path().join("info-only/data.bin"), 1024);
+    write_sized(&temp.path().join("profile-only/debug/app.exe"), 1024);
+    fs::create_dir_all(temp.path().join("bad-tag")).unwrap();
+    fs::write(temp.path().join("bad-tag/CACHEDIR.TAG"), b"Signature: 0000").unwrap();
+    write_sized(&temp.path().join("bad-tag/data.bin"), 1024);
+
+    let report = clean_discovery(temp.path());
+    let mut found = report
+        .candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                candidate.kind,
+                candidate.provenance,
+                candidate.tier,
+            )
+        })
+        .collect::<Vec<_>>();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            (
+                "registry".to_owned(),
+                ArtifactKind::TaggedCache,
+                Provenance::Declared,
+                RiskTier::Reinstallable
+            ),
+            (
+                "sbt".to_owned(),
+                ArtifactKind::RustTarget,
+                Provenance::Declared,
+                RiskTier::Routine
+            ),
+        ]
+    );
+
+    let orphan = find_candidate(&report.candidates, ArtifactKind::RustTarget);
+    let plan = create_cleanup_plan(
+        &report.candidates,
+        std::slice::from_ref(&orphan.id),
+        Vec::new(),
+    )
+    .unwrap();
+    let summary = apply_cleanup_plan(&plan, ApplyOptions { execute: true });
+    assert!(!summary.has_failures(), "{summary:#?}");
+    assert!(!temp.path().join("sbt").exists());
+    assert!(temp.path().join("registry").exists());
+}
+
+#[test]
+fn app_data_root_admits_only_declared_caches() {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    // Discovery only: real deletion tests stay inside the repository.
+    let temp = tempfile::Builder::new()
+        .prefix(".storage-scout-appdata-test-")
+        .tempdir_in(PathBuf::from(local_app_data).join("Temp"))
+        .unwrap();
+    write_sized(&temp.path().join("proj/Cargo.toml"), 1);
+    write_sized(&temp.path().join("proj/target/app.exe"), 4096);
+    write_orphan_target(&temp.path().join("sbt"), 4096);
+    write_cache_tag(&temp.path().join("uv"));
+    write_sized(&temp.path().join("uv/blob"), 4096);
+
+    let report = clean_discovery(temp.path());
+    let mut names = report
+        .candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, vec!["sbt".to_owned(), "uv".to_owned()]);
+    assert!(
+        report
+            .candidates
+            .iter()
+            .all(|candidate| candidate.provenance == Provenance::Declared)
+    );
+
+    let ids = report
+        .candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+    let plan = create_cleanup_plan(&report.candidates, &ids, Vec::new()).unwrap();
+    let summary = apply_cleanup_plan(&plan, ApplyOptions { execute: false });
+    assert!(!summary.has_failures(), "{summary:#?}");
+}
+
+#[test]
+fn a_target_owned_by_a_running_build_is_rejected_before_deletion() {
+    let temp = tempdir();
+    write_sized(&temp.path().join("proj/Cargo.toml"), 1);
+    let target = temp.path().join("proj/target");
+    write_sized(&target.join("debug/app.exe"), 4096);
+    let lock_path = target.join("debug/.cargo-lock");
+    write_sized(&lock_path, 0);
+
+    let report = clean_discovery(temp.path());
+    let candidate = find_candidate(&report.candidates, ArtifactKind::RustTarget);
+    let plan = create_cleanup_plan(
+        &report.candidates,
+        std::slice::from_ref(&candidate.id),
+        Vec::new(),
+    )
+    .unwrap();
+
+    let holder = File::open(&lock_path).unwrap();
+    holder.lock().unwrap();
+    let rejected = apply_cleanup_plan(&plan, ApplyOptions { execute: true });
+    assert!(target.exists());
+    assert!(matches!(
+        &rejected.outcomes[0].status,
+        CleanupStatus::Rejected(reason) if reason.contains("in use")
+    ));
+
+    holder.unlock().unwrap();
+    let deleted = apply_cleanup_plan(&plan, ApplyOptions { execute: true });
+    assert!(!deleted.has_failures(), "{deleted:#?}");
+    assert!(!target.exists());
+}
+
+fn make_junction(link: &Path, target: &Path) {
+    let link_text = link.display().to_string().replace('\'', "''");
+    let target_text = target.display().to_string().replace('\'', "''");
+    let script = format!(
+        "New-Item -ItemType Junction -Path '{link_text}' -Target '{target_text}' | Out-Null"
+    );
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn write_policy(path: &Path, volume: &Path, roots: &Path, min_free: &str, log: &Path) {
+    let policy = format!(
+        "[trigger]\nvolume = {volume:?}\nmin_free = \"{min_free}\"\n\n[select]\nroots = [{roots:?}]\nmin_size = \"0\"\n\n[report]\nlog_file = {log:?}\n",
+        volume = volume.to_str().unwrap(),
+        roots = roots.to_str().unwrap(),
+        log = log.to_str().unwrap(),
+    );
+    fs::write(path, policy).unwrap();
+}
+
+#[test]
+fn cli_auto_idles_dry_runs_skips_busy_targets_and_executes() {
+    let temp = tempdir();
+    let work = temp.path().join("work");
+    write_sized(&work.join("old/Cargo.toml"), 1);
+    write_sized(&work.join("old/target/debug/app.exe"), 4096);
+    write_sized(&work.join("old/target/debug/.cargo-lock"), 0);
+    write_sized(&work.join("new/Cargo.toml"), 1);
+    write_sized(&work.join("new/target/debug/app.exe"), 8192);
+    write_sized(&work.join("linked/Cargo.toml"), 1);
+    write_sized(&work.join("linked/target/app.exe"), 2048);
+    let elsewhere = temp.path().join("elsewhere");
+    write_sized(&elsewhere.join("payload"), 10);
+    make_junction(&work.join("linked/target/junction"), &elsewhere);
+    let policy = temp.path().join("auto.toml");
+    let log = temp.path().join("logs/auto.jsonl");
+    let config = policy.to_str().unwrap();
+
+    write_policy(&policy, temp.path(), &work, "0", &log);
+    let idle = cli(&["auto", "--config", config, "--json"]);
+    assert_eq!(idle.status.code(), Some(0), "{idle:#?}");
+    let document: serde_json::Value = serde_json::from_slice(&idle.stdout).unwrap();
+    assert_eq!(document["schema_version"], SCHEMA_VERSION);
+    assert_eq!(document["command"], "auto");
+    assert_eq!(document["mode"], "idle");
+    assert_eq!(document["decision"]["decision"], "idle");
+    assert!(document["candidates"].as_array().unwrap().is_empty());
+
+    write_policy(&policy, temp.path(), &work, "100TiB", &log);
+    let dry_run = cli(&["auto", "--config", config, "--json"]);
+    assert_eq!(dry_run.status.code(), Some(0), "{dry_run:#?}");
+    let document: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(document["mode"], "dry-run");
+    assert_eq!(document["decision"]["decision"], "reclaim");
+    assert_eq!(
+        document["decision"]["selected"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(document["candidates"].as_array().unwrap().len(), 3);
+    assert_eq!(document["withheld"].as_array().unwrap().len(), 1);
+    assert!(
+        document["withheld"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("reparse point")
+    );
+    assert_eq!(document["summary"]["executed"], false);
+    assert!(work.join("old/target").exists());
+    assert!(work.join("new/target").exists());
+
+    let holder = File::open(work.join("old/target/debug/.cargo-lock")).unwrap();
+    holder.lock().unwrap();
+    let execute = cli(&["auto", "--config", config, "--execute", "--json"]);
+    assert_eq!(execute.status.code(), Some(0), "{execute:#?}");
+    let document: serde_json::Value = serde_json::from_slice(&execute.stdout).unwrap();
+    assert_eq!(document["mode"], "executed");
+    let withheld = document["withheld"].as_array().unwrap();
+    assert_eq!(withheld.len(), 2);
+    assert!(withheld.iter().any(|entry| {
+        entry["path"].as_str().unwrap().ends_with("old\\target")
+            && entry["reason"].as_str().unwrap().starts_with("in use")
+    }));
+    assert_eq!(
+        document["decision"]["selected"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(document["summary"]["executed"], true);
+    assert_eq!(
+        document["summary"]["outcomes"][0]["status"]["status"],
+        "deleted"
+    );
+    assert!(work.join("old/target").exists());
+    assert!(!work.join("new/target").exists());
+    assert!(work.join("linked/target").exists());
+    assert!(elsewhere.join("payload").exists());
+    holder.unlock().unwrap();
+
+    let human = cli(&["auto", "--config", config]);
+    assert_eq!(human.status.code(), Some(0), "{human:#?}");
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("auto: dry-run"), "{text}");
+    assert!(text.contains("Selected 1 stalest"), "{text}");
+
+    let lines = fs::read_to_string(&log).unwrap();
+    let entries = lines.lines().collect::<Vec<_>>();
+    assert_eq!(entries.len(), 4, "{lines}");
+    let modes = entries
+        .iter()
+        .map(|line| {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            entry["mode"].as_str().unwrap().to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(modes, ["idle", "dry-run", "executed", "dry-run"]);
+
+    let missing = cli(&[
+        "auto",
+        "--config",
+        temp.path().join("nope.toml").to_str().unwrap(),
+    ]);
+    assert_eq!(missing.status.code(), Some(1));
+    fs::write(&policy, "[trigger]\nvolume = 'C:\\'\n").unwrap();
+    let invalid = cli(&["auto", "--config", config]);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid policy"));
 }

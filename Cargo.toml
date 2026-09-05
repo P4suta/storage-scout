@@ -1,12 +1,12 @@
 [package]
 name = "storage-scout"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 authors = ["storage-scout contributors"]
-description = "Fast Windows disk-usage scanner and safety-first interactive build-artifact cleaner."
+description = "Fast Windows disk-usage scanner and safety-first build-artifact cleaner with threshold-driven unattended cleanup."
 keywords = ["disk-usage", "storage", "cli", "du", "cleanup"]
 categories = ["command-line-utilities", "filesystem"]
 
@@ -18,6 +18,7 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+toml = "1.1.5"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

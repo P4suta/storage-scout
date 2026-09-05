@@ -4,8 +4,15 @@
 //! only candidates returned by [`scan`], and [`apply_cleanup_plan`] revalidates
 //! every candidate immediately before any deletion. There is no public API that
 //! deletes an arbitrary path.
+//!
+//! Unattended cleanup ([`evaluate_auto`]) composes the same two phases behind
+//! a declarative [`AutoPolicy`]: a free-space [`Trigger`] decides *whether* to
+//! act and the pure [`decide`] function chooses the smallest, stalest set of
+//! candidates that restores the target.
 
+mod age;
 mod artifact;
+mod auto;
 mod bytes;
 mod cleanup;
 mod report;
@@ -20,15 +27,21 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub use artifact::ArtifactKind;
+pub use age::Age;
+pub use artifact::{ArtifactKind, Provenance};
+pub use auto::{
+    AutoEvaluation, AutoPolicy, Decision, Selection, Trigger, WithheldCandidate, decide,
+    evaluate_auto,
+};
 pub use bytes::Bytes;
 pub use cleanup::apply_cleanup_plan;
-pub use report::{render_clean_human, render_json, render_scan_human};
+pub use report::{render_auto_human, render_clean_human, render_json, render_scan_human};
 pub use scan::scan;
 
 use windows::FileIdentity;
 
-/// Version of every JSON document emitted by v0.2.
+/// Version of every JSON document. Fields are only ever added within a
+/// version; consumers should ignore unknown fields.
 pub const SCHEMA_VERSION: u32 = 1;
 /// Default number of largest directories to retain.
 pub const DEFAULT_TOP: usize = 20;
@@ -124,7 +137,7 @@ pub struct ScanOptions {
 }
 
 impl ScanOptions {
-    /// Build options with v0.2 defaults.
+    /// Build options with library defaults.
     #[must_use]
     pub fn new(roots: Vec<PathBuf>) -> Self {
         Self {
@@ -188,6 +201,9 @@ pub struct ArtifactCandidate {
     pub path: PathBuf,
     /// Artifact family.
     pub kind: ArtifactKind,
+    /// Whether the directory declares itself a cache or was inferred from its
+    /// name and a sibling manifest.
+    pub provenance: Provenance,
     /// Regeneration risk.
     pub tier: RiskTier,
     /// Logical, allocated, and estimated reclaimable usage.

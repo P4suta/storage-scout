@@ -1,21 +1,23 @@
-//! Command-line interface for storage-scout 0.2.
+//! Command-line interface for storage-scout.
 
 use std::collections::HashSet;
 use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use inquire::{InquireError, MultiSelect};
 use serde::Serialize;
 use storage_scout::{
-    ApplyOptions, ArtifactCandidate, ArtifactKind, Bytes, CandidateId, CleanupPlan, CleanupSummary,
-    DEFAULT_TOP, Measure, RiskTier, SCHEMA_VERSION, ScanOptions, apply_cleanup_plan,
-    create_cleanup_plan, discover_cleanup_candidates, render_clean_human, render_json,
+    Age, ApplyOptions, ArtifactCandidate, ArtifactKind, AutoEvaluation, AutoPolicy, Bytes,
+    CandidateId, CleanupPlan, CleanupSummary, DEFAULT_TOP, Decision, Measure, RiskTier,
+    SCHEMA_VERSION, ScanOptions, Selection, apply_cleanup_plan, create_cleanup_plan,
+    discover_cleanup_candidates, evaluate_auto, render_auto_human, render_clean_human, render_json,
     render_scan_human, scan,
 };
 
@@ -36,6 +38,9 @@ enum Command {
     Scan(ScanArgs),
     /// Discover, select, validate, and optionally delete known build artifacts.
     Clean(CleanArgs),
+    /// Reclaim the stalest artifacts when a volume's free space falls below a
+    /// policy threshold. Designed for a scheduled task.
+    Auto(AutoArgs),
 }
 
 #[derive(Debug, Args)]
@@ -97,7 +102,7 @@ struct CleanArgs {
     min_size: Bytes,
     /// Keep only candidates whose newest file is at least this old, e.g. 30d.
     #[arg(long, value_name = "AGE", value_parser = parse_age)]
-    older_than: Option<u64>,
+    older_than: Option<Age>,
     /// Protect a subtree. Repeatable.
     #[arg(long, value_name = "PATH")]
     exclude: Vec<PathBuf>,
@@ -116,6 +121,19 @@ struct CleanArgs {
     /// Non-interactive deletion acknowledgement; requires --execute and --id.
     #[arg(long, requires_all = ["execute", "id"])]
     yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct AutoArgs {
+    /// TOML policy file. Defaults to ~/.config/storage-scout/auto.toml.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Actually delete after revalidation. The default is a dry-run.
+    #[arg(long)]
+    execute: bool,
+    /// Emit stable JSON with `schema_version` 1.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +160,20 @@ struct CleanJson<'a> {
     summary: Option<&'a CleanupSummary>,
 }
 
+#[derive(Serialize)]
+struct AutoJson<'a> {
+    schema_version: u32,
+    command: &'static str,
+    mode: &'static str,
+    /// Unix seconds when the evaluation ran.
+    evaluated_at: u64,
+    policy: &'a AutoPolicy,
+    #[serde(flatten)]
+    evaluation: &'a AutoEvaluation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'a CleanupSummary>,
+}
+
 fn main() -> ExitCode {
     if std::env::args_os().len() == 1 {
         let mut command = Cli::command();
@@ -163,6 +195,7 @@ fn run(cli: Cli) -> Result<u8> {
     match cli.command {
         Command::Scan(args) => run_scan(args),
         Command::Clean(args) => run_clean(args),
+        Command::Auto(args) => run_auto(args),
     }
 }
 
@@ -202,33 +235,22 @@ fn run_clean(args: CleanArgs) -> Result<u8> {
         id,
         yes,
     } = args;
-    let options = ScanOptions {
+    let selection = Selection {
         roots,
-        top: 0,
+        kinds: kind,
         min_size,
-        max_depth: Some(0),
-        excludes: exclude.clone(),
-        threads: None,
-        measure: Measure::Both,
+        older_than,
+        excludes: exclude,
+        include_tiers: include_tier,
     };
-    let mut report = discover_cleanup_candidates(&options).map_err(anyhow::Error::msg)?;
-    if !kind.is_empty() {
-        report
-            .candidates
-            .retain(|candidate| kind.contains(&candidate.kind));
-    }
-    if let Some(age) = older_than {
-        let cutoff = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .saturating_sub(age);
-        report
-            .candidates
-            .retain(|candidate| candidate.newest_mtime != 0 && candidate.newest_mtime <= cutoff);
-    }
+    let now = unix_now();
+    let mut report =
+        discover_cleanup_candidates(&selection.scan_options()).map_err(anyhow::Error::msg)?;
+    report
+        .candidates
+        .retain(|candidate| selection.admits(now, candidate));
 
-    let unlocked = unlocked_tiers(&include_tier);
+    let unlocked = selection.unlocked_tiers();
     if id.is_empty() && json {
         return write_clean_json("discovery", &report.candidates, None, None);
     }
@@ -272,7 +294,7 @@ fn run_clean(args: CleanArgs) -> Result<u8> {
         }
         return Ok(0);
     }
-    let plan = create_cleanup_plan(&report.candidates, &selected_ids, exclude)
+    let plan = create_cleanup_plan(&report.candidates, &selected_ids, selection.excludes)
         .map_err(anyhow::Error::msg)?;
 
     if !execute {
@@ -310,14 +332,84 @@ fn run_clean(args: CleanArgs) -> Result<u8> {
     Ok(cleanup_exit_code(&summary))
 }
 
-fn cleanup_exit_code(summary: &CleanupSummary) -> u8 {
-    u8::from(summary.has_failures())
+fn run_auto(args: AutoArgs) -> Result<u8> {
+    let config = args.config.map_or_else(default_policy_path, Ok)?;
+    let text = fs::read_to_string(&config)
+        .with_context(|| format!("cannot read policy {}", config.display()))?;
+    let policy = AutoPolicy::parse(&text)
+        .map_err(|error| anyhow!("invalid policy {}: {error}", config.display()))?;
+    let evaluated_at = unix_now();
+    let evaluation = evaluate_auto(&policy, evaluated_at).map_err(anyhow::Error::msg)?;
+    let summary = evaluation.plan.as_ref().map(|plan| {
+        apply_cleanup_plan(
+            plan,
+            ApplyOptions {
+                execute: args.execute,
+            },
+        )
+    });
+    let mode = match (&evaluation.decision, &summary) {
+        (Decision::Idle { .. }, _) => "idle",
+        (Decision::NoCandidates { .. }, _) => "no-candidates",
+        (Decision::Reclaim { .. }, Some(summary)) if summary.executed => "executed",
+        (Decision::Reclaim { .. }, _) => "dry-run",
+    };
+    let document = AutoJson {
+        schema_version: SCHEMA_VERSION,
+        command: "auto",
+        mode,
+        evaluated_at,
+        policy: &policy,
+        evaluation: &evaluation,
+        summary: summary.as_ref(),
+    };
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if args.json {
+        render_json(&document, &mut out)?;
+    } else {
+        render_auto_human(
+            &policy,
+            &evaluation,
+            summary.as_ref(),
+            use_color(),
+            &mut out,
+        )?;
+    }
+    if let Some(log_file) = &policy.log_file {
+        append_json_line(log_file, &document)
+            .with_context(|| format!("cannot append to log {}", log_file.display()))?;
+    }
+    Ok(summary.as_ref().map_or(0, cleanup_exit_code))
 }
 
-fn unlocked_tiers(included: &[RiskTier]) -> HashSet<RiskTier> {
-    std::iter::once(RiskTier::Routine)
-        .chain(included.iter().copied())
-        .collect()
+fn default_policy_path() -> Result<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| anyhow!("no --config given and USERPROFILE is not set"))?;
+    Ok(PathBuf::from(home).join(".config/storage-scout/auto.toml"))
+}
+
+fn append_json_line(path: &PathBuf, document: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+    serde_json::to_writer(&mut file, document)?;
+    writeln!(file)?;
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn cleanup_exit_code(summary: &CleanupSummary) -> u8 {
+    u8::from(summary.has_failures())
 }
 
 fn validate_unlocked_ids(
@@ -395,11 +487,12 @@ fn print_candidates(candidates: &[ArtifactCandidate], unlocked: &HashSet<RiskTie
             .map_or_else(|| "unavailable".to_owned(), |value| value.to_string());
         writeln!(
             out,
-            "  {} {:>11} logical / {:>11} allocated  [{}]{}\n      id={}\n      {}",
+            "  {} {:>11} logical / {:>11} allocated  [{}, {}]{}\n      id={}\n      {}",
             tier_tag(candidate.tier, use_color()),
             candidate.usage.logical,
             allocation,
             candidate.kind.label(),
+            candidate.provenance,
             lock,
             candidate.id,
             candidate.path.display()
@@ -513,59 +606,12 @@ fn parse_id(value: &str) -> Result<CandidateId, String> {
     CandidateId::from_str(value)
 }
 
-fn parse_age(value: &str) -> Result<u64, String> {
-    let split = value
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(value.len());
-    let (number, suffix) = value.split_at(split);
-    let count = number
-        .parse::<u64>()
-        .map_err(|_| format!("invalid age: {value}"))?;
-    let multiplier = match suffix.to_ascii_lowercase().as_str() {
-        "h" => 60 * 60,
-        "d" => 24 * 60 * 60,
-        "w" => 7 * 24 * 60 * 60,
-        _ => return Err("age must use h, d, or w (for example 30d)".to_owned()),
-    };
-    count
-        .checked_mul(multiplier)
-        .ok_or_else(|| "age is too large".to_owned())
+fn parse_age(value: &str) -> Result<Age, String> {
+    Age::from_str(value)
 }
 
-fn parse_size(input: &str) -> Result<Bytes, String> {
-    let value = input.trim();
-    let split = value
-        .find(|character: char| !character.is_ascii_digit() && character != '.')
-        .unwrap_or(value.len());
-    let (number, suffix) = value.split_at(split);
-    let number = number
-        .parse::<f64>()
-        .map_err(|_| format!("invalid size: {input}"))?;
-    if !number.is_finite() || number.is_sign_negative() {
-        return Err(format!("invalid non-negative size: {input}"));
-    }
-    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1.0,
-        "k" | "kib" => 1024.0,
-        "kb" => 1_000.0,
-        "m" | "mib" => 1024.0 * 1024.0,
-        "mb" => 1_000_000.0,
-        "g" | "gib" => 1024.0 * 1024.0 * 1024.0,
-        "gb" => 1_000_000_000.0,
-        "t" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "tb" => 1_000_000_000_000.0,
-        _ => return Err(format!("unknown size suffix: {suffix}")),
-    };
-    let bytes = number * multiplier;
-    if bytes >= 18_446_744_073_709_551_616.0 {
-        return Err("size is too large".to_owned());
-    }
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "finite non-negative value was range-checked above; byte fractions are truncated"
-    )]
-    Ok(Bytes(bytes as u64))
+fn parse_size(value: &str) -> Result<Bytes, String> {
+    Bytes::from_str(value)
 }
 
 #[cfg(test)]

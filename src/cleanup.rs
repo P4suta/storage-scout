@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::safety::{self, is_reparse_point};
+use crate::safety::{self, Classification, is_reparse_point};
 use crate::scan::measure_for_cleanup;
 use crate::windows;
 use crate::{
@@ -94,9 +94,6 @@ fn revalidate(candidate: &ArtifactCandidate, excludes: &[PathBuf]) -> Result<Usa
     if safety::normalized(&canonical) != safety::normalized(&candidate.path) {
         return Err("canonical path changed since discovery".to_owned());
     }
-    if let Some(reason) = safety::protected_reason(&canonical) {
-        return Err(format!("protected location: {reason}"));
-    }
     if let Some(exclude) = safety::is_excluded(&canonical, excludes) {
         return Err(format!("intersects exclusion {}", exclude.display()));
     }
@@ -105,12 +102,24 @@ fn revalidate(candidate: &ArtifactCandidate, excludes: &[PathBuf]) -> Result<Usa
     if identity != candidate.identity {
         return Err("volume/file ID changed; candidate is stale".to_owned());
     }
-    let kind = safety::classify_path(&canonical)?;
+    let Classification { kind, provenance } = safety::classify_path(&canonical)?;
     if kind != candidate.kind {
         return Err(format!(
             "artifact kind changed from {} to {}",
             candidate.kind, kind
         ));
+    }
+    if provenance != candidate.provenance {
+        return Err(format!(
+            "artifact provenance changed from {} to {}",
+            candidate.provenance, provenance
+        ));
+    }
+    if let Some(reason) = safety::protected_reason(&canonical, provenance) {
+        return Err(format!("protected location: {reason}"));
+    }
+    if let Some(reason) = safety::busy_reason(&canonical, kind) {
+        return Err(format!("in use: {reason}"));
     }
     let (usage, newest) = measure_for_cleanup(std::slice::from_ref(&canonical))?;
     let current_id = make_candidate_id(identity, &canonical, kind, usage, newest);
