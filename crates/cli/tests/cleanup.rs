@@ -886,7 +886,8 @@ fn a_marker_that_appears_after_discovery_is_heard_before_deletion() {
         None,
     );
     let target = write_cargo_project(&run.join("proj"), 4096);
-    let report = discover(temp.path());
+    let confined = scout().confined(vec![temp.path().to_path_buf()]);
+    let report = confined.discover(&options(temp.path())).unwrap();
     let settled = report.candidates.clone();
     assert_eq!(settled.len(), 1, "{report:#?}");
     assert_eq!(
@@ -911,7 +912,7 @@ fn a_marker_that_appears_after_discovery_is_heard_before_deletion() {
         None,
     );
     fs::remove_file(kept.join("owner.lock")).unwrap();
-    let summary = apply(&plan, Mode::Execute);
+    let summary = confined.apply(&plan, Mode::Execute);
     assert!(
         matches!(
             status(&summary),
