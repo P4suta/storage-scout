@@ -4,13 +4,13 @@
 )]
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, Metadata};
+use std::fs::{self, File, Metadata, TryLockError};
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use storage_scout_core::candidate::Identity;
@@ -242,42 +242,130 @@ pub(super) fn remove_tree(
     remove_dir(root).map_err(io)
 }
 
-pub(super) struct Tree;
+pub(super) struct Tree {
+    root: PathBuf,
+}
 
-fn unsupported() -> io::Error {
-    io::Error::from(io::ErrorKind::Unsupported)
+fn inside(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut components = relative.components().peekable();
+    components.peek()?;
+    components
+        .all(|component| matches!(component, Component::Normal(_)))
+        .then(|| root.join(relative))
+}
+
+fn vanished(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+enum SessionLock {
+    Taken(File),
+    Absent,
+    Held,
+}
+
+fn session_lock(path: &Path) -> io::Result<SessionLock> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if vanished(&error) => return Ok(SessionLock::Absent),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(SessionLock::Taken(file)),
+        Err(TryLockError::WouldBlock) => Ok(SessionLock::Held),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    File,
+    Directory,
+}
+
+fn same(path: &Path, expected: Identity, entry: Entry) -> io::Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if vanished(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let found = if metadata.is_dir() {
+        Entry::Directory
+    } else {
+        Entry::File
+    };
+    if is_reparse_point(&metadata) || found != entry {
+        return Ok(false);
+    }
+    Ok(identity(path)? == expected)
 }
 
 impl Tree {
-    pub(super) fn open(root: &Path, _expected: Identity) -> Result<Self, WalkError> {
-        Err(WalkError::Io {
-            path: root.to_path_buf(),
-            error: unsupported(),
-        })
+    pub(super) fn open(root: &Path, expected: Identity) -> Result<Self, WalkError> {
+        match same(root, expected, Entry::Directory) {
+            Ok(true) => Ok(Self {
+                root: root.to_path_buf(),
+            }),
+            Ok(false) => Err(WalkError::Moved {
+                path: root.to_path_buf(),
+            }),
+            Err(error) => Err(WalkError::Io {
+                path: root.to_path_buf(),
+                error,
+            }),
+        }
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "Windows has no handle-bound pruning yet"
-    )]
-    pub(super) fn prune_file(&self, _relative: &Path, _expected: Identity) -> io::Result<Pruned> {
-        Err(unsupported())
+    pub(super) fn prune_file(&self, relative: &Path, expected: Identity) -> io::Result<Pruned> {
+        let Some(path) = inside(&self.root, relative) else {
+            return Ok(Pruned::Moved);
+        };
+        if !same(&path, expected, Entry::File)? {
+            return Ok(Pruned::Moved);
+        }
+        match remove_file(&path) {
+            Ok(()) => Ok(Pruned::Removed),
+            Err(error) if vanished(&error) => Ok(Pruned::Moved),
+            Err(error) => Err(error),
+        }
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "Windows has no handle-bound pruning yet"
-    )]
     pub(super) fn prune_session(
         &self,
-        _relative: &Path,
-        _lock: &std::ffi::OsStr,
-        _expected: Identity,
+        relative: &Path,
+        lock: &std::ffi::OsStr,
+        expected: Identity,
         shown: &Path,
     ) -> Result<Pruned, WalkError> {
-        Err(WalkError::Io {
+        let io = |error| WalkError::Io {
             path: shown.to_path_buf(),
-            error: unsupported(),
-        })
+            error,
+        };
+        let Some(directory) = inside(&self.root, relative) else {
+            return Ok(Pruned::Moved);
+        };
+        let lock = directory.with_file_name(lock);
+        let held = match session_lock(&lock).map_err(io)? {
+            SessionLock::Taken(file) => Some(file),
+            SessionLock::Absent => None,
+            SessionLock::Held => return Ok(Pruned::Held),
+        };
+        if !same(&directory, expected, Entry::Directory).map_err(io)? {
+            return Ok(Pruned::Moved);
+        }
+        clear(&directory, &BTreeSet::new())?;
+        remove_dir(&directory).map_err(io)?;
+        if held.is_some() {
+            match remove_file(&lock) {
+                Ok(()) => {},
+                Err(error) if vanished(&error) => {},
+                Err(error) => return Err(io(error)),
+            }
+        }
+        drop(held);
+        Ok(Pruned::Removed)
     }
 }

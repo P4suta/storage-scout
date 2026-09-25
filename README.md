@@ -67,7 +67,7 @@ Inside a Cargo target that is still in use, these files are dead by rustc's own 
 | `superseded-session` | an incremental session older than the one rustc loads next; rustc deletes it itself the next time it compiles that crate |
 | `abandoned-session` | an incremental session whose rustc ended before finishing it |
 
-Every cargo lock in the target is held while it is pruned, each session is taken under rustc's own session lock, and each file is re-identified by handle before it is removed.
+Every cargo lock in the target is held while it is pruned, each session is taken under rustc's own session lock (`fcntl` on macOS, `flock` on Linux, `LockFileEx` on Windows), and each file is re-identified before it is removed.
 A unit whose image cannot be read keeps all its objects.
 
 ## Sharing identical files
@@ -88,16 +88,16 @@ Parallel worktrees build the same dependencies into separate `target/` directori
 
 ## Running on events
 
-`watch` is the resident form: run it as a login agent (launchd, systemd `--user`).
+`watch` is the resident form: run it as a login agent (launchd, systemd `--user`, a Task Scheduler logon task).
 It keeps the candidates and their files in memory and reacts only to what changed:
 
 - a write inside a cache waits for the cache's writer to release its lock, then prunes and shares that cache's new files;
 - an owner releasing its lock reaps what it owned;
 - a new directory is looked at when it appears.
 
-Filesystem events come from FSEvents on macOS and inotify on Linux; Windows has no watcher yet.
-
-Ownership that only git knows changes through git, so hooks tell the watcher:
+Filesystem events come from FSEvents on macOS, `ReadDirectoryChangesW` on Windows, and inotify on Linux.
+On macOS and Windows the watcher sees every directory below its roots, so a ref update under `.git/refs` is enough for it to ask the owners again and git hooks are optional.
+Linux watches one directory at a time, so there ownership that only git knows changes through git hooks:
 
 ```sh
 storage-scout auto --execute --detach --event post-merge -- "$@"

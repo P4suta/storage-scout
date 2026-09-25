@@ -331,6 +331,16 @@ pub fn hard_link(link: &Path, target: &Path) -> Built {
 }
 
 #[must_use]
+pub fn watches_subtrees() -> bool {
+    let whole = cfg!(any(target_os = "macos", windows));
+    if !whole {
+        let _skipped = Built::Unavailable(String::from("inotify watches one directory at a time"))
+            .or_skip("a watcher that reports every directory below a root");
+    }
+    whole
+}
+
+#[must_use]
 pub const fn reports_devices() -> bool {
     cfg!(unix)
 }
@@ -658,6 +668,21 @@ pub fn write_owner_marker(
     keep: MarkerKeep,
     keyed_to: Option<&Path>,
 ) {
+    write_owner_json(directory, role, keep, keyed_to);
+    write_owner_lock(directory);
+}
+
+pub fn write_owner_lock(directory: &Path) {
+    fs::create_dir_all(directory).expect("the owned directory");
+    fs::write(directory.join("owner.lock"), b"").expect("an owner lock");
+}
+
+pub fn write_owner_json(
+    directory: &Path,
+    role: MarkerRole,
+    keep: MarkerKeep,
+    keyed_to: Option<&Path>,
+) {
     fs::create_dir_all(directory).expect("the owned directory");
     let role = match role {
         MarkerRole::Scratch => "scratch",
@@ -674,7 +699,6 @@ pub fn write_owner_marker(
         "{{\"schema\": \"njutest-temp-owner-v1\", \"pid\": 1, \"started\": \"x\", \"kept\": {kept}, \"role\": \"{role}\"{key}}}"
     );
     fs::write(directory.join("owner.json"), document).expect("an owner marker");
-    fs::write(directory.join("owner.lock"), b"").expect("an owner lock");
 }
 
 #[must_use]

@@ -19,6 +19,8 @@ use crate::store::{self, Station};
 use crate::{SCHEMA_VERSION, Scout, busy};
 
 const PROFILE_PARTS: [&str; 4] = ["deps", "incremental", "build", "examples"];
+const GIT_DIRECTORY: &str = ".git";
+const REFS: &str = "refs";
 
 #[derive(Debug)]
 enum Signal {
@@ -110,6 +112,7 @@ impl Hooks<'_> {
 
 struct Session<'a> {
     scout: Scout,
+    roots: Vec<PathBuf>,
     policy: &'a AutoPolicy,
     excludes: Vec<Location>,
     hooks: &'a Hooks<'a>,
@@ -120,6 +123,24 @@ struct Session<'a> {
     pool: Pool,
     sender: Sender<Signal>,
     watcher: Watcher,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitArea {
+    Refs,
+    Other,
+    Outside,
+}
+
+fn git_area(directory: &Path) -> GitArea {
+    let mut components = directory
+        .components()
+        .skip_while(|component| component.as_os_str() != std::ffi::OsStr::new(GIT_DIRECTORY));
+    match (components.next(), components.next()) {
+        (None, _) => GitArea::Outside,
+        (Some(_), Some(next)) if next.as_os_str() == std::ffi::OsStr::new(REFS) => GitArea::Refs,
+        (Some(_), _) => GitArea::Other,
+    }
 }
 
 fn appeared_already(appeared: &[Found], path: &Path) -> bool {
@@ -359,7 +380,17 @@ impl Session<'_> {
     }
 
     fn appear(&mut self, directories: &BTreeSet<PathBuf>) -> Result<(), WatchError> {
-        let mut pending = directories.iter().cloned().collect::<Vec<_>>();
+        let mut pending = directories
+            .iter()
+            .flat_map(|directory| {
+                directory
+                    .parent()
+                    .filter(|parent| self.roots.iter().any(|root| parent.starts_with(root)))
+                    .map(Path::to_path_buf)
+                    .into_iter()
+                    .chain([directory.clone()])
+            })
+            .collect::<Vec<_>>();
         let mut visited = BTreeSet::new();
         let mut appeared = Vec::new();
         while let Some(directory) = pending.pop() {
@@ -504,7 +535,7 @@ impl Session<'_> {
 
     fn turn(&mut self, signals: Vec<Signal>) -> Result<(), WatchError> {
         self.scout = self.scout.refreshed();
-        let hooked = self.hooks.raised().map_err(WatchError::Station)?;
+        let mut hooked = self.hooks.raised().map_err(WatchError::Station)?;
         let mut lost = false;
         let mut appeared = BTreeSet::new();
         for signal in signals {
@@ -516,6 +547,14 @@ impl Session<'_> {
                 Signal::Changed(Change::Directory(directory)) => {
                     if directory.starts_with(&self.hooks.state) {
                         continue;
+                    }
+                    match git_area(&directory) {
+                        GitArea::Refs => {
+                            hooked |= self.watcher.recursive();
+                            continue;
+                        },
+                        GitArea::Other => continue,
+                        GitArea::Outside => {},
                     }
                     match self.owner(&directory) {
                         Some(root) if self.written(&root) => {
@@ -562,7 +601,9 @@ fn watching(
     config: &Path,
     render: &dyn Fn(&WatchRecord) -> io::Result<()>,
 ) -> Result<std::convert::Infallible, WatchError> {
-    let state = store::state_dir().map_err(WatchError::Station)?;
+    let state = store::state_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(WatchError::Station)?;
     let station = Station::for_policy(&state, config);
     let _held = station.wait().map_err(WatchError::Station)?;
     let hooks = Hooks {
@@ -573,7 +614,15 @@ fn watching(
     };
     let hooks = &hooks;
     let (sender, receiver): (Sender<Signal>, Receiver<Signal>) = mpsc::channel();
-    let mut paths = policy.selection.roots.clone();
+    let mut paths = policy
+        .selection
+        .roots
+        .iter()
+        .filter_map(|root| match std::fs::canonicalize(root) {
+            Ok(canonical) => Some(canonical),
+            Err(_absent) => None,
+        })
+        .collect::<Vec<_>>();
     paths.push(hooks.state.clone());
     let deliver = sender.clone();
     let watcher = Watcher::start(&paths, move |change| {
@@ -582,6 +631,7 @@ fn watching(
     .map_err(WatchError::Events)?;
     let mut session = Session {
         scout: scout.refreshed(),
+        roots: paths.clone(),
         policy,
         excludes: scan::excludes(&policy.selection.excludes),
         hooks,
@@ -645,6 +695,22 @@ mod tests {
             observed_freed: None,
             pairs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_ref_update_is_told_apart_from_other_git_writes() {
+        assert_eq!(
+            git_area(Path::new("/w/app/.git/refs/remotes/origin")),
+            GitArea::Refs
+        );
+        assert_eq!(git_area(Path::new("/w/app/.git/refs")), GitArea::Refs);
+        assert_eq!(git_area(Path::new("/w/app/.git")), GitArea::Other);
+        assert_eq!(
+            git_area(Path::new("/w/app/.git/objects/ab")),
+            GitArea::Other
+        );
+        assert_eq!(git_area(Path::new("/w/app/src")), GitArea::Outside);
+        assert_eq!(git_area(Path::new("/w/app/refs")), GitArea::Outside);
     }
 
     #[test]

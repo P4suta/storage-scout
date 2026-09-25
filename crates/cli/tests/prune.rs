@@ -51,6 +51,7 @@ fn pruned(root: &Path) -> Option<PruneRun> {
 fn profile(root: &Path, name: &str) -> PathBuf {
     let project = root.join(name);
     write_sized(&project.join("Cargo.toml"), 1);
+    testkit::write_cache_tag(&project.join("target"));
     let profile = project.join("target/debug");
     write_sized(&profile.join(".cargo-lock"), 0);
     fs::create_dir_all(profile.join(".fingerprint")).unwrap();
@@ -146,9 +147,10 @@ fn object(directory: &Path, name: &str) -> PathBuf {
 }
 
 fn named(directory: &Path, names: &[&str]) -> Vec<String> {
+    let parent = directory.file_name().unwrap().to_str().unwrap();
     names
         .iter()
-        .map(|name| directory.join(name).to_str().unwrap().to_owned())
+        .map(|name| format!("/build/{parent}/{name}"))
         .collect()
 }
 

@@ -375,7 +375,7 @@ fn objects(root: &Path, profile: &Path, doomed: &mut Vec<Doomed>) -> u64 {
                 else {
                     continue;
                 };
-                let Some(identity) = platform::identity_of_metadata(&metadata) else {
+                let Ok(identity) = platform::identity(&path) else {
                     continue;
                 };
                 doomed.push(Doomed {

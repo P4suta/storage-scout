@@ -83,6 +83,7 @@ impl Watching {
 fn profile(root: &Path, name: &str) -> PathBuf {
     let project = root.join(name);
     write_sized(&project.join("Cargo.toml"), 1);
+    testkit::write_cache_tag(&project.join("target"));
     let profile = project.join("target/debug");
     write_sized(&profile.join(".cargo-lock"), 0);
     fs::create_dir_all(profile.join(".fingerprint")).unwrap();
@@ -136,12 +137,11 @@ fn released_scratch_is_reaped_the_moment_its_owner_lets_go() {
     let Some(mut watching) = Watching::start("watch-owner", |_| {}) else {
         return;
     };
-    let staged = watching.root.with_file_name("staged");
-    testkit::write_owner_marker(&staged, MarkerRole::Scratch, MarkerKeep::Released, None);
-    write_sized(&staged.join("scratch.bin"), 1024);
-    let owner = testkit::claim(&staged);
     let run = watching.root.join("run");
-    fs::rename(&staged, &run).unwrap();
+    testkit::write_owner_lock(&run);
+    let owner = testkit::claim(&run);
+    write_sized(&run.join("scratch.bin"), 1024);
+    testkit::write_owner_json(&run, MarkerRole::Scratch, MarkerKeep::Released, None);
     drop(owner);
     loop {
         let line = watching.next();
@@ -255,4 +255,67 @@ fn writes_inside_a_cache_nobody_locks_change_nothing() {
     assert!(first.contains("pruned 1 entry"), "{first}");
     testkit::assert_absent(&old);
     testkit::assert_present(cache.join("blob"));
+}
+
+#[test]
+fn work_that_lands_is_reaped_when_the_remote_ref_moves_without_any_hook() {
+    if !testkit::watches_subtrees() {
+        return;
+    }
+    let mut feat = PathBuf::new();
+    let mut work = PathBuf::new();
+    let mut upstream = PathBuf::new();
+    let Some(mut watching) = Watching::start("watch-refs", |root| {
+        let git = testkit::Git::isolated(root.parent().unwrap());
+        upstream = root.with_file_name("upstream");
+        fs::create_dir_all(&upstream).unwrap();
+        git.run(&upstream, &["init", "--quiet"]);
+        git.commit_file(&upstream, "Cargo.toml", "[package]\nname = \"x\"\n");
+        git.commit_file(&upstream, ".gitignore", "target/\n");
+        git.commit_file(&upstream, "src/lib.rs", "pub fn one() {}\n");
+        work = root.join("work");
+        git.run(
+            root,
+            &[
+                "clone",
+                "--quiet",
+                upstream.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ],
+        );
+        feat = root.join("feat");
+        git.run(
+            &work,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feat",
+                feat.to_str().unwrap(),
+                "origin/main",
+            ],
+        );
+        git.commit_file(&feat, "src/lib.rs", "pub fn one() {}\npub fn two() {}\n");
+        testkit::write_cache_tag(&feat.join("target"));
+        write_sized(&feat.join("target/debug/app"), 4096);
+    }) else {
+        return;
+    };
+    let git = testkit::Git::isolated(watching.root.parent().unwrap());
+    git.commit_file(
+        &upstream,
+        "src/lib.rs",
+        "pub fn one() {}\npub fn two() {}\n",
+    );
+    git.run(&work, &["fetch", "--quiet"]);
+    loop {
+        let line = watching.next();
+        assert!(!line.contains("FAILURES"), "{line}");
+        if line.starts_with("hook:") && line.contains("reaped 1") {
+            break;
+        }
+    }
+    testkit::assert_absent(feat.join("target"));
+    testkit::assert_present(feat.join("src/lib.rs"));
 }

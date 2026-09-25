@@ -9,8 +9,9 @@ use storage_scout_core::share::{Extras, Failure, Filesystem, Method, Mode, Owner
 
 #[cfg_attr(target_os = "macos", path = "platform/events_macos.rs")]
 #[cfg_attr(target_os = "linux", path = "platform/events_linux.rs")]
+#[cfg_attr(windows, path = "platform/events_windows.rs")]
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
+    not(any(target_os = "macos", target_os = "linux", windows)),
     path = "platform/events_none.rs"
 )]
 mod events;
@@ -28,7 +29,7 @@ pub(crate) mod spawn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
+    not(any(target_os = "macos", target_os = "linux", windows)),
     expect(dead_code, reason = "nothing is watched on this platform")
 )]
 pub(crate) enum Change {
@@ -208,10 +209,6 @@ pub(crate) fn extras(path: &Path, identity: Identity) -> Extras {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    windows,
-    expect(dead_code, reason = "nothing is pruned in place on Windows yet")
-)]
 pub(crate) enum Pruned {
     Removed,
     Moved,
