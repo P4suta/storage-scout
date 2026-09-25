@@ -34,10 +34,12 @@
 - Every surviving mutant is either a missing test or a claim with a reason in `.rust-mutants.toml`.
   `question-to-unwrap` is not measured: it turns a reported refusal into a panic, and both stop before anything changes.
   `ignore-question-statement` and `return-ok-default` are, because they turn a failure into success.
-- CI measures mutants on btrfs so sharing runs; `STORAGE_SCOUT_REQUIRE_SHARING=1` makes the sharing tests fail instead of skipping.
+- Pull requests measure only the files they change, on btrfs so sharing runs; `STORAGE_SCOUT_REQUIRE_SHARING=1` makes the sharing tests fail instead of skipping.
+  Full measurement is local: `mise run mutants`, and `mise run verify` for the whole contract.
 
 ```sh
 mise run check     # fmt, clippy, gates, pure, tests, doctests
 mise run cross     # clippy for Windows, macOS, and Linux targets
-mise run mutants   # mutation testing
+mise run mutants          # mutation testing, every file
+mise run mutants:branch   # only what this branch changes, as a pull request does
 ```

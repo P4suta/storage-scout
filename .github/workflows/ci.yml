@@ -82,20 +82,15 @@ jobs:
           STORAGE_SCOUT_REQUIRE_SHARING: "1"
         run: cargo nextest run --package storage-scout --test dedupe --profile ci
 
-  mutation:
-    name: mutants ${{ matrix.shard }}/4
+  mutants:
+    name: mutants of the changed files
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - name: Install rust-mutants
         run: |
@@ -117,77 +112,44 @@ jobs:
           mkdir /mnt/share/tmp
           echo "TMPDIR=/mnt/share/tmp" >> "$GITHUB_ENV"
           echo "STORAGE_SCOUT_REQUIRE_SHARING=1" >> "$GITHUB_ENV"
-      - run: rust-mutants doctor
-      - name: Measure this part of the catalog
-        run: rust-mutants run --shard ${{ matrix.shard }}/4 --locked --offline
-        continue-on-error: true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: mutation-shard-${{ matrix.shard }}
-          path: reports/mutation/
-          if-no-files-found: error
-
-  mutation-verdict:
-    name: mutants verdict
-    runs-on: ubuntu-latest
-    needs: [mutation]
-    if: ${{ !cancelled() }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install rust-mutants
+      - name: Keep only the claims about the changed files
+        id: scope
+        env:
+          BASE: origin/${{ github.base_ref }}
         run: |
-          rustup toolchain install 1.98.0 --profile minimal
-          cargo +1.98.0 install \
-            --git https://github.com/P4suta/njutest \
-            --rev ${{ env.NJUTEST_REV }} \
-            --locked rust-mutants-cli
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: mutation-shard-*
-          path: reports/mutation/
-          merge-multiple: true
-      - name: Put the parts back together
-        run: rust-mutants merge --runs '*'
-      - name: One page showing every survivor in place
-        run: rust-mutants report --format html
-        continue-on-error: true
+          python3 - <<'PY'
+          import fnmatch, json, os, subprocess, tomllib
+          changed = set(subprocess.run(["git", "diff", "--name-only", os.environ["BASE"] + "...HEAD"], capture_output=True, text=True, check=True).stdout.split())
+          config = tomllib.load(open(".rust-mutants.toml", "rb"))
+          measured = sorted(path for path in changed if any(fnmatch.fnmatch(path, pattern) for pattern in config["project"]["include"]))
+          mutation = config.get("mutation", {})
+          for key in ("expect", "skip"):
+              mutation[key] = [entry for entry in mutation.get(key, []) if entry["path"] in changed]
+          def value(item):
+              return "[" + ", ".join(value(each) for each in item) + "]" if isinstance(item, list) else json.dumps(item)
+          lines = []
+          for section in ("project", "execution"):
+              lines.append(f"[{section}]")
+              lines += [f"{key} = {value(item)}" for key, item in config.get(section, {}).items()]
+          lines.append("[mutation]")
+          lines += [f"{key} = {value(item)}" for key, item in mutation.items() if key not in ("expect", "skip")]
+          for key in ("expect", "skip"):
+              for entry in mutation[key]:
+                  lines.append(f"[[mutation.{key}]]")
+                  lines += [f"{name} = {value(item)}" for name, item in entry.items()]
+          open(os.environ["RUNNER_TEMP"] + "/rust-mutants.toml", "w").write("\n".join(lines) + "\n")
+          open(os.environ["GITHUB_OUTPUT"], "a").write(f"measure={'true' if measured else 'false'}\n")
+          print("measured:", *measured, sep="\n  ")
+          PY
+      - name: Measure the changed files
+        if: steps.scope.outputs.measure == 'true'
+        run: rust-mutants run --config "$RUNNER_TEMP/rust-mutants.toml" --changed-from "origin/${{ github.base_ref }}" --locked --offline
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: mutation-report
           path: reports/mutation/
-
-  assurance:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - name: Install njutest
-        run: |
-          rustup toolchain install 1.98.0 --profile minimal
-          cargo +1.98.0 install \
-            --git https://github.com/P4suta/njutest \
-            --rev ${{ env.NJUTEST_REV }} \
-            --locked njutest
-      - run: njutest doctor
-      - name: Verify
-        run: njutest verify --ui=plain
-        continue-on-error: true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: njutest-reports
-          path: |
-            reports/
-            .njutest/
+          if-no-files-found: ignore
 
   coverage:
     runs-on: ubuntu-latest

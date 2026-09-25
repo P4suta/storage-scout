@@ -55,6 +55,10 @@ run = "rust-mutants run --dry-run"
 description = "Only the files that differ from HEAD"
 run = "rust-mutants run --changed"
 
+[tasks."mutants:branch"]
+description = "Only the files this branch changes from main, as a pull request measures them"
+run = "rust-mutants run --changed-from origin/main"
+
 [tasks."mutants:explain"]
 description = "Account for one mutant: mise run mutants:explain -- <ID-PREFIX>"
 run = "rust-mutants explain"
