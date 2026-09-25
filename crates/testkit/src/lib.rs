@@ -797,6 +797,12 @@ impl Drop for Holder {
 
 #[must_use]
 pub fn hold_session_lock(path: &Path) -> Option<Holder> {
+    if cfg!(windows) {
+        let _skipped =
+            Built::Unavailable(String::from("rustc locks sessions with LockFileEx here"))
+                .or_skip("a process that holds a rustc session lock");
+        return None;
+    }
     let script = if cfg!(target_os = "linux") {
         "use Fcntl qw(:flock); open(my $f, '+<', $ARGV[0]) or die $!; flock($f, LOCK_EX | LOCK_NB) or die $!; $| = 1; print \"held\\n\"; <STDIN>;"
     } else {
