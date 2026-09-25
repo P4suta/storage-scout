@@ -1,3 +1,9 @@
+[tools]
+typos = "latest"
+taplo = "latest"
+actionlint = "latest"
+lefthook = "latest"
+
 
 [tasks.fmt]
 description = "Format the workspace"
@@ -29,7 +35,11 @@ run = "cargo test --workspace --doc"
 
 [tasks.check]
 description = "Everything CI runs on one platform"
-depends = ["fmt:check", "clippy", "gates", "pure", "test", "test:doc"]
+depends = ["fmt:check", "clippy", "gates", "pure", "test", "test:doc", "lint:repo"]
+
+[tasks."lint:repo"]
+description = "Spelling, TOML formatting, and the workflows"
+run = ["typos", "taplo fmt --check", "actionlint"]
 
 [tasks.doctor]
 description = "Show what this host resolved: protected areas, gates, free space"

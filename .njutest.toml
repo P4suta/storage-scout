@@ -3,12 +3,12 @@ contract = "standard-v1"
 
 [project]
 exclude = [
-    "crates/cli/src/main.rs",
-    "crates/cli/src/report.rs",
-    "crates/cli/src/doctor.rs",
-    "crates/cli/src/trace.rs",
-    "crates/testkit/src/lib.rs",
-    "xtask/src/main.rs",
+  "crates/cli/src/main.rs",
+  "crates/cli/src/report.rs",
+  "crates/cli/src/doctor.rs",
+  "crates/cli/src/trace.rs",
+  "crates/testkit/src/lib.rs",
+  "xtask/src/main.rs",
 ]
 
 [execution]

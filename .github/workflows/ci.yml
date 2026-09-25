@@ -232,10 +232,25 @@ jobs:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
+  lint:
+    name: spelling, TOML, workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: typos,taplo,actionlint
+      - run: typos
+      - run: taplo fmt --check
+      - run: actionlint
+
   ci-success:
     name: ci-success
     if: always()
-    needs: [quality, sharing, mutants, coverage, msrv, pure, cross-check, deny]
+    needs: [quality, sharing, mutants, coverage, msrv, pure, cross-check, deny, lint]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
