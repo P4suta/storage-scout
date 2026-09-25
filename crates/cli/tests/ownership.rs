@@ -335,6 +335,35 @@ fn a_worktree_whose_repository_cannot_be_read_is_not_called_forgotten() {
 }
 
 #[test]
+fn a_worktree_git_refuses_to_read_keeps_its_work_and_says_git_refused() {
+    let repo = Repo::new("own-refused");
+    let broken = repo.worktree("broken", &["--detach"]);
+    let target = build(&broken);
+    fs::remove_file(repo.work.join(".git/worktrees/broken/HEAD")).unwrap();
+    let report = repo
+        .scout()
+        .discover(&ScanOptions {
+            roots: vec![repo.root().to_path_buf()],
+            top: 0,
+            min_size: Bytes::ZERO,
+            max_depth: Some(0),
+            excludes: Vec::new(),
+            threads: None,
+            measure: Measure::Allocated,
+        })
+        .unwrap();
+    let canonical = fs::canonicalize(&target).unwrap();
+    let found = report
+        .candidates
+        .iter()
+        .find(|each| each.path() == canonical)
+        .unwrap();
+    assert_eq!(found.candidate().settlement(), Settlement::Active);
+    let basis = serde_json::to_string(found.candidate().ownership()).unwrap();
+    assert!(basis.contains("refused"), "{basis}");
+}
+
+#[test]
 fn a_git_link_that_is_a_symbolic_link_is_not_trusted() {
     let temp = tempdir("own-linked-git");
     let root = temp.path();

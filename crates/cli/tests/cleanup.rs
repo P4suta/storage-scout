@@ -667,9 +667,19 @@ fn a_lock_that_cannot_be_opened_is_never_taken_for_free() {
     let Some(restricted) = testkit::restrict(&lock, 0o000) else {
         return;
     };
+    let previewed = apply(&plan, Mode::DryRun);
     let refused = apply(&plan, Mode::Execute);
     drop(restricted);
     testkit::assert_present(&lock);
+    assert!(
+        matches!(
+            status(&previewed),
+            Status::Rejected {
+                rejection: Rejection::LivenessUnknown { .. }
+            }
+        ),
+        "{previewed:#?}"
+    );
     assert!(
         matches!(
             status(&refused),

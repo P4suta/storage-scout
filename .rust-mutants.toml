@@ -170,6 +170,7 @@ path = "crates/cli/src/platform/share_linux.rs"
 item = "facts"
 rule = "eq-to-neq"
 original = "=="
+line = 100
 reason = "sharing in place never refuses an executable, so the mode it records changes nothing on this platform"
 outcome = "survived"
 
@@ -333,6 +334,30 @@ original = "contents.names.has_file(crate::owners::MARKER_NAME)"
 reason = "looking for a marker in every directory finds none where there is none, so only the time changes"
 outcome = "survived"
 
+[[mutation.expect]]
+path = "crates/cli/src/platform/share_linux.rs"
+item = "filesystem"
+rule = "eq-to-neq"
+original = "=="
+reason = "btrfs and XFS share the same way, so taking one for the other changes nothing measured"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/share_linux.rs"
+item = "signed"
+rule = "return-default"
+original = "value.into()"
+reason = "on the btrfs volume CI measures, reading every magic as zero still finds btrfs first"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "links_of"
+rule = "return-default"
+original = "metadata.nlink()"
+reason = "sharing in place never refuses a file with several names, so the count changes nothing on the platform CI measures"
+outcome = "survived"
+
 [[mutation.skip]]
 path = "crates/cli/src/busy.rs"
 lines = "197-197"
@@ -340,8 +365,13 @@ reason = "the identity of a lock file this process has just opened cannot fail t
 
 [[mutation.skip]]
 path = "crates/cli/src/platform/share_linux.rs"
-lines = "131-138"
+lines = "131-131"
 reason = "FIDEDUPERANGE fails or reports a negative status only for requests the checks before it already refuse"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/share_linux.rs"
+lines = "136-138"
+reason = "the kernel reports a negative status only for requests the checks before it already refuse"
 
 [[mutation.skip]]
 path = "crates/cli/src/platform/share_linux.rs"

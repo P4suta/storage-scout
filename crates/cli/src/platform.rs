@@ -347,6 +347,15 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_of_another_length_is_left_alone() {
+        let Some(fixture) = Fixture::new("platform-length") else {
+            return;
+        };
+        write_patterned(&fixture.root.join(dup()), LEN * 2, 1);
+        assert_eq!(fixture.share(dup()), Err(Failure::DuplicateChanged));
+    }
+
+    #[test]
     fn a_duplicate_reached_through_a_link_is_left_alone() {
         let Some(fixture) = Fixture::new("platform-link") else {
             return;
