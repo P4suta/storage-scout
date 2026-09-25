@@ -384,7 +384,7 @@ struct Stock {
     found: Found,
     subject: Subject,
     method: Option<Method>,
-    files: Vec<(PathBuf, PathBuf, FileFacts)>,
+    files: Vec<(Box<Path>, FileFacts)>,
 }
 
 #[derive(Default)]
@@ -437,7 +437,7 @@ impl Pool {
                 stock
                     .files
                     .iter()
-                    .map(|(_, _, facts)| facts.identity)
+                    .map(|(_, facts)| facts.identity)
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
@@ -452,12 +452,16 @@ impl Pool {
                     unreadable: listed.unreadable,
                 },
                 Some(method),
-                listed.files,
+                listed
+                    .files
+                    .into_iter()
+                    .map(|(_, relative, facts)| (relative.into_boxed_path(), facts))
+                    .collect::<Vec<_>>(),
             ),
         };
         let fresh = files
             .iter()
-            .map(|(_, _, facts)| facts.identity)
+            .map(|(_, facts)| facts.identity)
             .filter(|identity| !known.contains(identity))
             .collect();
         self.stocks.insert(
@@ -480,7 +484,22 @@ impl Pool {
         self.stocks.remove(root);
     }
 
+    fn lengths(&self, focus: &Focus<'_>) -> Option<BTreeSet<u64>> {
+        match focus {
+            Focus::Everything => None,
+            Focus::Fresh { identities, .. } => Some(
+                self.stocks
+                    .values()
+                    .flat_map(|stock| &stock.files)
+                    .filter(|(_, facts)| identities.contains(&facts.identity))
+                    .map(|(_, facts)| facts.len)
+                    .collect(),
+            ),
+        }
+    }
+
     fn items(&self, focus: &Focus<'_>) -> (Vec<Subject>, Vec<Item<'_>>) {
+        let lengths = self.lengths(focus);
         let mut subjects = Vec::new();
         let mut items = Vec::new();
         let mut seen = BTreeSet::new();
@@ -491,9 +510,16 @@ impl Pool {
             let Some(method) = stock.method else {
                 continue;
             };
-            for (path, relative, facts) in &stock.files {
+            for (relative, facts) in &stock.files {
+                if lengths
+                    .as_ref()
+                    .is_some_and(|lengths| !lengths.contains(&facts.len))
+                {
+                    continue;
+                }
+                let path = root.join(relative);
                 if seen.insert(facts.identity)
-                    && let Ok(location) = host::locate(path)
+                    && let Ok(location) = host::locate(&path)
                 {
                     items.push(Item {
                         record: Record {
@@ -508,8 +534,8 @@ impl Pool {
                             sharing: facts.sharing,
                         },
                         found: &stock.found,
-                        path: path.clone(),
-                        relative: relative.clone(),
+                        path,
+                        relative: relative.to_path_buf(),
                     });
                 }
             }
