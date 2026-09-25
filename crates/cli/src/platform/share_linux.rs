@@ -60,13 +60,14 @@ pub(super) fn filesystem(path: &Path) -> io::Result<Filesystem> {
     // SAFETY: `statfs` returned 0, so it initialised the buffer.
     let stat = unsafe { stat.assume_init() };
     let kind = signed(stat.f_type);
-    Ok(if kind == signed(libc::BTRFS_SUPER_MAGIC) {
-        Filesystem::Btrfs
-    } else if kind == signed(libc::XFS_SUPER_MAGIC) {
-        Filesystem::Xfs
-    } else {
-        Filesystem::Other
-    })
+    let kinds = [
+        (signed(libc::BTRFS_SUPER_MAGIC), Filesystem::Btrfs),
+        (signed(libc::XFS_SUPER_MAGIC), Filesystem::Xfs),
+    ];
+    Ok(kinds
+        .into_iter()
+        .find(|(magic, _)| *magic == kind)
+        .map_or(Filesystem::Other, |(_, filesystem)| filesystem))
 }
 
 fn signed<T: Into<i64>>(value: T) -> i64 {
@@ -78,11 +79,8 @@ fn caller() -> libc::uid_t {
     unsafe { libc::geteuid() }
 }
 
-fn size(stat: &libc::stat) -> Option<u64> {
-    match u64::try_from(stat.st_size) {
-        Ok(len) => Some(len),
-        Err(_negative) => None,
-    }
+const fn size(stat: &libc::stat) -> u64 {
+    stat.st_size.unsigned_abs()
 }
 
 #[expect(
@@ -152,7 +150,7 @@ pub(super) fn share(tree: &Tree, method: Method, request: &Request<'_>) -> Resul
     }
     let keeper = imp::open_regular(request.keeper).map_err(|_gone| Failure::KeeperChanged)?;
     let kept = imp::stat_fd(&keeper).map_err(failed(Step::Inspect))?;
-    if imp::stat_identity(&kept) != request.keeper_identity || size(&kept) != Some(request.len) {
+    if imp::stat_identity(&kept) != request.keeper_identity || size(&kept) != request.len {
         return Err(Failure::KeeperChanged);
     }
     let (dir, name) = match tree.locate(request.duplicate).map_err(failed(Step::Open))? {
@@ -170,7 +168,7 @@ pub(super) fn share(tree: &Tree, method: Method, request: &Request<'_>) -> Resul
     .map_err(|_gone| Failure::DuplicateChanged)?;
     let found = imp::stat_fd(&duplicate).map_err(failed(Step::Inspect))?;
     if imp::stat_identity(&found) != request.duplicate_identity
-        || size(&found) != Some(request.len)
+        || size(&found) != request.len
         || found.st_uid != caller()
     {
         return Err(Failure::DuplicateChanged);

@@ -429,11 +429,24 @@ fn a_detached_run_finishes_in_the_background() {
     };
     let config = policy.to_str().unwrap();
     let detached = hooked(
-        &["auto", "--config", config, "--execute", "--detach"],
+        &[
+            "auto",
+            "--config",
+            config,
+            "--execute",
+            "--detach",
+            "--json",
+        ],
         &state,
         b"",
     );
     assert_eq!(detached.status.code(), Some(0), "{detached:#?}");
+    let answer = json(&detached);
+    assert_eq!(answer["detached"], "spawned", "{answer}");
+    assert!(
+        answer["pid"].as_u64().is_some_and(|pid| pid > 0),
+        "{answer}"
+    );
     let flag = |path: &Path| {
         path.extension()
             .is_some_and(|extension| extension == "pending")

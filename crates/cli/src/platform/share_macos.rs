@@ -75,11 +75,8 @@ fn widen(len: usize) -> u64 {
     }
 }
 
-fn size(stat: &libc::stat) -> Option<u64> {
-    match u64::try_from(stat.st_size) {
-        Ok(len) => Some(len),
-        Err(_negative) => None,
-    }
+const fn size(stat: &libc::stat) -> u64 {
+    stat.st_size.unsigned_abs()
 }
 
 fn caller() -> libc::uid_t {
@@ -483,7 +480,7 @@ fn restore(names: &Names<'_>, clone: &Opened, duplicate: &Opened) -> Result<(), 
 fn open_keeper(request: &Request<'_>) -> Result<Opened, Failure> {
     let file = imp::open_regular(request.keeper).map_err(|_gone| Failure::KeeperChanged)?;
     let stat = imp::stat_fd(&file).map_err(failed(Step::Inspect))?;
-    if imp::stat_identity(&stat) != request.keeper_identity || size(&stat) != Some(request.len) {
+    if imp::stat_identity(&stat) != request.keeper_identity || size(&stat) != request.len {
         return Err(Failure::KeeperChanged);
     }
     Ok(Opened { file, stat })
@@ -492,7 +489,7 @@ fn open_keeper(request: &Request<'_>) -> Result<Opened, Failure> {
 fn open_duplicate(dir: &OwnedFd, name: &CStr, request: &Request<'_>) -> Result<Opened, Failure> {
     let opened = open_file(dir, name).map_err(|_gone| Failure::DuplicateChanged)?;
     if imp::stat_identity(&opened.stat) != request.duplicate_identity
-        || size(&opened.stat) != Some(request.len)
+        || size(&opened.stat) != request.len
         || !replaceable(&opened.stat)
     {
         return Err(Failure::DuplicateChanged);

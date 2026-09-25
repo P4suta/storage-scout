@@ -115,7 +115,7 @@ pub(crate) fn remove_tree(
 pub(crate) struct FileFacts {
     pub identity: Identity,
     pub len: u64,
-    pub links: u32,
+    pub links: u64,
     pub owner: Owner,
     pub mode: Mode,
     pub sharing: Sharing,
@@ -320,6 +320,29 @@ mod tests {
             fixture.share_as(Path::new("sub/missing.bin"), right, LEN),
             Err(Failure::DuplicateChanged)
         );
+        fixture.share(dup()).unwrap();
+    }
+
+    #[test]
+    fn a_method_this_platform_does_not_have_shares_nothing() {
+        let Some(fixture) = Fixture::new("platform-method") else {
+            return;
+        };
+        let other = match fixture.method {
+            Method::CloneAndSwap => Method::DedupeRange,
+            Method::DedupeRange => Method::CloneAndSwap,
+        };
+        let request = Request {
+            keeper: &fixture.keeper,
+            keeper_identity: fixture.keeper_identity,
+            duplicate: dup(),
+            duplicate_identity: fixture.identity_of(dup()),
+            len: LEN,
+        };
+        assert!(matches!(
+            fixture.tree.share(other, &request),
+            Err(Failure::Io { .. })
+        ));
         fixture.share(dup()).unwrap();
     }
 

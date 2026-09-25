@@ -69,6 +69,310 @@ original = "<="
 reason = "a file always has at least one link, and the linked table counts a single-link file exactly as the unlinked sum does"
 outcome = "survived"
 
+[[mutation.expect]]
+path = "crates/cli/src/apply/capability.rs"
+item = "Authorized::new"
+rule = "condition-to-true"
+original = "&host::locate(&path)? == clearance.location()"
+reason = "the path is the one the clearance was made from, so its location always matches; the check guards callers, not a state a run can reach"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/dedupe/capability.rs"
+item = "Shareable::new"
+rule = "condition-to-false"
+original = "&host::locate(path)? != clearance.location()"
+reason = "the path is the one the clearance was made from, so its location always matches; the check guards callers, not a state a run can reach"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/dedupe.rs"
+item = "inventory"
+rule = "condition-to-true"
+original = "platform::device(&metadata) == device"
+reason = "only a mount point under a candidate differs in device, and the mount tests are left out of measurement"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/dedupe.rs"
+item = "settle"
+rule = "condition-to-true"
+original = "!held\n                .as_ref()\n                .is_some_and(|(current, _)| ptr::eq(*current, found))"
+reason = "taking the same target's lease again for each pair is slower and releases it between pairs, but shares the same files"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/measure.rs"
+item = "Tally::allocated"
+rule = "condition-to-false"
+original = "measured.links <= 1"
+reason = "a file always has at least one link, and the linked table counts a single-link file exactly as the unlinked sum does"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/observe.rs"
+item = "cache_tag"
+rule = "condition-to-false"
+original = "!entries.has_file(CACHE_TAG_NAME)"
+reason = "reading a missing tag yields Invalid instead of Absent, and neither names a kind"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/observe.rs"
+item = "owner_tag"
+rule = "condition-to-false"
+original = "!entries.has_file(crate::owners::MARKER_NAME)"
+reason = "reading a missing marker yields Foreign instead of Absent, and neither names a kind"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/owners.rs"
+item = "dot_git"
+rule = "remove-match-guard"
+original = "error.kind() == io::ErrorKind::NotFound"
+reason = "a .git that cannot be looked at means its directory cannot be searched, and then nothing below it is a candidate"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/owners.rs"
+item = "gitdir"
+rule = "condition-to-false"
+original = "target.is_absolute()"
+reason = "joining an absolute gitdir onto its directory yields the gitdir itself"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/share_linux.rs"
+item = "facts"
+rule = "condition-to-true"
+original = "metadata.uid() == caller()"
+reason = "only another user's file differs, and tests cannot create one without privileges"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/share_linux.rs"
+item = "facts"
+rule = "condition-to-false"
+original = "metadata.mode() & 0o111 == 0"
+reason = "sharing in place never refuses an executable, so the mode it records changes nothing on this platform"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/share_linux.rs"
+item = "facts"
+rule = "condition-to-true"
+original = "metadata.mode() & 0o111 == 0"
+reason = "sharing in place never refuses an executable, so the mode it records changes nothing on this platform"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/share_linux.rs"
+item = "facts"
+rule = "eq-to-neq"
+original = "=="
+reason = "sharing in place never refuses an executable, so the mode it records changes nothing on this platform"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/share_linux.rs"
+item = "facts"
+rule = "negate-condition"
+original = "metadata.mode() & 0o111 == 0"
+reason = "sharing in place never refuses an executable, so the mode it records changes nothing on this platform"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/share_linux.rs"
+item = "dedupe"
+rule = "condition-to-false"
+original = "result != 0"
+reason = "FIDEDUPERANGE fails only on requests the checks before it already refuse"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/share_linux.rs"
+item = "share"
+rule = "condition-to-false"
+original = "shared == 0"
+reason = "the kernel reports progress for every range it accepts, so a zero never arrives"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "free_space"
+rule = "condition-to-false"
+original = "stat.f_frsize == 0"
+reason = "every filesystem a test runs on reports f_frsize; the fallback is for those that do not"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "free_space"
+rule = "condition-to-true"
+original = "stat.f_frsize == 0"
+reason = "every filesystem a test runs on reports f_frsize; the fallback is for those that do not"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "free_space"
+rule = "eq-to-neq"
+original = "=="
+reason = "every filesystem a test runs on reports f_frsize; the fallback is for those that do not"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "free_space"
+rule = "negate-condition"
+original = "stat.f_frsize == 0"
+reason = "every filesystem a test runs on reports f_frsize; the fallback is for those that do not"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "stat_at"
+rule = "condition-to-false"
+original = "result != 0"
+reason = "fstatat of a name just listed in an open directory does not fail"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "stat_fd"
+rule = "condition-to-false"
+original = "result != 0"
+reason = "fstat of an open descriptor does not fail"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "names"
+rule = "condition-to-false"
+original = "stream.is_null()"
+reason = "fdopendir of a descriptor just opened as a directory does not fail"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "make_writable"
+rule = "condition-to-false"
+original = "wanted == stat.st_mode"
+reason = "granting the owner a permission it already has changes nothing"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "make_writable"
+rule = "condition-to-true"
+original = "result == 0"
+reason = "fchmod by the owner of an open directory does not fail"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "make_writable"
+rule = "return-ok-default"
+original = "if result == 0 {\n        Ok(())\n    } else {\n        Err(io::Error::last_os_error())\n    }"
+reason = "fchmod by the owner of an open directory does not fail"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "Walk::clear"
+rule = "condition-to-false"
+original = "found != self.device"
+reason = "only a mount point inside a tree differs in device, and the mount tests are left out of measurement"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "Walk::clear"
+rule = "condition-to-false"
+original = "stat_identity(&stat_fd(&opened).map_err(child_io)?) != stat_identity(&stat)"
+reason = "a directory replaced between listing and opening is a race no test can stage"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "Walk::clear"
+rule = "condition-to-false"
+original = "self.keep.contains(&stat_identity(&stat))"
+reason = "the kept lock files matter only to a build that starts during removal, a race no test can stage"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "open_root"
+rule = "condition-to-false"
+original = "from != to"
+reason = "only a mount point differs in device from its parent, and the mount tests are left out of measurement"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "Tree::locate"
+rule = "condition-to-false"
+original = "device_number(stat_fd(&next)?.st_dev) != self.device"
+reason = "only a mount point under a tree differs in device, and the mount tests are left out of measurement"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "remove_tree"
+rule = "condition-to-false"
+original = "stat_identity(&stat_at(parent.as_raw_fd(), &name).map_err(io)?) != expected"
+reason = "a root replaced between emptying and removal is a race no test can stage"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/scan.rs"
+item = "walk"
+rule = "condition-to-true"
+original = "contents.names.has_file(crate::owners::MARKER_NAME)"
+reason = "looking for a marker in every directory finds none where there is none, so only the time changes"
+outcome = "survived"
+
+[[mutation.skip]]
+path = "crates/cli/src/busy.rs"
+lines = "197-197"
+reason = "the identity of a lock file this process has just opened cannot fail to be read"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/share_linux.rs"
+lines = "131-138"
+reason = "FIDEDUPERANGE fails or reports a negative status only for requests the checks before it already refuse"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/share_linux.rs"
+lines = "181-183"
+reason = "the kernel reports progress for every range it accepts, so a zero never arrives"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/unix.rs"
+lines = "237-237"
+reason = "fchmod by the owner of an open directory does not fail"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/unix.rs"
+lines = "265-269"
+reason = "only a mount point inside a tree differs in device, and the mount tests are left out of measurement"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/unix.rs"
+lines = "273-273"
+reason = "a directory replaced between listing and opening is a race no test can stage"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/unix.rs"
+lines = "451-451"
+reason = "a root replaced between emptying and removal is a race no test can stage"
+
+[[mutation.skip]]
+path = "crates/cli/src/scan.rs"
+item = "drain"
+reason = "a mutex is poisoned only by a thread that panics, and no scanning thread panics"
+
 [execution]
 locked = true
 

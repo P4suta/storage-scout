@@ -81,12 +81,44 @@ mod tests {
 
     use super::*;
 
+    const LOOPS: usize = 64;
+
+    struct Counted<'a> {
+        station: &'a Station,
+        holds: Cell<usize>,
+    }
+
+    impl Rendezvous for Counted<'_> {
+        type Held = Held;
+
+        fn raise(&self) -> io::Result<()> {
+            Rendezvous::raise(self.station)
+        }
+
+        fn lower(&self) -> io::Result<bool> {
+            Rendezvous::lower(self.station)
+        }
+
+        fn raised(&self) -> io::Result<bool> {
+            Rendezvous::raised(self.station)
+        }
+
+        fn hold(&self) -> io::Result<Option<Held>> {
+            self.holds.set(self.holds.get().saturating_add(1));
+            if self.holds.get() >= LOOPS {
+                return Err(io::Error::other("drive never stops"));
+            }
+            Rendezvous::hold(self.station)
+        }
+    }
+
     #[derive(Default)]
     struct Memory {
         flag: Cell<bool>,
         held: Cell<bool>,
         broken: Cell<bool>,
         holds_left: Cell<Option<usize>>,
+        holds: Cell<usize>,
         raise_on_release: Cell<bool>,
         log: RefCell<Vec<&'static str>>,
     }
@@ -122,6 +154,10 @@ mod tests {
         }
 
         fn hold(&self) -> io::Result<Option<Token<'a>>> {
+            self.holds.set(self.holds.get().saturating_add(1));
+            if self.holds.get() >= LOOPS {
+                return Err(io::Error::other("drive never stops"));
+            }
             if let Some(left) = self.holds_left.get() {
                 if left == 0 {
                     return Ok(None);
@@ -193,21 +229,25 @@ mod tests {
     fn the_station_on_disk_keeps_the_same_promises() {
         let temp = testkit::tempdir("coalesce-station");
         let station = Station::for_policy(temp.path(), &temp.path().join("auto.toml"));
+        let counted = || Counted {
+            station: &station,
+            holds: Cell::new(0),
+        };
         assert_eq!(
-            drive(&station, || -> Result<(), ()> { Ok(()) }).unwrap(),
+            drive(&counted(), || -> Result<(), ()> { Ok(()) }).unwrap(),
             Coalescing::Ran { runs: 1 }
         );
         assert!(!Rendezvous::raised(&station).unwrap());
         let holder = Rendezvous::hold(&station).unwrap().unwrap();
         assert!(Rendezvous::hold(&station).unwrap().is_none());
         assert_eq!(
-            drive(&station, || -> Result<(), ()> { Ok(()) }).unwrap(),
+            drive(&counted(), || -> Result<(), ()> { Ok(()) }).unwrap(),
             Coalescing::Handed
         );
         assert!(Rendezvous::raised(&station).unwrap());
         drop(holder);
         assert_eq!(
-            drive(&station, || -> Result<(), ()> { Ok(()) }).unwrap(),
+            drive(&counted(), || -> Result<(), ()> { Ok(()) }).unwrap(),
             Coalescing::Ran { runs: 1 }
         );
         assert!(!Rendezvous::lower(&station).unwrap());

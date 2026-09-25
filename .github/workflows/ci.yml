@@ -8,9 +8,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
-  NJUTEST_REV: 7b41fe94688bfb0387b7a55c05d1471d1327f901
+  NJUTEST_REV: 0821533b67b451d80fcff38517f1c7db1d25481a
 
 jobs:
   quality:

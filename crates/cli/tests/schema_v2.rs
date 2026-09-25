@@ -118,6 +118,13 @@ fn documents() -> BTreeMap<String, Value> {
     documents.insert("doctor".to_owned(), to_value(&scout.diagnose(None)));
     documents.insert("dedupe".to_owned(), to_value(&dedupe));
     documents.insert(
+        "detached".to_owned(),
+        json!({
+            "spawned": to_value(&storage_scout::hook::Detached::Spawned { pid: 1 }),
+            "handed": to_value(&storage_scout::hook::Detached::Handed),
+        }),
+    );
+    documents.insert(
         "dedupe-pairs".to_owned(),
         json!({ "pairs": to_value(&pairs) }),
     );

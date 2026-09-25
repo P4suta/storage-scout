@@ -484,6 +484,10 @@ mod tests {
             unix("/").relative(&windows(r"C:\x"), Case::Insensitive),
             None
         );
+        assert_eq!(
+            windows(r"C:\").relative(&windows(r"\\server\share\x"), Case::Insensitive),
+            None
+        );
         assert!(
             windows(r"C:\")
                 .relative(&windows(r"c:\x"), Case::Insensitive)

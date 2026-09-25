@@ -268,6 +268,36 @@ fn the_nearest_repository_owns_what_is_inside_it() {
 }
 
 #[test]
+fn a_repository_that_names_no_default_branch_keeps_its_work_and_says_why() {
+    let repo = Repo::new("own-headless");
+    let detached = repo.worktree("detached", &["--detach"]);
+    repo.git
+        .run(&repo.work, &["remote", "set-head", "origin", "--delete"]);
+    let target = build(&detached);
+    let report = repo
+        .scout()
+        .discover(&ScanOptions {
+            roots: vec![repo.root().to_path_buf()],
+            top: 0,
+            min_size: Bytes::ZERO,
+            max_depth: Some(0),
+            excludes: Vec::new(),
+            threads: None,
+            measure: Measure::Allocated,
+        })
+        .unwrap();
+    let canonical = fs::canonicalize(&target).unwrap();
+    let found = report
+        .candidates
+        .iter()
+        .find(|each| each.path() == canonical)
+        .unwrap();
+    assert_eq!(found.candidate().settlement(), Settlement::Active);
+    let basis = serde_json::to_string(found.candidate().ownership()).unwrap();
+    assert!(basis.contains("no-default-branch"), "{basis}");
+}
+
+#[test]
 fn a_history_unrelated_to_main_is_active() {
     let repo = Repo::new("own-unrelated");
     let lonely = repo.worktree("lonely", &["--detach"]);

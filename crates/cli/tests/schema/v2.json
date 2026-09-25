@@ -50,6 +50,13 @@
     "pairs[].status.rejection.reason",
     "pairs[].status.status"
   ],
+  "detached": [
+    "handed",
+    "handed.detached",
+    "spawned",
+    "spawned.detached",
+    "spawned.pid"
+  ],
   "discovery": [
     "candidates",
     "candidates[].id",

@@ -32,10 +32,10 @@ pub fn relevant(event: Event, arguments: &[String], input: &[u8], repository: &P
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(tag = "detached", rename_all = "kebab-case")]
 pub enum Detached {
     Handed,
-    Spawned,
+    Spawned { pid: u32 },
 }
 
 pub fn detach(policy: &Path, arguments: &[OsString]) -> io::Result<Detached> {
@@ -45,8 +45,8 @@ pub fn detach(policy: &Path, arguments: &[OsString]) -> io::Result<Detached> {
         return Ok(Detached::Handed);
     }
     let program = std::env::current_exe()?;
-    spawn::detached(&program, arguments, &state)?;
-    Ok(Detached::Spawned)
+    let pid = spawn::detached(&program, arguments, &state)?;
+    Ok(Detached::Spawned { pid })
 }
 
 #[derive(Debug, thiserror::Error)]

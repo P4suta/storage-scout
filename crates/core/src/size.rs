@@ -94,10 +94,10 @@ impl FromStr for Bytes {
         }
         let whole_value = digits(whole)?;
         let fraction_value = digits(fraction)?;
-        let scale = match u32::try_from(fraction.len()) {
-            Ok(places) => 10u128.checked_pow(places).ok_or(SizeError::Overflow)?,
-            Err(_too_long) => return Err(SizeError::Overflow),
-        };
+        let scale = fraction
+            .bytes()
+            .try_fold(1u128, |scale, _| scale.checked_mul(10))
+            .ok_or(SizeError::Overflow)?;
         let value = whole_value
             .checked_mul(multiplier)
             .and_then(|scaled| {

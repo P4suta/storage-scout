@@ -309,11 +309,8 @@ pub(super) fn identity_of(metadata: &Metadata) -> Identity {
     identity_from(metadata.dev(), metadata.ino())
 }
 
-pub(super) fn links_of(metadata: &Metadata) -> u32 {
-    match u32::try_from(metadata.nlink()) {
-        Ok(links) => links.max(1),
-        Err(_too_many) => u32::MAX,
-    }
+pub(super) fn links_of(metadata: &Metadata) -> u64 {
+    metadata.nlink()
 }
 
 struct Root {

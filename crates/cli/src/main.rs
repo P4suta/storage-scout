@@ -485,8 +485,11 @@ fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
             config.clone().into_os_string(),
             OsString::from("--execute"),
         ];
-        storage_scout::hook::detach(&config, &forwarded)
+        let detached = storage_scout::hook::detach(&config, &forwarded)
             .context("cannot start the background run")?;
+        if args.output.format() == Format::Json {
+            render_json(&detached, &mut io::stdout().lock())?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let text = fs::read_to_string(&config)

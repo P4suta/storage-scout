@@ -116,7 +116,7 @@ enum Answer {
     clippy::disallowed_methods,
     reason = "the one place git runs, with typed queries and a scrubbed environment"
 )]
-fn run(root: &Path, query: Query<'_>) -> Result<Answer, GitFailure> {
+fn exec(root: &Path, query: Query<'_>) -> Result<(Option<i32>, Vec<u8>), GitFailure> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -144,10 +144,14 @@ fn run(root: &Path, query: Query<'_>) -> Result<Answer, GitFailure> {
         command.output().map_err(|error| GitFailure::Unavailable {
             failure: failure::describe(&error),
         })?;
-    match (query, status.code()) {
-        (_, Some(0)) => Ok(Answer::Yes(stdout)),
-        (Query::IsAncestor { .. } | Query::MergeBase { .. }, Some(1)) => Ok(Answer::No),
-        (_, code) => Err(GitFailure::Refused {
+    Ok((status.code(), stdout))
+}
+
+fn run(root: &Path, query: Query<'_>) -> Result<Answer, GitFailure> {
+    match exec(root, query)? {
+        (Some(0), stdout) => Ok(Answer::Yes(stdout)),
+        (Some(1), _) => Ok(Answer::No),
+        (code, _) => Err(GitFailure::Refused {
             query: query.name(),
             code,
         }),
@@ -155,11 +159,11 @@ fn run(root: &Path, query: Query<'_>) -> Result<Answer, GitFailure> {
 }
 
 fn output(root: &Path, query: Query<'_>) -> Result<Vec<u8>, GitFailure> {
-    match run(root, query)? {
-        Answer::Yes(output) => Ok(output),
-        Answer::No => Err(GitFailure::Refused {
+    match exec(root, query)? {
+        (Some(0), stdout) => Ok(stdout),
+        (code, _) => Err(GitFailure::Refused {
             query: query.name(),
-            code: Some(1),
+            code,
         }),
     }
 }
