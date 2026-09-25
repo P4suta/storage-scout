@@ -649,7 +649,7 @@ mod tests {
                 .unwrap(),
             Pruned::Moved
         );
-        testkit::assert_present(&lockless_path);
+        testkit::assert_present(lockless_path.join("query.bin"));
         let own = identity(&lockless_path).unwrap();
         assert_eq!(
             pruning
@@ -673,6 +673,70 @@ mod tests {
                 )
                 .unwrap(),
             Pruned::Moved
+        );
+    }
+
+    #[test]
+    fn a_volume_reports_the_space_it_has_left() {
+        let temp = testkit::tempdir("platform-free");
+        assert!(free_space(temp.path()).unwrap() > 0);
+    }
+
+    #[test]
+    fn a_session_or_file_that_cannot_be_reached_is_an_error_not_a_move() {
+        let temp = testkit::tempdir("platform-prune-denied");
+        let root = temp.path().join("root");
+        let unit = root.join("incremental/app-1");
+        write_patterned(&unit.join("s-a-b-c/query.bin"), 16, 1);
+        write_patterned(&unit.join("s-a-b.lock"), 0, 0);
+        write_patterned(&unit.join("s-d-e-f/query.bin"), 16, 1);
+        write_patterned(&root.join("deps/sealed/stale.o"), 16, 2);
+        write_patterned(&root.join("deps/listed/stale.o"), 16, 3);
+        let Some(pruning) = pruning(&root) else {
+            return;
+        };
+        let locked = Path::new("incremental/app-1/s-a-b-c");
+        let locked_identity = identity(&root.join(locked)).unwrap();
+        let closed = Path::new("incremental/app-1/s-d-e-f");
+        let closed_identity = identity(&root.join(closed)).unwrap();
+        let sealed = identity(&root.join("deps/sealed/stale.o")).unwrap();
+        let listed = identity(&root.join("deps/listed/stale.o")).unwrap();
+        let Some(_lock) = testkit::restrict(&unit.join("s-a-b.lock"), 0o000) else {
+            return;
+        };
+        let Some(_closed) = testkit::restrict(&root.join(closed), 0o000) else {
+            return;
+        };
+        let Some(_sealed) = testkit::restrict(&root.join("deps/sealed"), 0o000) else {
+            return;
+        };
+        let Some(_listed) = testkit::restrict(&root.join("deps/listed"), 0o400) else {
+            return;
+        };
+        let unlocked = std::ffi::OsStr::new("s-a-b.lock");
+        assert!(matches!(
+            pruning.prune_session(locked, unlocked, locked_identity, &root.join(locked)),
+            Err(WalkError::Io { error, .. }) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        testkit::assert_present(root.join(locked).join("query.bin"));
+        let lockless = std::ffi::OsStr::new("s-d-e.lock");
+        assert!(matches!(
+            pruning.prune_session(closed, lockless, closed_identity, &root.join(closed)),
+            Err(WalkError::Io { error, .. }) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(
+            pruning
+                .prune_file(Path::new("deps/sealed/stale.o"), sealed)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            pruning
+                .prune_file(Path::new("deps/listed/stale.o"), listed)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
         );
     }
 }

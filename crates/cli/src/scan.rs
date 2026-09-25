@@ -484,23 +484,26 @@ fn walk(
         metadata,
         location: &location,
     };
-    let admission = admission(&here, region, &contents, collector);
-    if admission.is_none()
-        && collector.descent != Descent::Measure
-        && contents.names.has_file(CARGO_MANIFEST)
-        && let Ok(mut hosts) = collector.hosts.lock()
-    {
-        hosts.push(directory.to_path_buf());
-    }
-    let admission = match (collector.descent, admission) {
+    let admission = match (
+        collector.descent,
+        admission(&here, region, &contents, collector),
+    ) {
         (Descent::Sight(_), Some(admission)) => {
             sighted(directory, admission, collector);
             return Tally::empty(collector.options.measure);
         },
-        (Descent::Sight(Reach::Children), None) if depth > 0 => {
-            return Tally::empty(collector.options.measure);
+        (Descent::Sight(reach), None) => {
+            if contents.names.has_file(CARGO_MANIFEST)
+                && let Ok(mut hosts) = collector.hosts.lock()
+            {
+                hosts.push(directory.to_path_buf());
+            }
+            if reach == Reach::Children && depth > 0 {
+                return Tally::empty(collector.options.measure);
+            }
+            None
         },
-        (Descent::Measure | Descent::Sight(_), admission) => admission,
+        (Descent::Measure, admission) => admission,
     };
     let inside = match (region, &admission) {
         (Region::Artifact, _) | (Region::Root | Region::Open { .. }, Some(_)) => true,
@@ -508,13 +511,15 @@ fn walk(
     };
 
     let mut tally = match collector.descent {
-        Descent::Measure => files(&contents.files, collector),
+        Descent::Measure => {
+            let mut tally = files(&contents.files, collector);
+            if contents.names.has_file(crate::owners::MARKER_NAME) {
+                tally.marker(directory);
+            }
+            tally
+        },
         Descent::Sight(_) => Tally::empty(collector.options.measure),
     };
-    if collector.descent == Descent::Measure && contents.names.has_file(crate::owners::MARKER_NAME)
-    {
-        tally.marker(directory);
-    }
     let children = contents
         .directories
         .par_iter()
@@ -702,5 +707,42 @@ fn record(directory: &Path, admission: Admission, tally: &Tally, collector: &Col
             path: directory.to_path_buf(),
             candidate,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sighting_names_every_project_it_passes_that_has_no_target_yet() {
+        let temp = testkit::tempdir("scan-hosts");
+        let root = fs::canonicalize(temp.path()).unwrap().join("work");
+        let built = testkit::write_cargo_project(&root.join("built"), 1);
+        testkit::write_cache_tag(&built);
+        let deep = root.join("deep").join("down").join("bare");
+        testkit::write_sized(&root.join("bare").join("Cargo.toml"), 1);
+        testkit::write_sized(&deep.join("Cargo.toml"), 1);
+        testkit::write_sized(&root.join("plain").join("readme"), 1);
+        let options = ScanOptions::sighting(std::slice::from_ref(&root), &[]);
+        let protection = testkit::open_protection();
+        let owners = Owners::default();
+        let everything = sight(&options, &protection, &owners, Reach::Everything);
+        assert_eq!(
+            everything.hosts,
+            [root.join("bare"), root.join("built"), deep]
+        );
+        assert_eq!(
+            everything
+                .report
+                .candidates
+                .iter()
+                .map(Found::path)
+                .collect::<Vec<_>>(),
+            [built.as_path()]
+        );
+        let children = sight(&options, &protection, &owners, Reach::Children);
+        assert_eq!(children.hosts, [root.join("bare"), root.join("built")]);
+        assert!(children.report.candidates.is_empty());
     }
 }

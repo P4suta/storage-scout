@@ -3,7 +3,7 @@ mod capability;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -29,7 +29,6 @@ use crate::{SCHEMA_VERSION, busy, observe};
 const FINGERPRINT: &str = ".fingerprint";
 const BUILD: &str = "build";
 const LONGEST_NAME: u64 = 4096;
-const SYMBOLS_PER_READ: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Removed {
@@ -241,13 +240,18 @@ fn sessions(root: &Path, profile: &Path, doomed: &mut Vec<Doomed>) {
 
 #[derive(Debug)]
 enum ImageError {
+    Absent,
     Io,
     Mach,
 }
 
 impl From<io::Error> for ImageError {
-    fn from(_unreadable: io::Error) -> Self {
-        Self::Io
+    fn from(error: io::Error) -> Self {
+        if error.kind() == io::ErrorKind::NotFound {
+            Self::Absent
+        } else {
+            Self::Io
+        }
     }
 }
 
@@ -257,40 +261,44 @@ impl From<MachError> for ImageError {
     }
 }
 
-fn exactly(file: &mut File, at: u64, len: usize) -> Result<Vec<u8>, ImageError> {
+fn exactly(file: &mut File, at: u64, len: u64) -> Result<Vec<u8>, ImageError> {
     file.seek(SeekFrom::Start(at))?;
-    let mut bytes = vec![0u8; len];
-    file.read_exact(&mut bytes)?;
-    Ok(bytes)
+    let mut bytes = Vec::new();
+    Read::take(&mut *file, len).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()) == Ok(len) {
+        Ok(bytes)
+    } else {
+        Err(ImageError::Mach)
+    }
+}
+
+fn debug_offsets(file: &mut File, symtab: &macho::Symtab) -> Result<Vec<u32>, ImageError> {
+    file.seek(SeekFrom::Start(symtab.symbols))?;
+    let mut symbols = BufReader::new(file);
+    let mut symbol = [0u8; macho::SYMBOL_LEN];
+    let mut offsets = Vec::new();
+    for _ in 0..symtab.count {
+        symbols.read_exact(&mut symbol)?;
+        offsets.extend(macho::debug_objects(&symbol));
+    }
+    Ok(offsets)
 }
 
 fn debug_objects(path: &Path) -> Result<BTreeSet<Vec<u8>>, ImageError> {
     let mut file = platform::open_regular(path)?;
-    let header = exactly(&mut file, 0, macho::HEADER_LEN)?;
+    let header = exactly(
+        &mut file,
+        0,
+        u64::try_from(macho::HEADER_LEN).map_err(|_wide| ImageError::Mach)?,
+    )?;
     let commands = macho::header(&header)?;
     let table = exactly(
         &mut file,
         u64::try_from(macho::HEADER_LEN).map_err(|_wide| ImageError::Mach)?,
-        usize::try_from(commands.len).map_err(|_wide| ImageError::Mach)?,
+        u64::from(commands.len),
     )?;
     let symtab = macho::symtab(&table, commands.count)?;
-    let mut offsets = Vec::new();
-    let mut remaining = symtab.count;
-    let mut at = symtab.symbols;
-    let per_read = u64::try_from(SYMBOLS_PER_READ).map_err(|_wide| ImageError::Mach)?;
-    let width = u64::try_from(macho::SYMBOL_LEN).map_err(|_wide| ImageError::Mach)?;
-    while remaining > 0 {
-        let count = remaining.min(per_read);
-        let len = count.checked_mul(width).ok_or(ImageError::Mach)?;
-        let symbols = exactly(
-            &mut file,
-            at,
-            usize::try_from(len).map_err(|_wide| ImageError::Mach)?,
-        )?;
-        offsets.extend(macho::debug_objects(&symbols));
-        at = at.checked_add(len).ok_or(ImageError::Mach)?;
-        remaining = remaining.saturating_sub(count);
-    }
+    let offsets = debug_offsets(&mut file, &symtab)?;
     let mut names = BTreeSet::new();
     for offset in offsets {
         let offset = u64::from(offset);
@@ -299,8 +307,7 @@ fn debug_objects(path: &Path) -> Result<BTreeSet<Vec<u8>>, ImageError> {
             .checked_sub(offset)
             .ok_or(ImageError::Mach)?;
         let start = symtab.strings.checked_add(offset).ok_or(ImageError::Mach)?;
-        let window = usize::try_from(left.min(LONGEST_NAME)).map_err(|_wide| ImageError::Mach)?;
-        let bytes = exactly(&mut file, start, window)?;
+        let bytes = exactly(&mut file, start, left.min(LONGEST_NAME))?;
         let recorded = macho::terminated(&bytes).ok_or(ImageError::Mach)?;
         names.insert(macho::base_name(recorded).to_vec());
     }
@@ -314,16 +321,12 @@ fn referenced(directory: &Path, unit: &[u8]) -> Option<Result<BTreeSet<Vec<u8>>,
         let Some(image) = named(&image) else {
             return Some(Err(ImageError::Mach));
         };
-        let path = directory.join(image);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {},
-            Ok(_) => return Some(Err(ImageError::Mach)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_unreadable) => return Some(Err(ImageError::Io)),
-        }
-        found = true;
-        match debug_objects(&path) {
-            Ok(objects) => names.extend(objects),
+        match debug_objects(&directory.join(image)) {
+            Ok(objects) => {
+                found = true;
+                names.extend(objects);
+            },
+            Err(ImageError::Absent) => {},
             Err(error) => return Some(Err(error)),
         }
     }
@@ -395,10 +398,7 @@ fn profiles(survey: &busy::Survey) -> Vec<PathBuf> {
     let mut found = survey
         .locks
         .iter()
-        .filter(|lock| {
-            lock.protocol() == Protocol::Cargo
-                && lock.path().file_name() == Some(OsStr::new(Protocol::CARGO_NAMES[0]))
-        })
+        .filter(|lock| lock.protocol() == Protocol::Cargo)
         .filter_map(|lock| lock.path().parent())
         .filter(
             |profile| match fs::symlink_metadata(profile.join(FINGERPRINT)) {

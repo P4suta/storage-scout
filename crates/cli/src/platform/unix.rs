@@ -567,14 +567,14 @@ impl Tree {
             Err(error) => return Err(io(error)),
         }
         unlink_at(&dir, &name, libc::AT_REMOVEDIR).map_err(io)?;
-        if held.is_some() {
+        if let Some(held) = held {
             match unlink_at(&dir, &lock_name, 0) {
                 Ok(()) => {},
                 Err(error) if vanished(&error) => {},
                 Err(error) => return Err(io(error)),
             }
+            drop(held);
         }
-        drop(held);
         Ok(Pruned::Removed)
     }
 }

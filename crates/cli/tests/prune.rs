@@ -86,6 +86,7 @@ fn rustc_keeps_only_its_newest_session_and_the_rest_goes() {
     let new = session(&debug, "app-1", "s-b1-y-bbb");
     let working = session(&debug, "app-1", "s-c1-w-working");
     let lone = session(&debug, "lib-2", "s-a1-z-ccc");
+    let _linked = testkit::symlink_file(&old.join("linked"), &root.join("a/target/far/away"));
 
     let dry = prune(root, Mode::DryRun);
     assert_eq!(dry.totals.superseded_sessions.files, 1, "{dry:#?}");
@@ -140,6 +141,30 @@ fn a_session_its_rustc_still_holds_is_left_alone() {
     testkit::assert_absent(&old);
 }
 
+#[test]
+fn a_directory_is_a_profile_only_with_cargos_own_lock_and_fingerprints() {
+    let temp = tempdir("prune-not-profiles");
+    let root = temp.path();
+    let loose = profile(root, "loose");
+    fs::remove_dir(loose.join(".fingerprint")).unwrap();
+    let linked = profile(root, "linked");
+    let elsewhere = root.join("elsewhere.lock");
+    write_sized(&elsewhere, 0);
+    fs::remove_file(linked.join(".cargo-lock")).unwrap();
+    let Built::Yes(_) = testkit::symlink_file(&linked.join(".cargo-lock"), &elsewhere) else {
+        return;
+    };
+    let olds = [&loose, &linked].map(|debug| {
+        let _new = session(debug, "app-1", "s-b1-y-bbb");
+        session(debug, "app-1", "s-a1-x-aaa")
+    });
+    let run = prune(root, Mode::Execute);
+    assert_eq!(run.totals.files(), 0, "{run:#?}");
+    for old in &olds {
+        testkit::assert_present(old);
+    }
+}
+
 fn object(directory: &Path, name: &str) -> PathBuf {
     let path = directory.join(name);
     write_sized(&path, 2048);
@@ -191,8 +216,12 @@ fn only_objects_the_unit_image_no_longer_names_are_stale() {
     let unreadable = ["bad-3.a.one.rcgu.o", "bad-3.a.two.rcgu.o"].map(|name| object(&deps, name));
     write_sized(&deps.join("bad-3"), 64);
     let single = object(&deps, "one-4.a.x.rcgu.o");
+    let directory = deps.join("app-1.d.old.rcgu.o");
+    write_sized(&directory.join("inside"), 16);
     image(&deps.join("one-4"), &[]);
 
+    let dry = prune(root, Mode::DryRun);
+    assert_eq!(dry.totals.stale_objects.files, 4, "{dry:#?}");
     let Some(run) = pruned(root) else {
         return;
     };
@@ -207,7 +236,7 @@ fn only_objects_the_unit_image_no_longer_names_are_stale() {
         .iter()
         .chain(&imageless)
         .chain(&unreadable)
-        .chain([&dylib, &script, &single])
+        .chain([&dylib, &script, &single, &directory])
     {
         testkit::assert_present(present);
     }
@@ -233,44 +262,52 @@ fn what_its_owner_keeps_is_not_pruned_and_a_running_build_is_waited_for() {
     let holder = File::open(busy.join(".cargo-lock")).unwrap();
     holder.lock().unwrap();
 
-    let run = prune(root, Mode::Execute);
-    assert_eq!(run.totals.files(), 0, "{run:#?}");
-    let reasons = run
-        .subjects
-        .iter()
-        .map(|subject| match &subject.admission {
-            PruneAdmission::Rejected { rejection } => rejection.clone(),
-            PruneAdmission::Admitted { .. } => panic!("{run:#?}"),
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        reasons.iter().any(|rejection| matches!(
-            rejection,
-            Rejection::Owned {
-                settlement: Settlement::Kept,
-                ..
-            }
-        )),
-        "{reasons:#?}"
-    );
-    assert!(
-        reasons
+    for mode in [Mode::DryRun, Mode::Execute] {
+        let run = prune(root, mode);
+        assert_eq!(run.totals.files(), 0, "{run:#?}");
+        let reasons = run
+            .subjects
             .iter()
-            .any(|rejection| matches!(rejection, Rejection::Busy { .. })),
-        "{reasons:#?}"
-    );
+            .map(|subject| match &subject.admission {
+                PruneAdmission::Rejected { rejection } => rejection.clone(),
+                PruneAdmission::Admitted { .. } => panic!("{run:#?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            reasons.iter().any(|rejection| matches!(
+                rejection,
+                Rejection::Owned {
+                    settlement: Settlement::Kept,
+                    ..
+                }
+            )),
+            "{reasons:#?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|rejection| matches!(rejection, Rejection::Busy { .. })),
+            "{reasons:#?}"
+        );
+    }
     testkit::assert_present(&kept_old);
     testkit::assert_present(&busy_old);
     drop(holder);
 }
 
 #[test]
-fn auto_prunes_whenever_it_runs() {
+fn auto_prunes_whenever_it_runs_and_reports_only_what_it_touched() {
     let temp = tempdir("prune-auto");
     let root = temp.path();
     let debug = profile(root, "app");
     let old = session(&debug, "app-1", "s-a1-x-aaa");
     let _new = session(&debug, "app-1", "s-b1-y-bbb");
+    let idle = profile(root, "idle");
+    let _alone = session(&idle, "app-1", "s-a1-x-aaa");
+    let busy = profile(root, "busy");
+    let busy_old = session(&busy, "app-1", "s-a1-x-aaa");
+    let _busy_new = session(&busy, "app-1", "s-b1-y-bbb");
+    let holder = testkit::hold_session_lock(&lock_of(&busy_old));
     let policy = AutoPolicy::parse(&format!(
         "[select]\nroots = [{:?}]\n",
         root.to_str().unwrap()
@@ -281,6 +318,24 @@ fn auto_prunes_whenever_it_runs() {
         return;
     }
     assert!(!run.failed(), "{run:#?}");
-    assert_eq!(run.prune.totals.superseded_sessions.files, 1, "{run:#?}");
+    let expected = if holder.is_some() { 1 } else { 2 };
+    assert_eq!(
+        run.prune.totals.superseded_sessions.files, expected,
+        "{run:#?}"
+    );
     testkit::assert_absent(&old);
+    let reported = run
+        .prune
+        .subjects
+        .iter()
+        .map(|subject| subject.location.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(reported.len(), 2, "{run:#?}");
+    for touched in ["app", "busy"] {
+        assert!(
+            reported.contains(&testkit::location(&root.join(touched).join("target"))),
+            "{touched}: {run:#?}"
+        );
+    }
+    drop(holder);
 }

@@ -165,10 +165,14 @@ mod tests {
     fn an_executable_names_its_symbol_table() {
         let bytes = image(
             EXECUTE,
-            &[command(0x19, &[0; 16]), command(SYMTAB, &[100, 3, 400, 50])],
+            &[
+                command(0x19, &[0; 16]),
+                command(0x2a, &[]),
+                command(SYMTAB, &[100, 3, 400, 50]),
+            ],
         );
         let commands = header(&bytes).unwrap();
-        assert_eq!(commands.count, 2);
+        assert_eq!(commands.count, 3);
         let start = HEADER_LEN;
         let end = start
             .checked_add(usize::try_from(commands.len).unwrap())

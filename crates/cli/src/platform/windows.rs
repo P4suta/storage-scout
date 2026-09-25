@@ -9,7 +9,7 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 
@@ -17,8 +17,8 @@ use storage_scout_core::candidate::Identity;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileStandardInfo, GetDiskFreeSpaceExW,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileStandardInfo, GetDiskFreeSpaceExW,
     GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 
@@ -36,8 +36,25 @@ impl Drop for OwnedHandle {
 }
 
 pub(super) fn open_regular(path: &Path) -> io::Result<File> {
-    let file = File::open(path)?;
-    if file.metadata()?.is_file() {
+    let path = wide(path);
+    // SAFETY: the UTF-16 path is NUL-terminated and every pointer argument is valid for the call.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `CreateFileW` just returned this handle and nothing else owns it.
+    let file = File::from(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) });
+    if file.metadata()?.file_type().is_file() {
         Ok(file)
     } else {
         Err(io::Error::from(io::ErrorKind::InvalidInput))

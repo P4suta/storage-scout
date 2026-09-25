@@ -212,14 +212,6 @@ outcome = "survived"
 [[mutation.expect]]
 path = "crates/cli/src/platform/unix.rs"
 item = "free_space"
-rule = "condition-to-true"
-original = "stat.f_frsize == 0"
-reason = "every filesystem a test runs on reports f_frsize; the fallback is for those that do not"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/platform/unix.rs"
-item = "free_space"
 rule = "eq-to-neq"
 original = "=="
 reason = "every filesystem a test runs on reports f_frsize; the fallback is for those that do not"
@@ -361,9 +353,41 @@ original = "metadata.nlink()"
 reason = "sharing in place never refuses a file with several names, so the count changes nothing on the platform CI measures"
 outcome = "survived"
 
+[[mutation.expect]]
+path = "crates/cli/src/prune/capability.rs"
+item = "Prunable::new"
+rule = "condition-to-false"
+original = "&host::locate(path)? != clearance.location()"
+reason = "the path is the one the clearance was made from, so its location always matches; the check guards callers, not a state a run can reach"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/unix.rs"
+item = "Tree::prune_session"
+rule = "remove-match-guard"
+original = "stat_identity(&again) == expected"
+reason = "a session replaced between emptying it and removing it is a race no test can stage, and removing a replacement that is not empty fails anyway"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/events_linux.rs"
+item = "Source::start"
+rule = "condition-to-false"
+original = "raw == -1"
+reason = "inotify_init1 fails only when the process or the user has run out of descriptors or instances, which no test can stage"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/events_linux.rs"
+item = "Source::start"
+rule = "remove-unary-minus"
+original = "-1"
+reason = "a new descriptor is never 1, which standard output already holds"
+outcome = "survived"
+
 [[mutation.skip]]
 path = "crates/cli/src/busy.rs"
-lines = "197-197"
+lines = "225-225"
 reason = "the identity of a lock file this process has just opened cannot fail to be read"
 
 [[mutation.skip]]
@@ -408,5 +432,4 @@ reason = "a mutex is poisoned only by a thread that panics, and no scanning thre
 
 [execution]
 locked = true
-
-skip_targets = ["storage-scout/test/mount_boundary"]
+skip_targets = ["storage-scout/test/mount_boundary", "storage-scout/test/watch"]

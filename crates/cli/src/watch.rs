@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
 
 use serde::Serialize;
 use storage_scout_core::location::Location;
@@ -119,7 +120,7 @@ struct Session<'a> {
     world: BTreeMap<PathBuf, Found>,
     hosts: BTreeSet<PathBuf>,
     dirty: BTreeSet<PathBuf>,
-    waiting: BTreeSet<PathBuf>,
+    waiting: BTreeMap<PathBuf, JoinHandle<()>>,
     pool: Pool,
     sender: Sender<Signal>,
     watcher: Watcher,
@@ -172,7 +173,7 @@ fn surveyed(root: &Path) -> Option<busy::Survey> {
     }
 }
 
-fn wait_for(lock: PathBuf, root: PathBuf, sender: Sender<Signal>) -> io::Result<()> {
+fn wait_for(lock: PathBuf, root: PathBuf, sender: Sender<Signal>) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("storage-scout-waiter".to_owned())
         .spawn(move || {
@@ -181,7 +182,6 @@ fn wait_for(lock: PathBuf, root: PathBuf, sender: Sender<Signal>) -> io::Result<
             }
             let _closed = sender.send(Signal::Released(root));
         })
-        .map(drop)
 }
 
 impl Session<'_> {
@@ -470,9 +470,9 @@ impl Session<'_> {
             busy::Holding::Free => {},
             busy::Holding::Unknown => return Ok(()),
             busy::Holding::Held(lock) => {
-                wait_for(lock.to_path_buf(), root.to_path_buf(), self.sender.clone())
+                let waiter = wait_for(lock.to_path_buf(), root.to_path_buf(), self.sender.clone())
                     .map_err(WatchError::Events)?;
-                self.waiting.insert(root.to_path_buf());
+                self.waiting.insert(root.to_path_buf(), waiter);
                 return Ok(());
             },
         }
@@ -524,7 +524,7 @@ impl Session<'_> {
         let ready = self
             .dirty
             .iter()
-            .filter(|root| !self.waiting.contains(*root))
+            .filter(|root| !self.waiting.contains_key(*root))
             .cloned()
             .collect::<Vec<_>>();
         for root in ready {
@@ -567,7 +567,9 @@ impl Session<'_> {
                     }
                 },
                 Signal::Released(root) => {
-                    self.waiting.remove(&root);
+                    if let Some(waiter) = self.waiting.remove(&root) {
+                        let _joined = waiter.join();
+                    }
                     self.dirty.insert(root);
                 },
             }
@@ -595,6 +597,44 @@ pub(crate) fn watch(
     }
 }
 
+fn open<'a>(
+    scout: &Scout,
+    policy: &'a AutoPolicy,
+    hooks: &'a Hooks<'a>,
+) -> Result<(Session<'a>, Receiver<Signal>), WatchError> {
+    let (sender, receiver): (Sender<Signal>, Receiver<Signal>) = mpsc::channel();
+    let mut paths = policy
+        .selection
+        .roots
+        .iter()
+        .filter_map(|root| match std::fs::canonicalize(root) {
+            Ok(canonical) => Some(canonical),
+            Err(_absent) => None,
+        })
+        .collect::<Vec<_>>();
+    paths.push(hooks.state.clone());
+    let deliver = sender.clone();
+    let watcher = Watcher::start(&paths, move |change| {
+        let _closed = deliver.send(Signal::Changed(change));
+    })
+    .map_err(WatchError::Events)?;
+    let session = Session {
+        scout: scout.refreshed(),
+        roots: paths,
+        policy,
+        excludes: scan::excludes(&policy.selection.excludes),
+        hooks,
+        world: BTreeMap::new(),
+        hosts: BTreeSet::new(),
+        dirty: BTreeSet::new(),
+        waiting: BTreeMap::new(),
+        pool: Pool::default(),
+        sender,
+        watcher,
+    };
+    Ok((session, receiver))
+}
+
 fn watching(
     scout: &Scout,
     policy: &AutoPolicy,
@@ -612,37 +652,7 @@ fn watching(
         log: policy.log_file.clone(),
         render,
     };
-    let hooks = &hooks;
-    let (sender, receiver): (Sender<Signal>, Receiver<Signal>) = mpsc::channel();
-    let mut paths = policy
-        .selection
-        .roots
-        .iter()
-        .filter_map(|root| match std::fs::canonicalize(root) {
-            Ok(canonical) => Some(canonical),
-            Err(_absent) => None,
-        })
-        .collect::<Vec<_>>();
-    paths.push(hooks.state.clone());
-    let deliver = sender.clone();
-    let watcher = Watcher::start(&paths, move |change| {
-        let _closed = deliver.send(Signal::Changed(change));
-    })
-    .map_err(WatchError::Events)?;
-    let mut session = Session {
-        scout: scout.refreshed(),
-        roots: paths.clone(),
-        policy,
-        excludes: scan::excludes(&policy.selection.excludes),
-        hooks,
-        world: BTreeMap::new(),
-        hosts: BTreeSet::new(),
-        dirty: BTreeSet::new(),
-        waiting: BTreeSet::new(),
-        pool: Pool::default(),
-        sender,
-        watcher,
-    };
+    let (mut session, receiver) = open(scout, policy, &hooks)?;
     let _raised = hooks.raised().map_err(WatchError::Station)?;
     session.start()?;
     loop {
@@ -655,11 +665,305 @@ fn watching(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::fs;
+
     use storage_scout_core::size::Bytes;
+    use testkit::{MarkerKeep, MarkerRole, write_sized};
 
     use super::*;
     use crate::dedupe::Totals;
     use crate::prune::Removed;
+
+    type Records = RefCell<Vec<WatchRecord>>;
+
+    fn watched(
+        name: &str,
+        setup: impl FnOnce(&Path),
+        check: impl FnOnce(&mut Session<'_>, &Path, &Records),
+    ) {
+        let temp = testkit::tempdir(name);
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("work");
+        testkit::make_dir(&root);
+        setup(&root);
+        let state = base.join("state");
+        testkit::make_dir(&state);
+        let policy = AutoPolicy::parse(&format!(
+            "[select]\nroots = [{:?}]\n",
+            root.to_str().unwrap()
+        ))
+        .unwrap();
+        let records = Records::default();
+        let render = |record: &WatchRecord| {
+            records.borrow_mut().push(record.clone());
+            Ok(())
+        };
+        let hooks = Hooks {
+            station: Station::for_policy(&state, &base.join("auto.toml")),
+            state,
+            log: None,
+            render: &render,
+        };
+        let scout = Scout::with(testkit::open_protection()).confined(vec![base]);
+        let (mut session, _receiver) = open(&scout, &policy, &hooks).unwrap();
+        session.start().unwrap();
+        check(&mut session, &root, &records);
+    }
+
+    fn changed(directory: &Path) -> Signal {
+        Signal::Changed(Change::Directory(directory.to_path_buf()))
+    }
+
+    fn profile(root: &Path, name: &str) -> PathBuf {
+        let project = root.join(name);
+        write_sized(&project.join("Cargo.toml"), 1);
+        testkit::write_cache_tag(&project.join("target"));
+        let profile = project.join("target/debug");
+        write_sized(&profile.join(".cargo-lock"), 0);
+        testkit::make_dir(&profile.join(".fingerprint"));
+        testkit::make_dir(&profile.join("deps"));
+        profile
+    }
+
+    fn build(profile: &Path, unit: &str) -> PathBuf {
+        let mut old = PathBuf::new();
+        for (stamp, name) in [("a0", "aaa"), ("a1", "bbb")] {
+            let directory = profile
+                .join("incremental")
+                .join(unit)
+                .join(format!("s-{stamp}-x-{name}"));
+            write_sized(&directory.join("query-cache.bin"), 4096);
+            write_sized(
+                &profile
+                    .join("incremental")
+                    .join(unit)
+                    .join(format!("s-{stamp}-x.lock")),
+                0,
+            );
+            if old.as_os_str().is_empty() {
+                old = directory;
+            }
+        }
+        old
+    }
+
+    fn pruned_so_far(records: &Records) -> u64 {
+        records
+            .borrow()
+            .iter()
+            .filter_map(|record| record.prune.as_ref())
+            .map(|run| run.totals.files())
+            .sum()
+    }
+
+    fn reaped(records: &Records) -> usize {
+        records
+            .borrow()
+            .iter()
+            .filter_map(|record| record.reap.as_ref())
+            .map(|summary| summary.outcomes.len())
+            .sum()
+    }
+
+    #[test]
+    fn a_write_is_pruned_as_soon_as_the_writer_lets_go() {
+        watched(
+            "watch-unit-build",
+            |root| {
+                let _debug = profile(root, "app");
+            },
+            |session, root, records| {
+                let target = root.join("app/target");
+                assert!(session.world.contains_key(&target));
+                assert_eq!(records.borrow().len(), 1);
+                assert_eq!(records.borrow()[0].cause, Cause::Start);
+                let debug = target.join("debug");
+                let old = build(&debug, "one");
+                session
+                    .turn(vec![changed(&debug.join("incremental/one"))])
+                    .unwrap();
+                assert_eq!(pruned_so_far(records), 1);
+                testkit::assert_absent(&old);
+                assert!(session.dirty.is_empty());
+
+                let holder = File::open(debug.join(".cargo-lock")).unwrap();
+                holder.lock().unwrap();
+                let busy = build(&debug, "two");
+                session.turn(vec![changed(&debug.join("deps"))]).unwrap();
+                assert!(session.waiting.contains_key(&target));
+                session.turn(vec![changed(&debug.join("deps"))]).unwrap();
+                assert_eq!(pruned_so_far(records), 1);
+                testkit::assert_present(&busy);
+                drop(holder);
+                session.waiting.remove(&target).unwrap().join().unwrap();
+                session
+                    .turn(vec![Signal::Released(target.clone())])
+                    .unwrap();
+                assert_eq!(pruned_so_far(records), 2);
+                testkit::assert_absent(&busy);
+                assert!(!session.waiting.contains_key(&target));
+            },
+        );
+    }
+
+    #[test]
+    fn a_new_project_and_a_directory_that_becomes_owned_are_both_noticed() {
+        watched(
+            "watch-unit-appear",
+            |_| {},
+            |session, root, records| {
+                assert!(session.world.is_empty());
+                let debug = profile(root, "late");
+                session.turn(vec![changed(root)]).unwrap();
+                let target = root.join("late/target");
+                assert!(
+                    session.world.contains_key(&target),
+                    "{:?}",
+                    session.world.keys()
+                );
+                assert!(session.hosts.contains(&root.join("late")));
+                let old = build(&debug, "one");
+                session.turn(vec![changed(&debug.join("deps"))]).unwrap();
+                assert_eq!(pruned_so_far(records), 1);
+                testkit::assert_absent(&old);
+
+                let run = root.join("run");
+                testkit::write_owner_lock(&run);
+                write_sized(&run.join("scratch.bin"), 64);
+                session.turn(vec![changed(root)]).unwrap();
+                testkit::write_owner_json(&run, MarkerRole::Scratch, MarkerKeep::Released, None);
+                session.turn(vec![changed(&run)]).unwrap();
+                assert_eq!(reaped(records), 1);
+                testkit::assert_absent(&run);
+                assert!(!session.world.contains_key(&run));
+            },
+        );
+    }
+
+    #[test]
+    fn an_owner_that_lets_go_is_reaped_and_a_vanished_candidate_is_forgotten() {
+        watched(
+            "watch-unit-owner",
+            |root| {
+                let _debug = profile(root, "gone");
+            },
+            |session, root, records| {
+                let run = root.join("run");
+                testkit::write_owner_marker(&run, MarkerRole::Scratch, MarkerKeep::Released, None);
+                let owner = testkit::claim(&run);
+                session.turn(vec![changed(root)]).unwrap();
+                assert!(session.waiting.contains_key(&run));
+                assert_eq!(reaped(records), 0);
+                drop(owner);
+                session.waiting.remove(&run).unwrap().join().unwrap();
+                session.turn(vec![Signal::Released(run.clone())]).unwrap();
+                assert_eq!(reaped(records), 1);
+                testkit::assert_absent(&run);
+
+                let target = root.join("gone/target");
+                assert!(session.world.contains_key(&target));
+                testkit::remove_tree(&target);
+                session.turn(vec![changed(&root.join("gone"))]).unwrap();
+                assert!(!session.world.contains_key(&target));
+            },
+        );
+    }
+
+    #[test]
+    fn a_hook_a_ref_update_and_a_lost_stream_ask_the_owners_again() {
+        watched(
+            "watch-unit-hook",
+            |root| {
+                let key = root.with_file_name("key");
+                testkit::make_dir(&key);
+                testkit::write_owner_marker(
+                    &root.join("cache"),
+                    MarkerRole::Cache,
+                    MarkerKeep::Released,
+                    Some(&key),
+                );
+                let key_two = root.with_file_name("key-two");
+                testkit::make_dir(&key_two);
+                testkit::write_owner_marker(
+                    &root.join("second"),
+                    MarkerRole::Cache,
+                    MarkerKeep::Released,
+                    Some(&key_two),
+                );
+            },
+            |session, root, records| {
+                assert_eq!(session.world.len(), 2);
+                testkit::remove_tree(&root.with_file_name("key"));
+                session.turn(vec![]).unwrap();
+                assert_eq!(reaped(records), 0);
+                session.hooks.station.raise().unwrap();
+                session.turn(vec![]).unwrap();
+                assert_eq!(reaped(records), 1);
+                assert_eq!(records.borrow().last().unwrap().cause, Cause::Hook);
+                testkit::assert_absent(root.join("cache"));
+
+                testkit::remove_tree(&root.with_file_name("key-two"));
+                let refs = root.join("repo/.git/refs/remotes/origin");
+                session.turn(vec![changed(&refs)]).unwrap();
+                let expected = usize::from(session.watcher.recursive());
+                assert_eq!(reaped(records), 1 + expected);
+
+                let late = profile(root, "unseen");
+                session.turn(vec![Signal::Changed(Change::Lost)]).unwrap();
+                assert!(
+                    session
+                        .world
+                        .contains_key(&late.parent().unwrap().to_path_buf())
+                );
+                assert_eq!(reaped(records), 2);
+                testkit::assert_absent(root.join("second"));
+            },
+        );
+    }
+
+    #[test]
+    fn writes_the_watcher_itself_makes_or_no_writer_locks_change_nothing() {
+        watched(
+            "watch-unit-quiet",
+            |root| {
+                write_sized(&root.join("tool/tool.py"), 1);
+                write_sized(&root.join("tool/__pycache__/tool.cpython-312.pyc"), 64);
+            },
+            |session, root, records| {
+                assert_eq!(session.world.len(), 1, "{:?}", session.world.keys());
+                let state = session.hooks.state.clone();
+                session.turn(vec![changed(&state)]).unwrap();
+                session
+                    .turn(vec![changed(&root.join("tool/__pycache__"))])
+                    .unwrap();
+                assert!(session.dirty.is_empty());
+                assert_eq!(records.borrow().len(), 1);
+                session
+                    .turn(vec![changed(&root.join("repo/.git/objects/ab"))])
+                    .unwrap();
+                assert!(session.dirty.is_empty());
+                assert_eq!(records.borrow().len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn a_waiter_reports_the_release_of_the_lock_it_waits_on() {
+        let temp = testkit::tempdir("watch-unit-waiter");
+        let lock = temp.path().join("owner.lock");
+        write_sized(&lock, 0);
+        let holder = File::open(&lock).unwrap();
+        holder.lock().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let waiter = wait_for(lock, temp.path().to_path_buf(), sender).unwrap();
+        drop(holder);
+        waiter.join().unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Signal::Released(root) if root == temp.path()
+        ));
+    }
 
     fn record(cause: Cause) -> WatchRecord {
         WatchRecord {

@@ -745,4 +745,147 @@ mod tests {
         assert_eq!(full(&base, base_id, LEN + 1), None);
         assert_eq!(full(&base, base_id, LEN - 1), None);
     }
+
+    type Files<'a> = &'a [(u128, u64)];
+
+    const TWICE: u64 = MINIMUM * 2;
+    const THRICE: u64 = MINIMUM * 3;
+
+    fn facts(file: u128, len: u64) -> FileFacts {
+        FileFacts {
+            identity: Identity { volume: 1, file },
+            len,
+            links: 1,
+            owner: share::Owner::Caller,
+            mode: share::Mode::Plain,
+            sharing: share::Sharing::Unknown,
+        }
+    }
+
+    fn pooled(root: &Path, stocks: &[(&str, Option<Method>, Files<'_>)]) -> (Pool, Vec<PathBuf>) {
+        let root = fs::canonicalize(root).unwrap();
+        let targets = stocks
+            .iter()
+            .map(|(name, _, _)| {
+                let target = testkit::write_cargo_project(&root.join(name), 1);
+                testkit::write_cache_tag(&target);
+                target
+            })
+            .collect::<Vec<_>>();
+        let sighted = crate::scan::sight(
+            &crate::ScanOptions::sighting(std::slice::from_ref(&root), &[]),
+            &testkit::open_protection(),
+            &crate::owners::Owners::default(),
+            crate::scan::Reach::Everything,
+        );
+        let mut pool = Pool::default();
+        let mut roots = Vec::new();
+        for ((_, method, files), path) in stocks.iter().zip(targets) {
+            let found = sighted
+                .report
+                .candidates
+                .iter()
+                .find(|found| found.path() == path)
+                .unwrap()
+                .clone();
+            let admission = match method {
+                Some(method) => Admission::Admitted {
+                    method: *method,
+                    files: files.len(),
+                    unreadable: 0,
+                },
+                None => Admission::Rejected {
+                    rejection: Rejection::NoRoots,
+                },
+            };
+            pool.stocks.insert(
+                path.clone(),
+                Stock {
+                    subject: Subject {
+                        id: found.candidate().id().clone(),
+                        location: found.candidate().location().clone(),
+                        admission,
+                    },
+                    found,
+                    method: *method,
+                    files: files
+                        .iter()
+                        .map(|(file, len)| {
+                            (
+                                PathBuf::from(format!("f{file}")).into_boxed_path(),
+                                facts(*file, *len),
+                            )
+                        })
+                        .collect(),
+                },
+            );
+            roots.push(path);
+        }
+        (pool, roots)
+    }
+
+    fn files(items: &[Item<'_>]) -> Vec<u128> {
+        items.iter().map(|item| item.record.identity.file).collect()
+    }
+
+    #[test]
+    fn only_lengths_shared_by_admitted_files_are_considered_and_fresh_files_narrow_them() {
+        let temp = testkit::tempdir("dedupe-pool");
+        let clone = Some(Method::CloneAndSwap);
+        let (pool, roots) = pooled(
+            temp.path(),
+            &[
+                ("a", clone, &[(1, MINIMUM), (2, TWICE), (3, THRICE)]),
+                ("b", clone, &[(4, MINIMUM), (5, TWICE), (1, MINIMUM)]),
+                ("c", None, &[(6, THRICE), (7, THRICE)]),
+            ],
+        );
+        assert_eq!(
+            pool.lengths(&Focus::Everything),
+            BTreeSet::from([MINIMUM, TWICE])
+        );
+        let (subjects, items) = pool.items(&Focus::Everything);
+        assert_eq!(subjects.len(), 3);
+        assert_eq!(files(&items), [1, 2, 4, 5]);
+        assert_eq!(
+            items.first().map(|item| item.path.clone()),
+            roots.first().map(|root| root.join("f1"))
+        );
+
+        let fresh_roots = BTreeSet::from([roots[0].clone()]);
+        let fresh_identities = BTreeSet::from([Identity { volume: 1, file: 5 }]);
+        let fresh = Focus::Fresh {
+            roots: &fresh_roots,
+            identities: &fresh_identities,
+        };
+        assert_eq!(pool.lengths(&fresh), BTreeSet::from([TWICE]));
+        let (focused, narrowed) = pool.items(&fresh);
+        assert_eq!(
+            focused
+                .iter()
+                .map(|subject| subject.location.clone())
+                .collect::<Vec<_>>(),
+            [host::locate(&roots[0]).unwrap()]
+        );
+        assert_eq!(files(&narrowed), [2, 5]);
+
+        let groups = share::groups(&items);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|group| fresh.group(group))
+                .map(|group| group.len)
+                .collect::<Vec<_>>(),
+            [TWICE]
+        );
+        let stale_identities = BTreeSet::from([Identity { volume: 1, file: 6 }]);
+        let stale = Focus::Fresh {
+            roots: &fresh_roots,
+            identities: &stale_identities,
+        };
+        assert!(pool.lengths(&stale).is_empty());
+        assert!(!groups.iter().any(|group| stale.group(group)));
+        assert!(groups.iter().all(|group| Focus::Everything.group(group)));
+    }
 }

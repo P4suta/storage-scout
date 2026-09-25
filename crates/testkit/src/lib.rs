@@ -145,6 +145,14 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).expect("a file with the given bytes");
 }
 
+pub fn make_dir(path: &Path) {
+    fs::create_dir_all(path).expect("a fixture directory");
+}
+
+pub fn remove_tree(path: &Path) {
+    fs::remove_dir_all(path).expect("a fixture tree that can be removed");
+}
+
 pub fn replace_file(path: &Path, bytes: &[u8]) {
     let mut staged = path.as_os_str().to_owned();
     staged.push(".replacement");
