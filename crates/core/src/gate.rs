@@ -4,7 +4,7 @@ use core::fmt;
 use serde::Serialize;
 
 use crate::area::{AppOwned, Area, Protection};
-use crate::artifact::{Identification, Listing, Provenance, Tier};
+use crate::artifact::{Identification, Kind, Listing, Provenance, Tier};
 use crate::candidate::{Candidate, CandidateId, Identity, Measurement};
 use crate::location::Location;
 use crate::lock::Liveness;
@@ -193,12 +193,21 @@ pub struct ShareCheck<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct PruneCheck<'a> {
+    pub recorded: &'a Candidate,
+    pub identity: Identity,
+    pub ownership: &'a Ownership,
+    pub liveness: &'a Liveness,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum Ask<'a> {
     Discover,
     Inspect(&'a Inspection<'a>),
     Recheck(&'a Recheck<'a>),
     Verify(&'a Verify<'a>),
     Share(&'a ShareCheck<'a>),
+    Prune(&'a PruneCheck<'a>),
 }
 
 impl<'a> Ask<'a> {
@@ -208,6 +217,7 @@ impl<'a> Ask<'a> {
             Self::Recheck(recheck) => Some((recheck.recorded, recheck.identity)),
             Self::Verify(verify) => Some((verify.recheck.recorded, verify.recheck.identity)),
             Self::Share(share) => Some((share.recorded, share.identity)),
+            Self::Prune(prune) => Some((prune.recorded, prune.identity)),
         }
     }
 }
@@ -363,7 +373,7 @@ fn evidence(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
 
 fn tier(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
     let grant = match ask {
-        Ask::Discover | Ask::Share(_) => return Verdict::Abstain,
+        Ask::Discover | Ask::Share(_) | Ask::Prune(_) => return Verdict::Abstain,
         Ask::Inspect(inspection) => inspection.tiers,
         Ask::Recheck(recheck) => recheck.mandate.tiers,
         Ask::Verify(verify) => verify.recheck.mandate.tiers,
@@ -393,6 +403,7 @@ fn ownership(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
         },
         Ask::Recheck(recheck) => (recheck.ownership, recheck.mandate.settlements),
         Ask::Verify(verify) => (verify.recheck.ownership, verify.recheck.mandate.settlements),
+        Ask::Prune(prune) => (prune.ownership, Admits::Unkept),
     };
     let settlement = ownership.settlement();
     if admits.admits(settlement) {
@@ -406,24 +417,28 @@ fn ownership(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
 }
 
 fn protocol(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
-    match ask {
-        Ask::Discover | Ask::Inspect(_) | Ask::Recheck(_) | Ask::Verify(_) => Verdict::Abstain,
-        Ask::Share(share) => {
-            let kind = share.recorded.kind();
-            match kind.protocol() {
-                Some(protocol) => Verdict::Pass(Note::Locks { protocol }),
-                None => Verdict::Reject(Rejection::NoLockProtocol {
-                    location: site.location.clone(),
-                    kind,
-                }),
-            }
+    let recorded = match ask {
+        Ask::Discover | Ask::Inspect(_) | Ask::Recheck(_) | Ask::Verify(_) => {
+            return Verdict::Abstain;
         },
+        Ask::Share(share) => share.recorded,
+        Ask::Prune(prune) => prune.recorded,
+    };
+    let kind = recorded.kind();
+    match kind.protocol() {
+        Some(protocol) => Verdict::Pass(Note::Locks { protocol }),
+        None => Verdict::Reject(Rejection::NoLockProtocol {
+            location: site.location.clone(),
+            kind,
+        }),
     }
 }
 
 fn capability(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
     match ask {
-        Ask::Discover | Ask::Inspect(_) | Ask::Recheck(_) | Ask::Verify(_) => Verdict::Abstain,
+        Ask::Discover | Ask::Inspect(_) | Ask::Recheck(_) | Ask::Verify(_) | Ask::Prune(_) => {
+            Verdict::Abstain
+        },
         Ask::Share(share) => match share.capability {
             Capability::Shares { filesystem, .. } => Verdict::Pass(Note::Shares { filesystem }),
             Capability::Unsupported { filesystem } => Verdict::Reject(Rejection::CannotShare {
@@ -438,6 +453,7 @@ fn busy(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
     let liveness = match ask {
         Ask::Discover => return Verdict::Abstain,
         Ask::Share(share) => share.liveness,
+        Ask::Prune(prune) => prune.liveness,
         Ask::Inspect(inspection) => match inspection.liveness {
             Some(liveness) => liveness,
             None => return Verdict::Abstain,
@@ -485,7 +501,7 @@ fn identity(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
 
 fn freshness(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
     let verify = match ask {
-        Ask::Discover | Ask::Inspect(_) | Ask::Recheck(_) | Ask::Share(_) => {
+        Ask::Discover | Ask::Inspect(_) | Ask::Recheck(_) | Ask::Share(_) | Ask::Prune(_) => {
             return Verdict::Abstain;
         },
         Ask::Verify(verify) => verify,
@@ -533,6 +549,11 @@ pub struct Admission {
 impl Admission {
     pub(crate) fn into_parts(self) -> (Location, Identification) {
         (self.location, self.identification)
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> Kind {
+        self.identification.kind
     }
 }
 
@@ -620,6 +641,32 @@ pub fn clear_share(site: &Site<'_>, share: &ShareCheck<'_>) -> Result<ShareClear
     }
 }
 
+#[derive(Debug)]
+#[must_use]
+pub struct PruneClearance {
+    location: Location,
+    identity: Identity,
+}
+
+impl PruneClearance {
+    #[must_use]
+    pub const fn location(&self) -> &Location {
+        &self.location
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> Identity {
+        self.identity
+    }
+}
+
+pub fn clear_prune(site: &Site<'_>, prune: &PruneCheck<'_>) -> Result<PruneClearance, Rejection> {
+    run(site, Ask::Prune(prune)).map(|_| PruneClearance {
+        location: site.location.clone(),
+        identity: prune.identity,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case")]
 pub enum Outcome {
@@ -664,6 +711,7 @@ pub fn inspect(site: &Site<'_>, inspection: &Inspection<'_>) -> Vec<Stage> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::borrow::ToOwned;
     use alloc::vec;
 
     use super::*;
@@ -672,6 +720,7 @@ mod tests {
     use crate::candidate::{Allocation, Contents, Observed, Usage};
     use crate::location::{Case, Syntax};
     use crate::lock::Protocol;
+    use crate::ownership::{Keep, Key, Marker, OwnerLock, Role};
     use crate::size::Bytes;
 
     fn at(path: &str) -> Location {
@@ -1141,6 +1190,94 @@ mod tests {
             .map(|(gate, _)| gate)
             .collect::<Vec<_>>();
         assert_eq!(stages, vec![Gate::Tier, Gate::Ownership, Gate::Freshness]);
+    }
+
+    fn prune_check<'a>(
+        candidate: &'a Candidate,
+        ownership: &'a Ownership,
+        liveness: &'a Liveness,
+    ) -> PruneCheck<'a> {
+        PruneCheck {
+            recorded: candidate,
+            identity: IDENTITY,
+            ownership,
+            liveness,
+        }
+    }
+
+    #[test]
+    fn pruning_needs_a_lock_protocol_and_no_writer_and_spares_what_is_kept() {
+        let fixture = Fixture::target();
+        let candidate = discovered(&fixture, &measured(100));
+        let cleared = clear_prune(
+            &fixture.site(),
+            &prune_check(&candidate, &Ownership::Nothing, &Liveness::Free),
+        )
+        .unwrap();
+        assert_eq!(cleared.identity(), IDENTITY);
+        assert_eq!(cleared.location(), candidate.location());
+
+        let held = Liveness::Held {
+            lock: at("/work/app/target/debug/.cargo-lock"),
+            protocol: Protocol::Cargo,
+        };
+        assert!(matches!(
+            clear_prune(
+                &fixture.site(),
+                &prune_check(&candidate, &Ownership::Nothing, &held)
+            ),
+            Err(Rejection::Busy { .. })
+        ));
+
+        let kept = Ownership::Markers {
+            markers: vec![Marker {
+                directory: at("/work/app/target/tmp"),
+                schema: "njutest-temp-owner-v1".to_owned(),
+                role: Role::Scratch,
+                keep: Keep::Kept,
+                lock: OwnerLock::Free,
+                key: Key::Unkeyed,
+            }],
+        };
+        assert!(matches!(
+            clear_prune(
+                &fixture.site(),
+                &prune_check(&candidate, &kept, &Liveness::Free)
+            ),
+            Err(Rejection::Owned {
+                settlement: Settlement::Kept,
+                ..
+            })
+        ));
+
+        let mut tagged = Fixture::target();
+        tagged.listing = tagged_listing();
+        let cache = discovered(&tagged, &measured(100));
+        assert!(matches!(
+            clear_prune(
+                &tagged.site(),
+                &prune_check(&cache, &Ownership::Nothing, &Liveness::Free)
+            ),
+            Err(Rejection::NoLockProtocol { .. })
+        ));
+    }
+
+    #[test]
+    fn pruning_removes_only_what_is_dead_so_tier_filesystem_and_contents_do_not_matter() {
+        let fixture = Fixture::target();
+        let candidate = discovered(&fixture, &measured(100));
+        let check_of = prune_check(&candidate, &Ownership::Nothing, &Liveness::Free);
+        let abstained = Gate::ALL
+            .iter()
+            .filter(|gate| {
+                check(**gate, &fixture.site(), Ask::Prune(&check_of)) == Verdict::Abstain
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            abstained,
+            vec![Gate::Tier, Gate::Capability, Gate::Freshness]
+        );
     }
 
     #[test]

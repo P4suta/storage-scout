@@ -531,7 +531,7 @@ fn auto_reaps_what_was_let_go_and_nothing_else() {
         None,
     );
     let policy = AutoPolicy::parse(&format!(
-        "[select]\nroots = [{:?}]\nmin_size = \"0\"\n",
+        "[select]\nroots = [{:?}]\n",
         repo.root().to_str().unwrap()
     ))
     .unwrap();
@@ -545,7 +545,6 @@ fn auto_reaps_what_was_let_go_and_nothing_else() {
             .iter()
             .all(|outcome| outcome.status == Status::WouldDelete)
     );
-    assert!(dry.evict.is_none());
 
     let run = repo.scout().auto(&policy, Mode::Execute).unwrap();
     assert!(!run.failed(), "{run:#?}");

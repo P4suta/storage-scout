@@ -22,7 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 
-use super::{FileMeasure, WalkError};
+use super::{FileMeasure, Pruned, WalkError};
 
 const REPARSE_POINT: u32 = 0x0400;
 
@@ -240,4 +240,36 @@ pub(super) fn remove_tree(
     release();
     clear(root, &BTreeSet::new())?;
     remove_dir(root).map_err(io)
+}
+
+pub(super) struct Tree;
+
+fn unsupported() -> io::Error {
+    io::Error::from(io::ErrorKind::Unsupported)
+}
+
+impl Tree {
+    pub(super) fn open(root: &Path, _expected: Identity) -> Result<Self, WalkError> {
+        Err(WalkError::Io {
+            path: root.to_path_buf(),
+            error: unsupported(),
+        })
+    }
+
+    pub(super) fn prune_file(&self, _relative: &Path, _expected: Identity) -> io::Result<Pruned> {
+        Err(unsupported())
+    }
+
+    pub(super) fn prune_session(
+        &self,
+        _relative: &Path,
+        _lock: &std::ffi::OsStr,
+        _expected: Identity,
+        shown: &Path,
+    ) -> Result<Pruned, WalkError> {
+        Err(WalkError::Io {
+            path: shown.to_path_buf(),
+            error: unsupported(),
+        })
+    }
 }

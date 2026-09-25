@@ -19,6 +19,16 @@ pub(crate) struct Lock {
     protocol: Protocol,
 }
 
+impl Lock {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) const fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Survey {
     pub locks: Vec<Lock>,

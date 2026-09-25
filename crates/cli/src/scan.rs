@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use serde::{Serialize, Serializer};
 use storage_scout_core::area::{Area, Protection, SystemReason};
 use storage_scout_core::artifact::{Entries, Listing};
-use storage_scout_core::candidate::{Candidate, Observed, Usage};
+use storage_scout_core::candidate::{Candidate, Measurement, Observed, Usage};
 use storage_scout_core::gate::{self, Admission, Boundary, Shape, Site};
 use storage_scout_core::location::Location;
 use storage_scout_core::reject::{FsOp, Rejection};
@@ -22,6 +22,7 @@ use crate::{SCHEMA_VERSION, failure, host, observe, platform};
 pub const DEFAULT_TOP: usize = 20;
 pub const DEFAULT_MIN_SIZE: Bytes = Bytes::new(10 * 1024 * 1024);
 pub(crate) const MAX_ISSUES: usize = 50;
+const GIT_DIRECTORY: &str = ".git";
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -35,6 +36,19 @@ pub struct ScanOptions {
 }
 
 impl ScanOptions {
+    #[must_use]
+    pub fn sighting(roots: &[PathBuf], excludes: &[PathBuf]) -> Self {
+        Self {
+            roots: roots.to_vec(),
+            top: 0,
+            min_size: Bytes::ZERO,
+            max_depth: Some(0),
+            excludes: excludes.to_vec(),
+            threads: None,
+            measure: Measure::Logical,
+        }
+    }
+
     #[must_use]
     pub const fn new(roots: Vec<PathBuf>) -> Self {
         Self {
@@ -101,8 +115,15 @@ pub struct ScanReport {
     pub issues: Vec<Rejection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Descent {
+    Measure,
+    Sight,
+}
+
 struct Collector<'a> {
     options: &'a ScanOptions,
+    descent: Descent,
     protection: &'a Protection,
     owners: &'a Owners,
     excludes: Vec<Location>,
@@ -159,8 +180,35 @@ pub(crate) fn excludes(paths: &[PathBuf]) -> Vec<Location> {
 }
 
 pub(crate) fn scan(options: &ScanOptions, protection: &Protection, owners: &Owners) -> ScanReport {
+    collect(options, protection, owners, Descent::Measure)
+}
+
+pub(crate) fn sight(options: &ScanOptions, protection: &Protection, owners: &Owners) -> ScanReport {
+    let sighting = ScanOptions {
+        measure: Measure::Logical,
+        min_size: Bytes::ZERO,
+        ..options.clone()
+    };
+    collect(&sighting, protection, owners, Descent::Sight)
+}
+
+pub(crate) fn measured(found: &Found, protection: &Protection) -> Result<Found, Rejection> {
+    let measurement = crate::measure::strictly(&found.path)?;
+    Ok(Found {
+        path: found.path.clone(),
+        candidate: found.candidate.measured(&measurement, protection.case()),
+    })
+}
+
+fn collect(
+    options: &ScanOptions,
+    protection: &Protection,
+    owners: &Owners,
+    descent: Descent,
+) -> ScanReport {
     let collector = Collector {
         options,
+        descent,
         protection,
         owners,
         excludes: excludes(&options.excludes),
@@ -344,7 +392,10 @@ fn walk(
             return Tally::empty(collector.options.measure);
         },
     };
-    if collector.excluded(&location) {
+    if collector.excluded(&location)
+        || (collector.descent == Descent::Sight
+            && directory.file_name() == Some(std::ffi::OsStr::new(GIT_DIRECTORY)))
+    {
         return Tally::empty(collector.options.measure);
     }
     let Some(contents) = read(directory, metadata, collector) else {
@@ -377,13 +428,24 @@ fn walk(
             }
         },
     };
+    let admission = match (collector.descent, admission) {
+        (Descent::Sight, Some(admission)) => {
+            sighted(directory, admission, collector);
+            return Tally::empty(collector.options.measure);
+        },
+        (Descent::Measure, admission) | (Descent::Sight, admission @ None) => admission,
+    };
     let inside = match (region, &admission) {
         (Region::Artifact, _) | (Region::Root | Region::Open { .. }, Some(_)) => true,
         (Region::Root | Region::Open { .. }, None) => false,
     };
 
-    let mut tally = files(&contents.files, collector);
-    if contents.names.has_file(crate::owners::MARKER_NAME) {
+    let mut tally = match collector.descent {
+        Descent::Measure => files(&contents.files, collector),
+        Descent::Sight => Tally::empty(collector.options.measure),
+    };
+    if collector.descent == Descent::Measure && contents.names.has_file(crate::owners::MARKER_NAME)
+    {
         tally.marker(directory);
     }
     let children = contents
@@ -411,6 +473,7 @@ fn walk(
     if let Some(admission) = admission {
         record(directory, admission, &tally, collector);
     } else if !inside
+        && collector.descent == Descent::Measure
         && collector.options.max_depth.is_none_or(|max| depth <= max)
         && tally.logical() >= collector.options.min_size
         && let Ok(mut directories) = collector.directories.lock()
@@ -510,6 +573,41 @@ fn files(files: &[(PathBuf, Metadata)], collector: &Collector<'_>) -> Tally {
         tally.file(path, metadata.len(), identity);
     }
     tally
+}
+
+fn sighted(directory: &Path, admission: Admission, collector: &Collector<'_>) {
+    let identity = match platform::identity(directory) {
+        Ok(identity) => identity,
+        Err(error) => {
+            collector.issue(failure::io(directory, FsOp::FileId, &error));
+            return;
+        },
+    };
+    let markers = match admission.kind().protocol() {
+        Some(_) => match crate::busy::survey(directory) {
+            Ok(survey) => survey.markers,
+            Err(rejection) => {
+                collector.issue(rejection);
+                Vec::new()
+            },
+        },
+        None => Vec::new(),
+    };
+    let candidate = Candidate::new(
+        admission,
+        Observed {
+            identity,
+            measurement: Measurement::UNMEASURED,
+            ownership: collector.owners.of(directory, &markers),
+        },
+        collector.protection.case(),
+    );
+    if let Ok(mut candidates) = collector.candidates.lock() {
+        candidates.push(Found {
+            path: directory.to_path_buf(),
+            candidate,
+        });
+    }
 }
 
 fn record(directory: &Path, admission: Admission, tally: &Tally, collector: &Collector<'_>) {

@@ -145,6 +145,13 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).expect("a file with the given bytes");
 }
 
+pub fn replace_file(path: &Path, bytes: &[u8]) {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".replacement");
+    fs::write(&staged, bytes).expect("a replacement");
+    fs::rename(&staged, path).expect("the replacement takes the name");
+}
+
 pub fn write_patterned(path: &Path, size: u64, seed: u8) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("parent directories");
@@ -737,4 +744,92 @@ impl Git {
         );
         self.run(repository, &["commit", "--quiet", "-m", &message]);
     }
+}
+
+const COMMAND_LEN: usize = 24;
+const SYMBOLS_AT: usize = 32 + COMMAND_LEN;
+
+fn little(value: usize) -> [u8; 4] {
+    u32::try_from(value)
+        .expect("a fixture field that fits in 32 bits")
+        .to_le_bytes()
+}
+
+pub fn write_macho_image(path: &Path, objects: &[&str]) {
+    let mut strings = vec![b' ', 0];
+    let mut symbols = Vec::new();
+    for object in objects.iter().copied().chain(["_main"]) {
+        let kind: u8 = if object == "_main" { 0x0f } else { 0x66 };
+        symbols.extend_from_slice(&little(strings.len()));
+        symbols.extend_from_slice(&[kind, 0, 0, 0]);
+        symbols.extend_from_slice(&0u64.to_le_bytes());
+        strings.extend_from_slice(object.as_bytes());
+        strings.push(0);
+    }
+    let strings_at = SYMBOLS_AT
+        .checked_add(symbols.len())
+        .expect("a small symbol table");
+    let count = objects.len().checked_add(1).expect("a small symbol table");
+    let mut bytes = Vec::new();
+    for field in [0xfeed_facf_u32, 0x0100_000c, 0, 2, 1] {
+        bytes.extend_from_slice(&field.to_le_bytes());
+    }
+    bytes.extend_from_slice(&little(COMMAND_LEN));
+    bytes.extend_from_slice(&[0; 8]);
+    for field in [2, COMMAND_LEN, SYMBOLS_AT, count, strings_at, strings.len()] {
+        bytes.extend_from_slice(&little(field));
+    }
+    bytes.extend_from_slice(&symbols);
+    bytes.extend_from_slice(&strings);
+    write_bytes(path, &bytes);
+    let _executable = executable(path);
+}
+
+#[derive(Debug)]
+pub struct Holder(std::process::Child);
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        drop(self.0.stdin.take());
+        let _exited = self.0.wait();
+    }
+}
+
+#[must_use]
+pub fn hold_session_lock(path: &Path) -> Option<Holder> {
+    let script = if cfg!(target_os = "linux") {
+        "use Fcntl qw(:flock); open(my $f, '+<', $ARGV[0]) or die $!; flock($f, LOCK_EX | LOCK_NB) or die $!; $| = 1; print \"held\\n\"; <STDIN>;"
+    } else {
+        "use Fcntl; open(my $f, '+<', $ARGV[0]) or die $!; fcntl($f, F_SETLK, pack('q q l s s', 0, 0, 0, F_WRLCK, SEEK_SET)) or die $!; $| = 1; print \"held\\n\"; <STDIN>;"
+    };
+    let spawned = Command::new("perl")
+        .args(["-e", script])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            let _skipped =
+                Built::Unavailable(error.to_string()).or_skip("a process that holds a lock");
+            return None;
+        },
+    };
+    let mut line = String::new();
+    let Some(stdout) = child.stdout.take() else {
+        panic!("the holder has no stdout");
+    };
+    if let Err(error) = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line)
+    {
+        panic!("the holder did not report: {error}");
+    }
+    assert_eq!(
+        line,
+        "held\n",
+        "the holder could not take {}",
+        path.display()
+    );
+    Some(Holder(child))
 }

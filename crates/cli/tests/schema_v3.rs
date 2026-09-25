@@ -16,7 +16,7 @@ use storage_scout::core::size::Bytes;
 use storage_scout::{Measure, Mode, PairOutcome, PairStatus, SCHEMA_VERSION, ScanOptions, Scout};
 use testkit::{tempdir, write_cache_tag, write_cargo_project, write_patterned, write_sized};
 
-const RECORD: &str = "tests/schema/v2.json";
+const RECORD: &str = "tests/schema/v3.json";
 
 fn field_paths(value: &Value, prefix: &str, into: &mut BTreeSet<String>) {
     match value {

@@ -879,13 +879,19 @@ fn a_lock_name_inside_cargos_own_directories_is_not_a_lock() {
 fn a_marker_that_appears_after_discovery_is_heard_before_deletion() {
     let temp = tempdir("owned-late");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    testkit::write_owner_marker(
+        &target.join("tmp/released"),
+        testkit::MarkerRole::Scratch,
+        testkit::MarkerKeep::Released,
+        None,
+    );
     let report = discover(temp.path());
     let plan = Scout::plan(
         &report.candidates,
         &ids(&report.candidates),
         Mandate {
             tiers: TierGrant::ROUTINE,
-            settlements: storage_scout::core::ownership::Admits::Evictable,
+            settlements: storage_scout::core::ownership::Admits::Settled,
         },
         &[],
     )

@@ -12,8 +12,8 @@ use storage_scout_core::candidate::{
 };
 use storage_scout_core::gate::{Boundary, Shape, Site, admit};
 use storage_scout_core::location::{Case, Location, Syntax};
-use storage_scout_core::ownership::Ownership;
-use storage_scout_core::select::{Effect, Eviction, Step, Stop, Trigger, eviction_order};
+use storage_scout_core::ownership::{Ownership, Settlement, Worktree};
+use storage_scout_core::select::reap;
 use storage_scout_core::size::Bytes;
 
 fn component() -> impl Strategy<Value = String> {
@@ -28,7 +28,7 @@ fn location(parts: &[String]) -> Location {
     Location::parse_str(Syntax::Unix, &format!("/{}", parts.join("/"))).unwrap()
 }
 
-fn candidates(shapes: &[(u8, u64)]) -> Vec<Candidate> {
+fn candidates(shapes: &[(u8, u64, bool)]) -> Vec<Candidate> {
     let protection = Protection::new(
         Syntax::Unix,
         Case::Sensitive,
@@ -40,7 +40,7 @@ fn candidates(shapes: &[(u8, u64)]) -> Vec<Candidate> {
     shapes
         .iter()
         .enumerate()
-        .map(|(index, &(tier, size))| {
+        .map(|(index, &(tier, size, released))| {
             let mut parent = Entries::default();
             let (name, tag) = match tier {
                 0 => {
@@ -84,7 +84,15 @@ fn candidates(shapes: &[(u8, u64)]) -> Vec<Candidate> {
                 Observed {
                     identity,
                     measurement,
-                    ownership: Ownership::Nothing,
+                    ownership: if released {
+                        Ownership::Worktree {
+                            worktree: Worktree::Orphaned {
+                                root: Location::parse_str(Syntax::Unix, "/work").unwrap(),
+                            },
+                        }
+                    } else {
+                        Ownership::Nothing
+                    },
                 },
                 Case::Sensitive,
             )
@@ -156,46 +164,24 @@ proptest! {
     }
 
     #[test]
-    fn at_or_above_the_trigger_nothing_is_taken(min_free in 0u64..1_000_000, excess in 0u64..1_000_000) {
-        let trigger = Trigger { min_free: Bytes::new(min_free), target_free: None };
-        let order = eviction_order(&candidates(&[(0, 1), (1, 2)]));
-        let (_, step) = Eviction::begin(trigger, Bytes::new(min_free.saturating_add(excess)), order);
-        prop_assert_eq!(step, Step::Stop(Stop::NotBelowTrigger));
-    }
-
-    #[test]
-    fn eviction_takes_a_prefix_of_one_order_whatever_the_input_order_and_stops_at_the_goal(
-        shapes in prop::collection::vec((0u8..3, 1u64..8), 1..8),
+    fn reaping_takes_exactly_what_was_let_go_whatever_the_order(
+        shapes in prop::collection::vec((0u8..3, 1u64..8, any::<bool>()), 1..8),
         rotation in 0usize..8,
-        excess in 1u64..100_000,
     ) {
         let candidates = candidates(&shapes);
-        let order = eviction_order(&candidates);
+        let reaped = reap(&candidates);
+        let released = candidates
+            .iter()
+            .filter(|candidate| candidate.settlement() == Settlement::Released)
+            .map(|candidate| candidate.id().clone())
+            .collect::<Vec<_>>();
+        prop_assert_eq!(&reaped, &released);
         let mut rotated = candidates.clone();
         rotated.rotate_left(rotation % candidates.len());
-        prop_assert_eq!(&eviction_order(&rotated), &order);
-
-        let trigger = Trigger { min_free: Bytes::new(1_000_000), target_free: Some(Bytes::new(1_000_000 + excess)) };
-        let (mut eviction, mut step) = Eviction::begin(trigger, Bytes::ZERO, order.clone());
-        let mut free = Bytes::ZERO;
-        let mut taken = Vec::new();
-        while let Step::Take(id) = step {
-            let freed = candidates
-                .iter()
-                .find(|candidate| candidate.id() == &id)
-                .and_then(|candidate| candidate.usage().reclaimable())
-                .unwrap();
-            free = free.saturating_add(freed);
-            taken.push(id);
-            step = eviction.observe(Effect::Deleted, free);
-        }
-        prop_assert_eq!(&taken[..], &order[..taken.len()]);
-        match step {
-            Step::Stop(Stop::GoalReached) => prop_assert!(free >= eviction.goal()),
-            Step::Stop(Stop::Exhausted) => prop_assert_eq!(taken.len(), order.len()),
-            other @ (Step::Take(_) | Step::Stop(Stop::NotBelowTrigger | Stop::NoProgress)) => {
-                prop_assert!(false, "unexpected {other:?}");
-            },
-        }
+        let mut again = reap(&rotated);
+        again.sort();
+        let mut sorted = reaped;
+        sorted.sort();
+        prop_assert_eq!(sorted, again);
     }
 }

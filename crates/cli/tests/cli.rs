@@ -164,15 +164,9 @@ fn a_kind_filter_narrows_discovery() {
     );
 }
 
-fn write_policy(path: &Path, roots: &Path, trigger: Option<(&Path, &str)>, log: &Path) {
-    let trigger = trigger.map_or_else(String::new, |(volume, min_free)| {
-        format!(
-            "[trigger]\nvolume = {:?}\nmin_free = \"{min_free}\"\n\n",
-            volume.to_str().unwrap()
-        )
-    });
+fn write_policy(path: &Path, roots: &Path, log: &Path) {
     let policy = format!(
-        "{trigger}[select]\nroots = [{roots:?}]\nmin_size = \"0\"\n\n[report]\nlog_file = {log:?}\n",
+        "[select]\nroots = [{roots:?}]\n\n[report]\nlog_file = {log:?}\n",
         roots = roots.to_str().unwrap(),
         log = log.to_str().unwrap(),
     );
@@ -180,7 +174,7 @@ fn write_policy(path: &Path, roots: &Path, trigger: Option<(&Path, &str)>, log: 
 }
 
 #[test]
-fn auto_reaps_released_work_and_evicts_only_under_pressure() {
+fn auto_reaps_released_work_and_never_deletes_what_is_still_owned() {
     let temp = tempdir("cli-auto");
     if !open_space(temp.path()) {
         return;
@@ -205,7 +199,7 @@ fn auto_reaps_released_work_and_evicts_only_under_pressure() {
     let log = temp.path().join("logs/auto.jsonl");
     let config = policy.to_str().unwrap();
 
-    write_policy(&policy, &work, None, &log);
+    write_policy(&policy, &work, &log);
     let dry_run = cli(&["auto", "--config", config, "--json"]);
     assert_eq!(dry_run.status.code(), Some(0), "{dry_run:#?}");
     let document = json(&dry_run);
@@ -215,42 +209,37 @@ fn auto_reaps_released_work_and_evicts_only_under_pressure() {
         document["reap"]["summary"]["outcomes"][0]["status"]["status"],
         "would-delete"
     );
-    assert!(document["evict"].is_null());
+    assert!(document.get("evict").is_none());
     testkit::assert_present(&released);
     testkit::assert_absent(&log);
 
-    write_policy(&policy, &work, Some((temp.path(), "0")), &log);
-    let calm = json(&cli(&["auto", "--config", config, "--execute", "--json"]));
-    assert_eq!(calm["evict"]["stopped"], "not-below-trigger");
-    testkit::assert_absent(&released);
-    testkit::assert_present(&free);
-
-    write_policy(&policy, &work, Some((temp.path(), "100TiB")), &log);
-    let free_location = serde_json::to_value(testkit::location(&free)).unwrap();
     let holder = File::open(busy.join("debug/.cargo-lock")).unwrap();
     holder.lock().unwrap();
-    let pressed = cli(&["auto", "--config", config, "--execute", "--json"]);
-    assert_eq!(pressed.status.code(), Some(0), "{pressed:#?}");
-    let evicted = json(&pressed);
-    assert_eq!(evicted["evict"]["steps"][0]["location"], free_location);
-    assert_eq!(evicted["evict"]["steps"][0]["status"]["status"], "deleted");
-    let stopped = evicted["evict"]["stopped"].as_str().unwrap().to_owned();
-    assert!(
-        matches!(stopped.as_str(), "exhausted" | "no-progress"),
-        "{stopped}"
-    );
-    testkit::assert_absent(&free);
+    let executed = cli(&["auto", "--config", config, "--execute", "--json"]);
+    assert_eq!(executed.status.code(), Some(0), "{executed:#?}");
+    assert_eq!(json(&executed)["reap"]["selected"], 1);
+    testkit::assert_absent(&released);
+    testkit::assert_present(&free);
     testkit::assert_present(&busy);
+    testkit::assert_present(&linked);
     testkit::assert_present(elsewhere.join("payload"));
     drop(holder);
 
+    let again = json(&cli(&["auto", "--config", config, "--execute", "--json"]));
+    assert_eq!(again["reap"]["selected"], 0);
+    testkit::assert_present(&free);
     assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 2);
 
     fs::write(
         &policy,
-        "[trigger]\nvolume = '/'\nmin_free = '1G'\n[select]\nroots = ['/x']\nolder_than = '3d'\n",
+        "[trigger]\nvolume = '/'\nmin_free = '1G'\n[select]\nroots = ['/x']\n",
     )
     .unwrap();
+    let triggered = cli(&["auto", "--config", config]);
+    assert_eq!(triggered.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&triggered.stderr).contains("not when the disk fills"));
+
+    fs::write(&policy, "[select]\nroots = ['/x']\nolder_than = '3d'\n").unwrap();
     let retired = cli(&["auto", "--config", config]);
     assert_eq!(retired.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&retired.stderr).contains("no longer judges by age"));
@@ -321,7 +310,7 @@ fn event_fixture(
     write_sized(&released.join("scratch.bin"), 1024);
     let policy = temp.path().join("auto.toml");
     let log = temp.path().join("auto.jsonl");
-    write_policy(&policy, &work, None, &log);
+    write_policy(&policy, &work, &log);
     let state = temp.path().join("state");
     fs::create_dir_all(&state).unwrap();
     Some((temp, policy, released, state))

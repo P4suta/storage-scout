@@ -258,7 +258,7 @@ const fn protection(settlement: Settlement) -> u8 {
 pub enum Admits {
     Anything,
     Settled,
-    Evictable,
+    Unkept,
 }
 
 impl Admits {
@@ -266,10 +266,16 @@ impl Admits {
     pub const fn admits(self, settlement: Settlement) -> bool {
         match (self, settlement) {
             (Self::Anything, _)
-            | (Self::Settled | Self::Evictable, Settlement::Released | Settlement::Landed)
-            | (Self::Evictable, Settlement::Active | Settlement::Unclaimed) => true,
+            | (Self::Settled, Settlement::Released | Settlement::Landed)
+            | (
+                Self::Unkept,
+                Settlement::Released
+                | Settlement::Landed
+                | Settlement::Active
+                | Settlement::Unclaimed,
+            ) => true,
             (Self::Settled, Settlement::Active | Settlement::Unclaimed | Settlement::Kept)
-            | (Self::Evictable, Settlement::Kept) => false,
+            | (Self::Unkept, Settlement::Kept) => false,
         }
     }
 }
@@ -475,7 +481,11 @@ mod tests {
         }
         assert!(!Admits::Settled.admits(Settlement::Active));
         assert!(!Admits::Settled.admits(Settlement::Kept));
-        assert!(!Admits::Evictable.admits(Settlement::Kept));
-        assert!(Admits::Evictable.admits(Settlement::Unclaimed));
+        assert!(!Admits::Settled.admits(Settlement::Unclaimed));
+        assert!(Admits::Settled.admits(Settlement::Released));
+        assert!(Admits::Settled.admits(Settlement::Landed));
+        assert!(!Admits::Unkept.admits(Settlement::Kept));
+        assert!(Admits::Unkept.admits(Settlement::Active));
+        assert!(Admits::Unkept.admits(Settlement::Unclaimed));
     }
 }

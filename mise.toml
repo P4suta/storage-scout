@@ -95,7 +95,7 @@ run = "njutest verify --changed=origin/main --ui=plain"
 
 [tasks."schema:bless"]
 description = "Record newly added JSON fields after reviewing the diff"
-run = "STORAGE_SCOUT_BLESS_SCHEMA=1 cargo test --package storage-scout --test schema_v2"
+run = "STORAGE_SCOUT_BLESS_SCHEMA=1 cargo test --package storage-scout --test schema_v3"
 
 [tasks.cross]
 description = "Type-check the targets this host is not"

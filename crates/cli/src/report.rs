@@ -7,8 +7,6 @@ use storage_scout_core::artifact::{Kind, Tier};
 use storage_scout_core::candidate::{Allocation, Usage};
 use storage_scout_core::gate::Outcome;
 use storage_scout_core::location::Location;
-use storage_scout_core::ownership::Settlement;
-use storage_scout_core::select::Stop;
 use storage_scout_core::size::Bytes;
 
 use crate::apply::{Mode, Plan, Status, Summary};
@@ -16,6 +14,7 @@ use crate::auto::AutoRun;
 use crate::dedupe::{Admission, DedupeRun, PairStatus, Tally};
 use crate::doctor::{Diagnosis, PolicyFile, Warning};
 use crate::explain::Explanation;
+use crate::prune::{PruneAdmission, PruneRun};
 use crate::scan::ScanReport;
 
 const BANNER: &str = concat!("storage-scout ", env!("CARGO_PKG_VERSION"));
@@ -202,20 +201,10 @@ pub fn render_auto(run: &AutoRun, out: &mut dyn Write) -> io::Result<()> {
         Mode::DryRun => "auto: dry-run (nothing deleted)",
     };
     writeln!(out, "{BANNER} — {mode}")?;
-    let settled = run
-        .candidates
-        .iter()
-        .filter(|found| {
-            matches!(
-                found.candidate().settlement(),
-                Settlement::Released | Settlement::Landed
-            )
-        })
-        .count();
     writeln!(
         out,
-        "Considered {} candidates under {} roots; {settled} already let go by their owners.",
-        run.candidates.len(),
+        "Considered {} candidates under {} roots.",
+        run.considered,
         run.policy.selection.roots.len()
     )?;
     match &run.reap.summary {
@@ -235,41 +224,9 @@ pub fn render_auto(run: &AutoRun, out: &mut dyn Write) -> io::Result<()> {
         },
         None => writeln!(out, "Nothing to reap.")?,
     }
-    if let Some(dedupe) = &run.dedupe {
-        writeln!(out)?;
-        writeln!(
-            out,
-            "Free space {} was below the trigger; sharing identical files left {}.",
-            dedupe.free_before, dedupe.free_after
-        )?;
-        write_sharing(&dedupe.run, out)?;
-    }
-    let Some(evict) = &run.evict else {
-        return Ok(());
-    };
     writeln!(out)?;
-    writeln!(
-        out,
-        "Free space {} against a goal of {}; eviction stopped: {}.",
-        evict.free_before,
-        evict.goal,
-        match evict.stopped {
-            Stop::NotBelowTrigger => "not below the trigger",
-            Stop::GoalReached => "goal reached",
-            Stop::NoProgress => "a deletion freed nothing",
-            Stop::Exhausted => "nothing left to evict",
-        }
-    )?;
-    for step in &evict.steps {
-        writeln!(
-            out,
-            "  [{}] {} ({} free after)",
-            status_text(&step.status),
-            step.location,
-            step.free_after
-        )?;
-    }
-    Ok(())
+    write_pruning(&run.prune, out)?;
+    write_sharing(&run.dedupe, out)
 }
 
 fn status_text(status: &Status) -> String {
@@ -376,7 +333,11 @@ pub fn render_explain(explanation: &Explanation, out: &mut dyn Write) -> io::Res
 }
 
 fn tally(tally: Tally) -> String {
-    let noun = if tally.files == 1 { "file" } else { "files" };
+    counted(tally, "file", "files")
+}
+
+fn counted(tally: Tally, one: &str, many: &str) -> String {
+    let noun = if tally.files == 1 { one } else { many };
     format!("{} {noun} ({})", tally.files, tally.bytes)
 }
 
@@ -462,6 +423,64 @@ pub fn render_dedupe(run: &DedupeRun, out: &mut dyn Write) -> io::Result<()> {
         writeln!(out, "Not considered:")?;
         for (location, rejection) in rejected {
             writeln!(out, "  [{rejection}] {location}")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_pruning(run: &PruneRun, out: &mut dyn Write) -> io::Result<()> {
+    let verb = match run.mode {
+        Mode::Execute => "Pruned",
+        Mode::DryRun => "Would prune",
+    };
+    writeln!(
+        out,
+        "{verb} {} that rustc never reads again: {}, {}, {}.",
+        run.totals.bytes(),
+        counted(
+            run.totals.stale_objects,
+            "stale debug object",
+            "stale debug objects"
+        ),
+        counted(
+            run.totals.superseded_sessions,
+            "superseded incremental session",
+            "superseded incremental sessions"
+        ),
+        counted(
+            run.totals.abandoned_sessions,
+            "abandoned incremental session",
+            "abandoned incremental sessions"
+        ),
+    )?;
+    if let Some(freed) = run.observed_freed {
+        writeln!(out, "Observed free space gained: {freed}.")?;
+    }
+    for failure in &run.failures {
+        writeln!(out, "  [FAILED: {}] {:?}", failure.rejection, failure.rule)?;
+    }
+    Ok(())
+}
+
+pub fn render_prune(run: &PruneRun, out: &mut dyn Write) -> io::Result<()> {
+    let mode = match run.mode {
+        Mode::Execute => "prune",
+        Mode::DryRun => "prune: dry-run (nothing deleted)",
+    };
+    writeln!(out, "{BANNER} — {mode}")?;
+    write_pruning(run, out)?;
+    for subject in &run.subjects {
+        match &subject.admission {
+            PruneAdmission::Admitted { .. } if subject.removed.files() > 0 => writeln!(
+                out,
+                "  {:>11} {}",
+                subject.removed.bytes(),
+                subject.location
+            )?,
+            PruneAdmission::Admitted { .. } => {},
+            PruneAdmission::Rejected { rejection } => {
+                writeln!(out, "  [{rejection}] {}", subject.location)?;
+            },
         }
     }
     Ok(())

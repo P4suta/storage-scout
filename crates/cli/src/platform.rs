@@ -164,6 +164,35 @@ pub(crate) fn extras(path: &Path, identity: Identity) -> Extras {
     share::extras(path, identity)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pruned {
+    Removed,
+    Moved,
+    Held,
+}
+
+pub(crate) struct Pruning(imp::Tree);
+
+impl Pruning {
+    pub(crate) fn open(root: &Path, expected: Identity) -> Result<Self, WalkError> {
+        imp::Tree::open(root, expected).map(Self)
+    }
+
+    pub(crate) fn prune_file(&self, relative: &Path, expected: Identity) -> io::Result<Pruned> {
+        self.0.prune_file(relative, expected)
+    }
+
+    pub(crate) fn prune_session(
+        &self,
+        relative: &Path,
+        lock: &std::ffi::OsStr,
+        expected: Identity,
+        shown: &Path,
+    ) -> Result<Pruned, WalkError> {
+        self.0.prune_session(relative, lock, expected, shown)
+    }
+}
+
 pub(crate) struct Tree(share::Tree);
 
 impl Tree {
@@ -479,5 +508,127 @@ mod tests {
         let before = testkit::group_of(&path);
         fixture.share(dup()).unwrap();
         assert_eq!(testkit::group_of(&path), before);
+    }
+
+    fn pruning(root: &Path) -> Option<Pruning> {
+        match Pruning::open(root, identity(root).unwrap()) {
+            Ok(pruning) => Some(pruning),
+            Err(WalkError::Io { error, .. }) if error.kind() == io::ErrorKind::Unsupported => {
+                let _skipped =
+                    Built::Unavailable(error.to_string()).or_skip("a tree that can be pruned");
+                None
+            },
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+
+    #[test]
+    fn pruning_removes_only_the_file_that_was_listed() {
+        let temp = testkit::tempdir("platform-prune-file");
+        let root = temp.path().join("root");
+        write_patterned(&root.join("deps/replaced.o"), 16, 1);
+        write_patterned(&root.join("deps/stale.o"), 16, 2);
+        let Some(pruning) = pruning(&root) else {
+            return;
+        };
+        let listed = identity(&root.join("deps/replaced.o")).unwrap();
+        let stale = identity(&root.join("deps/stale.o")).unwrap();
+        testkit::replace_file(&root.join("deps/replaced.o"), &[3; 16]);
+        let replaced = Path::new("deps/replaced.o");
+        assert_eq!(pruning.prune_file(replaced, listed).unwrap(), Pruned::Moved);
+        testkit::assert_present(root.join(replaced));
+        let deps = identity(&root.join("deps")).unwrap();
+        assert_eq!(
+            pruning.prune_file(Path::new("deps"), deps).unwrap(),
+            Pruned::Moved
+        );
+        for outside in [
+            "deps/missing.o",
+            "missing/stale.o",
+            "../root/deps/stale.o",
+            "",
+        ] {
+            assert_eq!(
+                pruning.prune_file(Path::new(outside), stale).unwrap(),
+                Pruned::Moved,
+                "{outside}"
+            );
+        }
+        assert_eq!(
+            pruning
+                .prune_file(Path::new("deps/stale.o"), stale)
+                .unwrap(),
+            Pruned::Removed
+        );
+        testkit::assert_absent(root.join("deps/stale.o"));
+    }
+
+    #[test]
+    fn a_session_goes_with_its_lock_and_only_if_it_is_the_one_listed() {
+        let temp = testkit::tempdir("platform-prune-session");
+        let root = temp.path().join("root");
+        let unit = root.join("incremental/app-1");
+        write_patterned(&unit.join("s-a-b-c/work/product.o"), 16, 1);
+        write_patterned(&unit.join("s-a-b.lock"), 0, 0);
+        write_patterned(&unit.join("s-d-e-f/query.bin"), 16, 1);
+        write_patterned(&unit.join("s-g-h-i/query.bin"), 16, 1);
+        let Some(pruning) = pruning(&root) else {
+            return;
+        };
+        let session = |name: &str| (Path::new("incremental/app-1").join(name), unit.join(name));
+        let (locked, locked_path) = session("s-a-b-c");
+        let locked_identity = identity(&locked_path).unwrap();
+        assert_eq!(
+            pruning
+                .prune_session(
+                    &locked,
+                    std::ffi::OsStr::new("s-a-b.lock"),
+                    locked_identity,
+                    &locked_path
+                )
+                .unwrap(),
+            Pruned::Removed
+        );
+        testkit::assert_absent(&locked_path);
+        testkit::assert_absent(unit.join("s-a-b.lock"));
+
+        let (lockless, lockless_path) = session("s-d-e-f");
+        let other = identity(&unit.join("s-g-h-i")).unwrap();
+        assert_eq!(
+            pruning
+                .prune_session(
+                    &lockless,
+                    std::ffi::OsStr::new("s-d-e.lock"),
+                    other,
+                    &lockless_path
+                )
+                .unwrap(),
+            Pruned::Moved
+        );
+        testkit::assert_present(&lockless_path);
+        let own = identity(&lockless_path).unwrap();
+        assert_eq!(
+            pruning
+                .prune_session(
+                    &lockless,
+                    std::ffi::OsStr::new("s-d-e.lock"),
+                    own,
+                    &lockless_path
+                )
+                .unwrap(),
+            Pruned::Removed
+        );
+        testkit::assert_absent(&lockless_path);
+        assert_eq!(
+            pruning
+                .prune_session(
+                    &lockless,
+                    std::ffi::OsStr::new("s-d-e.lock"),
+                    own,
+                    &lockless_path
+                )
+                .unwrap(),
+            Pruned::Moved
+        );
     }
 }

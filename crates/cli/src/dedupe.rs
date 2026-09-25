@@ -80,9 +80,14 @@ pub struct Tally {
 }
 
 impl Tally {
-    const fn add(&mut self, len: u64) {
+    pub(crate) const fn add(&mut self, len: u64) {
         self.files = self.files.saturating_add(1);
         self.bytes = self.bytes.saturating_add(Bytes::new(len));
+    }
+
+    pub(crate) const fn merge(&mut self, other: Self) {
+        self.files = self.files.saturating_add(other.files);
+        self.bytes = self.bytes.saturating_add(other.bytes);
     }
 }
 

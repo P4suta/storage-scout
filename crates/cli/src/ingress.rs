@@ -4,11 +4,8 @@ use serde::Deserialize;
 use storage_scout_core::artifact::{Kind, Tier};
 use storage_scout_core::gate::TierGrant;
 use storage_scout_core::ownership::{Keep, Role};
-use storage_scout_core::select::Trigger;
-use storage_scout_core::size::{Bytes, SizeError};
 
-use crate::auto::{AutoPolicy, Selection, Watch};
-use crate::scan::DEFAULT_MIN_SIZE;
+use crate::auto::{AutoPolicy, Selection};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
@@ -16,15 +13,12 @@ pub enum PolicyError {
     Syntax(String),
     #[error("select.older_than was removed: storage-scout no longer judges by age")]
     RetiredAge,
-    #[error("{field}: {error}")]
-    Size {
-        field: &'static str,
-        error: SizeError,
-    },
-    #[error("trigger.target_free must be greater than trigger.min_free")]
-    TargetNotAboveTrigger,
-    #[error("trigger.volume must name a path on the watched volume")]
-    EmptyVolume,
+    #[error("select.min_size was removed: waste of any size is waste")]
+    RetiredMinSize,
+    #[error(
+        "[trigger] was removed: storage-scout removes waste when it appears, not when the disk fills"
+    )]
+    RetiredTrigger,
     #[error("select.roots must list at least one root")]
     NoRoots,
 }
@@ -32,17 +26,8 @@ pub enum PolicyError {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyDocument {
-    trigger: Option<TriggerDocument>,
     select: SelectDocument,
     report: Option<ReportDocument>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TriggerDocument {
-    volume: PathBuf,
-    min_free: String,
-    target_free: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -50,7 +35,6 @@ struct TriggerDocument {
 struct SelectDocument {
     roots: Vec<PathBuf>,
     kinds: Option<Vec<Kind>>,
-    min_size: Option<String>,
     exclude: Option<Vec<PathBuf>>,
     include_tier: Option<Vec<Tier>>,
 }
@@ -59,33 +43,6 @@ struct SelectDocument {
 #[serde(deny_unknown_fields)]
 struct ReportDocument {
     log_file: Option<PathBuf>,
-}
-
-fn size(field: &'static str, text: &str) -> Result<Bytes, PolicyError> {
-    text.parse::<Bytes>()
-        .map_err(|error| PolicyError::Size { field, error })
-}
-
-fn watch(trigger: TriggerDocument) -> Result<Watch, PolicyError> {
-    let min_free = size("trigger.min_free", &trigger.min_free)?;
-    let target_free = trigger
-        .target_free
-        .as_deref()
-        .map(|target| size("trigger.target_free", target))
-        .transpose()?;
-    if target_free.is_some_and(|target| target <= min_free) {
-        return Err(PolicyError::TargetNotAboveTrigger);
-    }
-    if trigger.volume.as_os_str().is_empty() {
-        return Err(PolicyError::EmptyVolume);
-    }
-    Ok(Watch {
-        volume: trigger.volume,
-        trigger: Trigger {
-            min_free,
-            target_free,
-        },
-    })
 }
 
 pub(crate) fn policy(text: &str) -> Result<AutoPolicy, PolicyError> {
@@ -98,25 +55,25 @@ pub(crate) fn policy(text: &str) -> Result<AutoPolicy, PolicyError> {
     {
         return Err(PolicyError::RetiredAge);
     }
+    if table.contains_key("trigger") {
+        return Err(PolicyError::RetiredTrigger);
+    }
+    if table
+        .get("select")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|select| select.contains_key("min_size"))
+    {
+        return Err(PolicyError::RetiredMinSize);
+    }
     let document = toml::from_str::<PolicyDocument>(text)
         .map_err(|error| PolicyError::Syntax(error.to_string()))?;
-    let watch = document.trigger.map(watch).transpose()?;
     if document.select.roots.is_empty() {
         return Err(PolicyError::NoRoots);
     }
-    let min_size = document
-        .select
-        .min_size
-        .as_deref()
-        .map(|minimum| size("select.min_size", minimum))
-        .transpose()?
-        .unwrap_or(DEFAULT_MIN_SIZE);
     Ok(AutoPolicy {
-        watch,
         selection: Selection {
             roots: document.select.roots,
             kinds: document.select.kinds.unwrap_or_default(),
-            min_size,
             excludes: document.select.exclude.unwrap_or_default(),
             tiers: TierGrant::of(document.select.include_tier.unwrap_or_default()),
         },

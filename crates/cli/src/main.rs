@@ -20,7 +20,7 @@ use storage_scout::trace::{self, Verbosity};
 use storage_scout::{
     AutoPolicy, Color, DEFAULT_TOP, Found, Measure, Mode, Plan, SCHEMA_VERSION, ScanOptions, Scout,
     Summary, render_auto, render_clean, render_dedupe, render_doctor, render_explain, render_json,
-    render_scan,
+    render_prune, render_scan,
 };
 
 #[derive(Debug, Parser)]
@@ -44,6 +44,7 @@ enum Command {
     Clean(CleanArgs),
     Auto(AutoArgs),
     Dedupe(DedupeArgs),
+    Prune(DedupeArgs),
     Doctor(Output),
     Explain(ExplainArgs),
 }
@@ -88,7 +89,6 @@ struct ExplainArgs {
 enum Phase {
     Manual,
     Reap,
-    Evict,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -262,6 +262,7 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Clean(args) => clean(&scout, args),
         Command::Auto(args) => auto(&scout, args),
         Command::Dedupe(args) => dedupe(&scout, &args),
+        Command::Prune(args) => prune(&scout, &args),
         Command::Doctor(output) => doctor(&scout, &output),
         Command::Explain(args) => explain(&scout, &args),
     }
@@ -295,7 +296,6 @@ fn explain(scout: &Scout, args: &ExplainArgs) -> Result<ExitCode> {
                 settlements: match args.phase {
                     Phase::Manual => Admits::Anything,
                     Phase::Reap => Admits::Settled,
-                    Phase::Evict => Admits::Evictable,
                 },
             },
         )
@@ -456,6 +456,18 @@ fn dedupe(scout: &Scout, args: &DedupeArgs) -> Result<ExitCode> {
     match args.output.format() {
         Format::Json => render_json(&run, &mut out)?,
         Format::Human => render_dedupe(&run, &mut out)?,
+    }
+    Ok(ExitCode::from(u8::from(run.failed())))
+}
+
+fn prune(scout: &Scout, args: &DedupeArgs) -> Result<ExitCode> {
+    let run = scout
+        .prune(&args.roots, &args.exclude, mode(&args.execution))
+        .map_err(|rejection| anyhow!("{rejection}"))?;
+    let mut out = io::stdout().lock();
+    match args.output.format() {
+        Format::Json => render_json(&run, &mut out)?,
+        Format::Human => render_prune(&run, &mut out)?,
     }
     Ok(ExitCode::from(u8::from(run.failed())))
 }

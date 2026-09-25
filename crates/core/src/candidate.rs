@@ -84,6 +84,16 @@ pub struct Measurement {
     pub contents: Contents,
 }
 
+impl Measurement {
+    pub const UNMEASURED: Self = Self {
+        usage: Usage {
+            logical: Bytes::ZERO,
+            allocation: Allocation::Unmeasured,
+        },
+        contents: Contents::ZERO,
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct CandidateId(String);
@@ -189,6 +199,15 @@ impl Candidate {
             usage: measurement.usage,
             identity,
             location,
+        }
+    }
+
+    #[must_use]
+    pub fn measured(&self, measurement: &Measurement, case: Case) -> Self {
+        Self {
+            id: CandidateId::derive(self.identity, &self.location, self.kind, measurement, case),
+            usage: measurement.usage,
+            ..self.clone()
         }
     }
 
