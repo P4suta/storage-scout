@@ -1,0 +1,8 @@
+---
+source: crates/cli/tests/rendering.rs
+expression: "render(|out| { render_prune(&pruned, out)?; render_watch(&record, out) })"
+---
+storage-scout <VERSION> — prune: dry-run (nothing deleted)
+Would prune 3.6 KiB that rustc never reads again: 0 stale debug objects (0 B), 1 superseded incremental session (2.9 KiB), 1 abandoned incremental session (700 B).
+  3.6 KiB <PATH>
+written: watching 3, reaped 0, pruned 2 entries (3.6 KiB), shared 0 files (0 B)

@@ -1,7 +1,7 @@
 mod capability;
 
 use std::borrow::Borrow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -62,6 +62,7 @@ pub enum PairStatus {
     AlreadyShared,
     Refused { refusal: Refusal },
     Withheld { rejection: Rejection },
+    Overtaken { failure: Failure },
     Failed { failure: Failure },
 }
 
@@ -80,9 +81,14 @@ pub struct Tally {
 }
 
 impl Tally {
-    const fn add(&mut self, len: u64) {
+    pub(crate) const fn add(&mut self, len: u64) {
         self.files = self.files.saturating_add(1);
         self.bytes = self.bytes.saturating_add(Bytes::new(len));
+    }
+
+    pub(crate) const fn merge(&mut self, other: Self) {
+        self.files = self.files.saturating_add(other.files);
+        self.bytes = self.bytes.saturating_add(other.bytes);
     }
 }
 
@@ -92,6 +98,7 @@ pub struct Totals {
     pub already_shared: Tally,
     pub refused: Tally,
     pub withheld: Tally,
+    pub overtaken: Tally,
     pub failed: Tally,
 }
 
@@ -359,6 +366,7 @@ fn settle<'f>(
                 },
                 Ok(shareable) => match shareable.share(&request(pair)) {
                     Ok(()) => PairStatus::Shared,
+                    Err(failure) if failure.overtaken() => PairStatus::Overtaken { failure },
                     Err(failure) => PairStatus::Failed { failure },
                 },
             }
@@ -366,8 +374,8 @@ fn settle<'f>(
     }
 }
 
-fn free_space(found: &[Found]) -> Volumes {
-    Volumes::sample(found.iter().map(|each| {
+fn free_space<'f>(found: impl Iterator<Item = &'f Found>) -> Volumes {
+    Volumes::sample(found.map(|each| {
         (
             each.candidate().identity().volume,
             each.path().parent().unwrap_or_else(|| each.path()),
@@ -375,53 +383,263 @@ fn free_space(found: &[Found]) -> Volumes {
     }))
 }
 
-fn survey<'f>(found: &'f [Found], terms: &Terms<'_>) -> (Vec<Subject>, Vec<Item<'f>>) {
-    let mut subjects = Vec::with_capacity(found.len());
-    let mut items = Vec::new();
-    let mut seen = BTreeSet::new();
-    for each in found {
-        let admitted = admit(each, terms)
-            .and_then(|method| inventory(each.path()).map(|listed| (method, listed)));
-        let admission = match admitted {
-            Err(rejection) => Admission::Rejected { rejection },
-            Ok((method, listed)) => {
-                let files = listed.files.len();
-                for (path, relative, facts) in listed.files {
-                    if seen.insert(facts.identity)
-                        && let Ok(location) = host::locate(&path)
-                    {
-                        items.push(Item {
-                            record: Record {
-                                location,
-                                len: facts.len,
-                                identity: facts.identity,
-                                method,
-                                links: facts.links,
-                                owner: facts.owner,
-                                mode: facts.mode,
-                                extras: Extras::Unobserved,
-                                sharing: facts.sharing,
-                            },
-                            found: each,
-                            path,
-                            relative,
-                        });
-                    }
-                }
+struct Stock {
+    found: Found,
+    subject: Subject,
+    method: Option<Method>,
+    files: Vec<(Box<Path>, FileFacts)>,
+}
+
+#[derive(Default)]
+pub(crate) struct Pool {
+    stocks: BTreeMap<PathBuf, Stock>,
+}
+
+pub(crate) enum Focus<'a> {
+    Everything,
+    Fresh {
+        roots: &'a BTreeSet<PathBuf>,
+        identities: &'a BTreeSet<Identity>,
+    },
+}
+
+impl Focus<'_> {
+    fn subject(&self, root: &Path) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Fresh { roots, .. } => roots.contains(root),
+        }
+    }
+
+    fn group<T: Borrow<Record>>(&self, group: &Group<'_, T>) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Fresh { identities, .. } => group
+                .members
+                .iter()
+                .any(|member| identities.contains(&(*member).borrow().identity)),
+        }
+    }
+}
+
+impl Pool {
+    pub(crate) fn stock(
+        &mut self,
+        found: &Found,
+        excludes: &[Location],
+        protection: &Protection,
+    ) -> BTreeSet<Identity> {
+        let terms = Terms {
+            excludes,
+            protection,
+        };
+        let known = self
+            .stocks
+            .get(found.path())
+            .map(|stock| {
+                stock
+                    .files
+                    .iter()
+                    .map(|(_, facts)| facts.identity)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let admitted = admit(found, &terms)
+            .and_then(|method| inventory(found.path()).map(|listed| (method, listed)));
+        let (admission, method, files) = match admitted {
+            Err(rejection) => (Admission::Rejected { rejection }, None, Vec::new()),
+            Ok((method, listed)) => (
                 Admission::Admitted {
                     method,
-                    files,
+                    files: listed.files.len(),
                     unreadable: listed.unreadable,
-                }
-            },
+                },
+                Some(method),
+                listed
+                    .files
+                    .into_iter()
+                    .map(|(_, relative, facts)| (relative.into_boxed_path(), facts))
+                    .collect::<Vec<_>>(),
+            ),
         };
-        subjects.push(Subject {
-            id: each.candidate().id().clone(),
-            location: each.candidate().location().clone(),
-            admission,
-        });
+        let fresh = files
+            .iter()
+            .map(|(_, facts)| facts.identity)
+            .filter(|identity| !known.contains(identity))
+            .collect();
+        self.stocks.insert(
+            found.path().to_path_buf(),
+            Stock {
+                found: found.clone(),
+                subject: Subject {
+                    id: found.candidate().id().clone(),
+                    location: found.candidate().location().clone(),
+                    admission,
+                },
+                method,
+                files,
+            },
+        );
+        fresh
     }
-    (subjects, items)
+
+    pub(crate) fn forget(&mut self, root: &Path) {
+        self.stocks.remove(root);
+    }
+
+    fn lengths(&self, focus: &Focus<'_>) -> BTreeSet<u64> {
+        let mut counts = BTreeMap::<u64, usize>::new();
+        for (_, facts) in self
+            .stocks
+            .values()
+            .filter(|stock| stock.method.is_some())
+            .flat_map(|stock| &stock.files)
+        {
+            let count = counts.entry(facts.len).or_default();
+            *count = count.saturating_add(1);
+        }
+        let repeated = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(len, _)| len);
+        match focus {
+            Focus::Everything => repeated.collect(),
+            Focus::Fresh { identities, .. } => {
+                let fresh = self
+                    .stocks
+                    .values()
+                    .flat_map(|stock| &stock.files)
+                    .filter(|(_, facts)| identities.contains(&facts.identity))
+                    .map(|(_, facts)| facts.len)
+                    .collect::<BTreeSet<_>>();
+                repeated.filter(|len| fresh.contains(len)).collect()
+            },
+        }
+    }
+
+    fn items(&self, focus: &Focus<'_>) -> (Vec<Subject>, Vec<Item<'_>>) {
+        let lengths = self.lengths(focus);
+        let mut subjects = Vec::new();
+        let mut items = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (root, stock) in &self.stocks {
+            if focus.subject(root) {
+                subjects.push(stock.subject.clone());
+            }
+            let Some(method) = stock.method else {
+                continue;
+            };
+            for (relative, facts) in &stock.files {
+                if !lengths.contains(&facts.len) {
+                    continue;
+                }
+                let path = root.join(relative);
+                if seen.insert(facts.identity)
+                    && let Ok(location) = host::locate(&path)
+                {
+                    items.push(Item {
+                        record: Record {
+                            location,
+                            len: facts.len,
+                            identity: facts.identity,
+                            method,
+                            links: facts.links,
+                            owner: facts.owner,
+                            mode: facts.mode,
+                            extras: Extras::Unobserved,
+                            sharing: facts.sharing,
+                        },
+                        found: &stock.found,
+                        path,
+                        relative: relative.to_path_buf(),
+                    });
+                }
+            }
+        }
+        (subjects, items)
+    }
+
+    pub(crate) fn share(
+        &self,
+        focus: &Focus<'_>,
+        excludes: &[Location],
+        protection: &Protection,
+        mode: Mode,
+    ) -> DedupeRun {
+        let terms = Terms {
+            excludes,
+            protection,
+        };
+        let found = || self.stocks.values().map(|stock| &stock.found);
+        let before = match mode {
+            Mode::Execute => Some(free_space(found())),
+            Mode::DryRun => None,
+        };
+        let (subjects, items) = self.items(focus);
+        let sized = share::groups(&items)
+            .into_iter()
+            .filter(|group| focus.group(group))
+            .collect::<Vec<_>>();
+        let sampled = refine(&sized, sample);
+        let confirmed = refine(&sampled, full);
+        let observed = confirmed
+            .par_iter()
+            .map(|group| {
+                group
+                    .members
+                    .par_iter()
+                    .map(|member| member.observed())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let groups = confirmed
+            .iter()
+            .zip(&observed)
+            .map(|(group, members)| Group {
+                len: group.len,
+                members: members.iter().collect(),
+            })
+            .collect::<Vec<_>>();
+        let mut pairs = share::plan(&groups);
+        pairs.sort_by(|left, right| {
+            left.duplicate
+                .found
+                .candidate()
+                .location()
+                .cmp(right.duplicate.found.candidate().location())
+        });
+        let mut held = None;
+        let mut totals = Totals::default();
+        let mut outcomes = Vec::with_capacity(pairs.len());
+        for pair in &pairs {
+            let status = settle(pair, mode, &mut held, &terms);
+            let tally = match status {
+                PairStatus::WouldShare | PairStatus::Shared => &mut totals.shared,
+                PairStatus::AlreadyShared => &mut totals.already_shared,
+                PairStatus::Refused { .. } => &mut totals.refused,
+                PairStatus::Withheld { .. } => &mut totals.withheld,
+                PairStatus::Overtaken { .. } => &mut totals.overtaken,
+                PairStatus::Failed { .. } => &mut totals.failed,
+            };
+            tally.add(pair.len);
+            outcomes.push(PairOutcome {
+                keeper: pair.keeper.record.location.clone(),
+                duplicate: pair.duplicate.record.location.clone(),
+                len: Bytes::new(pair.len),
+                status,
+            });
+        }
+        drop(held);
+        DedupeRun {
+            schema_version: SCHEMA_VERSION,
+            command: "dedupe",
+            mode,
+            subjects,
+            totals,
+            observed_freed: before.and_then(|before| before.gained(&free_space(found()))),
+            pairs: outcomes,
+        }
+    }
 }
 
 pub(crate) fn run(
@@ -430,74 +648,11 @@ pub(crate) fn run(
     protection: &Protection,
     mode: Mode,
 ) -> DedupeRun {
-    let terms = Terms {
-        excludes,
-        protection,
-    };
-    let before = match mode {
-        Mode::Execute => Some(free_space(found)),
-        Mode::DryRun => None,
-    };
-    let (subjects, items) = survey(found, &terms);
-    let sized = share::groups(&items);
-    let sampled = refine(&sized, sample);
-    let confirmed = refine(&sampled, full);
-    let observed = confirmed
-        .par_iter()
-        .map(|group| {
-            group
-                .members
-                .par_iter()
-                .map(|member| member.observed())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let groups = confirmed
-        .iter()
-        .zip(&observed)
-        .map(|(group, members)| Group {
-            len: group.len,
-            members: members.iter().collect(),
-        })
-        .collect::<Vec<_>>();
-    let mut pairs = share::plan(&groups);
-    pairs.sort_by(|left, right| {
-        left.duplicate
-            .found
-            .candidate()
-            .location()
-            .cmp(right.duplicate.found.candidate().location())
-    });
-    let mut held = None;
-    let mut totals = Totals::default();
-    let mut outcomes = Vec::with_capacity(pairs.len());
-    for pair in &pairs {
-        let status = settle(pair, mode, &mut held, &terms);
-        let tally = match status {
-            PairStatus::WouldShare | PairStatus::Shared => &mut totals.shared,
-            PairStatus::AlreadyShared => &mut totals.already_shared,
-            PairStatus::Refused { .. } => &mut totals.refused,
-            PairStatus::Withheld { .. } => &mut totals.withheld,
-            PairStatus::Failed { .. } => &mut totals.failed,
-        };
-        tally.add(pair.len);
-        outcomes.push(PairOutcome {
-            keeper: pair.keeper.record.location.clone(),
-            duplicate: pair.duplicate.record.location.clone(),
-            len: Bytes::new(pair.len),
-            status,
-        });
+    let mut pool = Pool::default();
+    for each in found {
+        let _fresh = pool.stock(each, excludes, protection);
     }
-    drop(held);
-    DedupeRun {
-        schema_version: SCHEMA_VERSION,
-        command: "dedupe",
-        mode,
-        subjects,
-        totals,
-        observed_freed: before.and_then(|before| before.gained(&free_space(found))),
-        pairs: outcomes,
-    }
+    pool.share(&Focus::Everything, excludes, protection, mode)
 }
 
 #[cfg(test)]
@@ -589,5 +744,182 @@ mod tests {
         assert_eq!(sample(&base, base_id, LEN + 1), None);
         assert_eq!(full(&base, base_id, LEN + 1), None);
         assert_eq!(full(&base, base_id, LEN - 1), None);
+    }
+
+    type Files<'a> = &'a [(u128, u64)];
+
+    const TWICE: u64 = MINIMUM * 2;
+    const THRICE: u64 = MINIMUM * 3;
+
+    fn facts(file: u128, len: u64) -> FileFacts {
+        FileFacts {
+            identity: Identity { volume: 1, file },
+            len,
+            links: 1,
+            owner: share::Owner::Caller,
+            mode: share::Mode::Plain,
+            sharing: share::Sharing::Unknown,
+        }
+    }
+
+    fn pooled(root: &Path, stocks: &[(&str, Option<Method>, Files<'_>)]) -> (Pool, Vec<PathBuf>) {
+        let root = fs::canonicalize(root).unwrap();
+        let targets = stocks
+            .iter()
+            .map(|(name, _, _)| {
+                let target = testkit::write_cargo_project(&root.join(name), 1);
+                testkit::write_cache_tag(&target);
+                target
+            })
+            .collect::<Vec<_>>();
+        let sighted = crate::scan::sight(
+            &crate::ScanOptions::sighting(std::slice::from_ref(&root), &[]),
+            &testkit::open_protection(),
+            &crate::owners::Owners::default(),
+            crate::scan::Reach::Everything,
+        );
+        let mut pool = Pool::default();
+        let mut roots = Vec::new();
+        for ((_, method, files), path) in stocks.iter().zip(targets) {
+            let found = sighted
+                .report
+                .candidates
+                .iter()
+                .find(|found| found.path() == path)
+                .unwrap()
+                .clone();
+            let admission = match method {
+                Some(method) => Admission::Admitted {
+                    method: *method,
+                    files: files.len(),
+                    unreadable: 0,
+                },
+                None => Admission::Rejected {
+                    rejection: Rejection::NoRoots,
+                },
+            };
+            pool.stocks.insert(
+                path.clone(),
+                Stock {
+                    subject: Subject {
+                        id: found.candidate().id().clone(),
+                        location: found.candidate().location().clone(),
+                        admission,
+                    },
+                    found,
+                    method: *method,
+                    files: files
+                        .iter()
+                        .map(|(file, len)| {
+                            (
+                                PathBuf::from(format!("f{file}")).into_boxed_path(),
+                                facts(*file, *len),
+                            )
+                        })
+                        .collect(),
+                },
+            );
+            roots.push(path);
+        }
+        (pool, roots)
+    }
+
+    fn files(items: &[Item<'_>]) -> Vec<u128> {
+        items.iter().map(|item| item.record.identity.file).collect()
+    }
+
+    #[test]
+    fn only_lengths_shared_by_admitted_files_are_considered_and_fresh_files_narrow_them() {
+        let temp = testkit::tempdir("dedupe-pool");
+        let clone = Some(Method::CloneAndSwap);
+        let (pool, roots) = pooled(
+            temp.path(),
+            &[
+                ("a", clone, &[(1, MINIMUM), (2, TWICE), (3, THRICE)]),
+                ("b", clone, &[(4, MINIMUM), (5, TWICE), (1, MINIMUM)]),
+                ("c", None, &[(6, THRICE), (7, THRICE)]),
+            ],
+        );
+        assert_eq!(
+            pool.lengths(&Focus::Everything),
+            BTreeSet::from([MINIMUM, TWICE])
+        );
+        let (subjects, items) = pool.items(&Focus::Everything);
+        assert_eq!(subjects.len(), 3);
+        assert_eq!(files(&items), [1, 2, 4, 5]);
+        assert_eq!(
+            items.first().map(|item| item.path.clone()),
+            roots.first().map(|root| root.join("f1"))
+        );
+
+        let fresh_roots = BTreeSet::from([roots[0].clone()]);
+        let fresh_identities = BTreeSet::from([Identity { volume: 1, file: 5 }]);
+        let fresh = Focus::Fresh {
+            roots: &fresh_roots,
+            identities: &fresh_identities,
+        };
+        assert_eq!(pool.lengths(&fresh), BTreeSet::from([TWICE]));
+        let (focused, narrowed) = pool.items(&fresh);
+        assert_eq!(
+            focused
+                .iter()
+                .map(|subject| subject.location.clone())
+                .collect::<Vec<_>>(),
+            [host::locate(&roots[0]).unwrap()]
+        );
+        assert_eq!(files(&narrowed), [2, 5]);
+
+        let groups = share::groups(&items);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|group| fresh.group(group))
+                .map(|group| group.len)
+                .collect::<Vec<_>>(),
+            [TWICE]
+        );
+        let stale_identities = BTreeSet::from([Identity { volume: 1, file: 6 }]);
+        let stale = Focus::Fresh {
+            roots: &fresh_roots,
+            identities: &stale_identities,
+        };
+        assert!(pool.lengths(&stale).is_empty());
+        assert!(!groups.iter().any(|group| stale.group(group)));
+        assert!(groups.iter().all(|group| Focus::Everything.group(group)));
+    }
+
+    #[test]
+    fn a_stock_names_only_the_files_it_had_not_seen() {
+        let temp = testkit::tempdir("dedupe-stock");
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let target = testkit::write_cargo_project(&root.join("app"), 1);
+        testkit::write_cache_tag(&target);
+        testkit::write_sized(&target.join("debug/.cargo-lock"), 0);
+        testkit::write_patterned(&target.join("debug/deps/one.rlib"), MINIMUM, 1);
+        let sighted = crate::scan::sight(
+            &crate::ScanOptions::sighting(std::slice::from_ref(&root), &[]),
+            &testkit::open_protection(),
+            &crate::owners::Owners::default(),
+            crate::scan::Reach::Everything,
+        );
+        let found = sighted.report.candidates.first().unwrap().clone();
+        let protection = testkit::open_protection();
+        let mut pool = Pool::default();
+        let first = pool.stock(&found, &[], &protection);
+        let admitted = pool.stocks.get(found.path()).unwrap().method.is_some();
+        if !admitted {
+            let required = std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_some();
+            assert!(!required, "this volume must share blocks");
+            let _skipped = testkit::Built::Unavailable(String::from("sharing is refused here"))
+                .or_skip("a volume that shares blocks");
+            return;
+        }
+        let one = platform::identity(&target.join("debug/deps/one.rlib")).unwrap();
+        assert_eq!(first, BTreeSet::from([one]));
+        assert!(pool.stock(&found, &[], &protection).is_empty());
+        testkit::write_patterned(&target.join("debug/deps/two.rlib"), MINIMUM, 2);
+        let two = platform::identity(&target.join("debug/deps/two.rlib")).unwrap();
+        assert_eq!(pool.stock(&found, &[], &protection), BTreeSet::from([two]));
     }
 }

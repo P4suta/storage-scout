@@ -4,7 +4,8 @@ use storage_scout::core::artifact::{Kind, Tier};
 use storage_scout::core::gate::{Mandate, TierGrant};
 use storage_scout::core::size::Bytes;
 use storage_scout::{
-    Color, Measure, Mode, ScanOptions, Scout, render_clean, render_explain, render_scan,
+    Cause, Color, Measure, Mode, ScanOptions, Scout, WatchRecord, render_clean, render_explain,
+    render_prune, render_scan, render_watch,
 };
 use testkit::{tempdir, write_cache_tag, write_cargo_project, write_sized};
 
@@ -116,4 +117,44 @@ fn the_vocabulary_a_consumer_switches_on_is_stable() {
         .collect::<Vec<_>>()
         .join("\n");
     insta::assert_snapshot!(kinds);
+}
+
+#[test]
+fn a_prune_and_the_watch_line_it_becomes() {
+    let temp = tempdir("render-prune");
+    let project = temp.path().join("proj");
+    write_sized(&project.join("Cargo.toml"), 1);
+    let profile = project.join("target/debug");
+    write_sized(&profile.join(".cargo-lock"), 0);
+    write_sized(&profile.join(".fingerprint/app-1/lib-app"), 16);
+    for (name, size) in [
+        ("s-a1-x-aaa", 3000),
+        ("s-b1-y-bbb", 5000),
+        ("s-c1-z-working", 700),
+    ] {
+        write_sized(
+            &profile
+                .join("incremental/app-1")
+                .join(name)
+                .join("query-cache.bin"),
+            size,
+        );
+    }
+    let scout = Scout::with(testkit::open_protection()).confined(vec![temp.path().to_path_buf()]);
+    let pruned = scout
+        .prune(&[temp.path().to_path_buf()], &[], Mode::DryRun)
+        .unwrap();
+    let record = WatchRecord {
+        schema_version: storage_scout::SCHEMA_VERSION,
+        command: "watch",
+        cause: Cause::Written,
+        watching: 3,
+        reap: None,
+        prune: Some(pruned.clone()),
+        dedupe: None,
+    };
+    stable!(insta::assert_snapshot!(render(|out| {
+        render_prune(&pruned, out)?;
+        render_watch(&record, out)
+    })));
 }

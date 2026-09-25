@@ -84,6 +84,16 @@ pub struct Measurement {
     pub contents: Contents,
 }
 
+impl Measurement {
+    pub const UNMEASURED: Self = Self {
+        usage: Usage {
+            logical: Bytes::ZERO,
+            allocation: Allocation::Unmeasured,
+        },
+        contents: Contents::ZERO,
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct CandidateId(String);
@@ -193,6 +203,15 @@ impl Candidate {
     }
 
     #[must_use]
+    pub fn measured(&self, measurement: &Measurement, case: Case) -> Self {
+        Self {
+            id: CandidateId::derive(self.identity, &self.location, self.kind, measurement, case),
+            usage: measurement.usage,
+            ..self.clone()
+        }
+    }
+
+    #[must_use]
     pub const fn id(&self) -> &CandidateId {
         &self.id
     }
@@ -241,8 +260,74 @@ impl Candidate {
 #[cfg(test)]
 mod tests {
     use alloc::string::ToString;
+    use alloc::vec;
 
     use super::*;
+    use crate::area::Protection;
+    use crate::artifact::{CacheTag, Entries, Listing, Tags};
+    use crate::gate::{Boundary, Shape, Site, admit};
+    use crate::location::Syntax;
+
+    #[test]
+    fn measuring_a_sighting_keeps_what_it_is_and_names_what_it_holds() {
+        let at = |path| Location::parse_str(Syntax::Unix, path).unwrap();
+        let protection = Protection::new(
+            Syntax::Unix,
+            Case::Sensitive,
+            at("/cwd"),
+            at("/bin/x"),
+            vec![],
+        )
+        .unwrap();
+        let mut parent = Entries::default();
+        parent.file(b"Cargo.toml");
+        let listing = Listing::new(parent, Entries::default(), Tags::cache(CacheTag::Absent));
+        let location = at("/work/app/target");
+        let site = Site {
+            location: &location,
+            shape: Shape::Directory,
+            boundary: Boundary::Same { device: 1 },
+            listing: &listing,
+            protection: &protection,
+            excludes: &[],
+        };
+        let sighted = Candidate::new(
+            admit(&site).unwrap(),
+            Observed {
+                identity: Identity { volume: 1, file: 2 },
+                measurement: Measurement::UNMEASURED,
+                ownership: Ownership::Nothing,
+            },
+            Case::Sensitive,
+        );
+        assert_eq!(sighted.usage().reclaimable(), None);
+        let bytes = Bytes::new(10);
+        let measurement = Measurement {
+            usage: Usage {
+                logical: bytes,
+                allocation: Allocation::Measured {
+                    allocated: bytes,
+                    reclaimable: bytes,
+                },
+            },
+            contents: Contents::file(b"a", 10, None),
+        };
+        let measured = sighted.measured(&measurement, Case::Sensitive);
+        assert_eq!(measured.usage().reclaimable(), Some(bytes));
+        assert_ne!(measured.id(), sighted.id());
+        assert_eq!(
+            measured.id(),
+            &CandidateId::derive(
+                sighted.identity(),
+                &location,
+                sighted.kind(),
+                &measurement,
+                Case::Sensitive
+            )
+        );
+        assert_eq!(measured.location(), sighted.location());
+        assert_eq!(measured.settlement(), sighted.settlement());
+    }
 
     #[test]
     fn an_id_is_exactly_sixty_four_hexadecimal_digits() {

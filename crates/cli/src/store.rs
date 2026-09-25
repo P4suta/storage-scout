@@ -126,6 +126,20 @@ impl Station {
 
     #[expect(
         clippy::disallowed_methods,
+        reason = "the run lock is the store's own file"
+    )]
+    pub(crate) fn wait(&self) -> io::Result<Held> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lock)?;
+        file.lock()?;
+        Ok(Held { _lock: file })
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
         reason = "the last run record is the store's own file"
     )]
     pub(crate) fn record(&self, document: &impl Serialize) -> io::Result<()> {

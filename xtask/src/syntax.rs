@@ -58,6 +58,28 @@ const RESTRICTIONS: &[Restriction] = &[
         rule: "sharing is cleared in one place",
     },
     Restriction {
+        segments: &["Prunable"],
+        allowed: &[
+            "crates/cli/src/prune.rs",
+            "crates/cli/src/prune/capability.rs",
+        ],
+        rule: "only prune may hold a pruning capability",
+    },
+    Restriction {
+        segments: &["Pruning"],
+        allowed: &[
+            "crates/cli/src/platform.rs",
+            "crates/cli/src/platform/",
+            "crates/cli/src/prune/capability.rs",
+        ],
+        rule: "only prune::capability may remove files inside a cache, and only with a Prunable",
+    },
+    Restriction {
+        segments: &["clear_prune"],
+        allowed: &["crates/cli/src/prune.rs"],
+        rule: "pruning is cleared in one place",
+    },
+    Restriction {
         segments: &["unlinkat"],
         allowed: PLATFORM,
         rule: "system calls that delete live only in platform",

@@ -15,7 +15,7 @@ use std::path::{Component, Path};
 
 use storage_scout_core::candidate::Identity;
 
-use super::{FileMeasure, WalkError};
+use super::{FileMeasure, Pruned, WalkError};
 
 const BLOCK_UNIT: u64 = 512;
 
@@ -70,12 +70,7 @@ pub(super) fn free_space(path: &Path) -> io::Result<u64> {
     }
     // SAFETY: `statvfs` returned 0, so it initialised the buffer.
     let stat = unsafe { stat.assume_init() };
-    let block = if stat.f_frsize == 0 {
-        stat.f_bsize
-    } else {
-        stat.f_frsize
-    };
-    Ok(widen(stat.f_bavail).saturating_mul(widen(block)))
+    Ok(widen(stat.f_bavail).saturating_mul(widen(stat.f_frsize)))
 }
 
 fn widen<T: Into<u64>>(value: T) -> u64 {
@@ -453,4 +448,128 @@ pub(super) fn remove_tree(
     unlink_at(&parent, &name, libc::AT_REMOVEDIR).map_err(io)?;
     release();
     Ok(())
+}
+
+enum SessionLock {
+    Taken(OwnedFd),
+    Absent,
+    Held,
+}
+
+#[cfg(target_os = "linux")]
+fn try_session_lock(fd: &OwnedFd) -> io::Result<bool> {
+    // SAFETY: `fd` is an open descriptor for the lock file.
+    let result = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Ok(false),
+        Some(_) | None => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_session_lock(fd: &OwnedFd) -> io::Result<bool> {
+    // SAFETY: an all-zero `flock` is a valid value of this plain C struct.
+    let mut lock = unsafe { std::mem::zeroed::<libc::flock>() };
+    lock.l_type = libc::F_WRLCK;
+    lock.l_whence = libc::c_short::try_from(libc::SEEK_SET)
+        .map_err(|_narrow| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `fd` is open for writing and `lock` describes the whole file.
+    let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETLK, &raw const lock) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EAGAIN | libc::EACCES) => Ok(false),
+        Some(_) | None => Err(error),
+    }
+}
+
+fn session_lock(dir: &OwnedFd, name: &CStr) -> io::Result<SessionLock> {
+    let fd = match open_at(dir.as_raw_fd(), name, libc::O_RDWR | libc::O_NOFOLLOW) {
+        Ok(fd) => fd,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(SessionLock::Absent),
+        Err(error) => return Err(error),
+    };
+    if try_session_lock(&fd)? {
+        Ok(SessionLock::Taken(fd))
+    } else {
+        Ok(SessionLock::Held)
+    }
+}
+
+impl Tree {
+    pub(super) fn prune_file(&self, relative: &Path, expected: Identity) -> io::Result<Pruned> {
+        let Located::Found { dir, name } = self.locate(relative)? else {
+            return Ok(Pruned::Moved);
+        };
+        let stat = match stat_at(dir.as_raw_fd(), &name) {
+            Ok(stat) => stat,
+            Err(error) if vanished(&error) => return Ok(Pruned::Moved),
+            Err(error) => return Err(error),
+        };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat_identity(&stat) != expected {
+            return Ok(Pruned::Moved);
+        }
+        unlink_at(&dir, &name, 0)?;
+        Ok(Pruned::Removed)
+    }
+
+    pub(super) fn prune_session(
+        &self,
+        relative: &Path,
+        lock: &OsStr,
+        expected: Identity,
+        shown: &Path,
+    ) -> Result<Pruned, WalkError> {
+        let io = |error| WalkError::Io {
+            path: shown.to_path_buf(),
+            error,
+        };
+        let Located::Found { dir, name } = self.locate(relative).map_err(io)? else {
+            return Ok(Pruned::Moved);
+        };
+        let lock_name = c_path(lock.as_bytes()).map_err(io)?;
+        let held = match session_lock(&dir, &lock_name).map_err(io)? {
+            SessionLock::Taken(fd) => Some(fd),
+            SessionLock::Absent => None,
+            SessionLock::Held => return Ok(Pruned::Held),
+        };
+        let opened = match open_directory(dir.as_raw_fd(), &name) {
+            Ok(opened) => opened,
+            Err(error) if vanished(&error) => return Ok(Pruned::Moved),
+            Err(error) => return Err(io(error)),
+        };
+        let stat = stat_fd(&opened).map_err(io)?;
+        if stat_identity(&stat) != expected || device_number(stat.st_dev) != self.device {
+            return Ok(Pruned::Moved);
+        }
+        let nothing = BTreeSet::new();
+        Walk {
+            device: self.device,
+            keep: &nothing,
+        }
+        .clear(&opened, shown)?;
+        drop(opened);
+        match stat_at(dir.as_raw_fd(), &name) {
+            Ok(again) if stat_identity(&again) == expected => {},
+            Ok(_) => return Ok(Pruned::Moved),
+            Err(error) if vanished(&error) => return Ok(Pruned::Moved),
+            Err(error) => return Err(io(error)),
+        }
+        unlink_at(&dir, &name, libc::AT_REMOVEDIR).map_err(io)?;
+        if let Some(held) = held {
+            match unlink_at(&dir, &lock_name, 0) {
+                Ok(()) => {},
+                Err(error) if vanished(&error) => {},
+                Err(error) => return Err(io(error)),
+            }
+            drop(held);
+        }
+        Ok(Pruned::Removed)
+    }
 }

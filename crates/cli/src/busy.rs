@@ -19,6 +19,16 @@ pub(crate) struct Lock {
     protocol: Protocol,
 }
 
+impl Lock {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) const fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Survey {
     pub locks: Vec<Lock>,
@@ -162,6 +172,24 @@ impl Contention {
             },
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum Holding<'a> {
+    Free,
+    Held(&'a Path),
+    Unknown,
+}
+
+pub(crate) fn held(locks: &[Lock]) -> Holding<'_> {
+    for lock in locks {
+        match attempt(lock) {
+            Attempt::Vanished | Attempt::Taken(_) => {},
+            Attempt::Held => return Holding::Held(&lock.path),
+            Attempt::Unknown => return Holding::Unknown,
+        }
+    }
+    Holding::Free
 }
 
 pub(crate) fn probe(locks: &[Lock]) -> Result<(), Contention> {

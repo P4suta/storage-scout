@@ -4,8 +4,9 @@
 
 - `crates/core` is `#![no_std]` and `#![forbid(unsafe_code)]`: every decision lives there and receives facts as plain data.
   `mise run pure` builds it for bare metal to prove it cannot do I/O or read a clock.
-- `crates/cli` is the shell: `platform` makes system calls, `observe`/`measure`/`busy`/`owners` read facts, `apply` deletes, `dedupe` shares identical files, `hook`/`coalesce`/`store` start and coordinate runs, the rest is CLI and rendering.
-- Ownership decides what `auto` may take: `released`/`landed` are reaped, `active`/`unclaimed` are evicted only under a trigger, `kept` never.
+- `crates/cli` is the shell: `platform` makes system calls, `observe`/`measure`/`busy`/`owners` read facts, `apply` deletes, `prune` removes files rustc never reads again, `dedupe` shares identical files, `watch` reacts to filesystem events, `hook`/`coalesce`/`store` start and coordinate runs, the rest is CLI and rendering.
+- Ownership decides what may be reaped: `released`/`landed` only; `active`, `unclaimed`, and `kept` are never deleted, and nothing depends on free space.
+  A marker inside a candidate only protects it.
   Git is read through typed queries in `observe::git` with fsmonitor off and never writes.
 - `crates/testkit` builds fixtures; `xtask` enforces the structural rules (`cargo xtask gates`).
 
@@ -17,15 +18,18 @@
   `remove_tree` is reachable only from it.
 - Sharing is a capability too: `dedupe::capability::Shareable` holds a `ShareClearance` (minted only by `core::gate::clear_share`) and the `Lease`.
   `platform::Tree` rewrites files only through it, re-identifying each file by handle and comparing it byte for byte at that moment.
+- So is pruning: `prune::capability::Prunable` holds a `PruneClearance` (minted only by `core::gate::clear_prune`) and the `Lease`; `platform::Pruning` removes a file or session only through it, by handle, after re-identifying it.
+  What is dead is decided in `core::prune` and `core::macho` from names and bytes alone.
 - `Gate` declaration order is the pipeline, and `share::PairGate` order decides which pairs of files may share.
   A new rule is a new variant; every gate matches every question exhaustively.
 - No wildcard matches on our enums, no `Result::ok`/`unwrap_or`/`map_or`, no `Path::exists`, no bool parameters, no `HashMap`/`HashSet`.
-- No time: clocks and file times are banned by `clippy.toml`.
+- No time and no thresholds: clocks and file times are banned by `clippy.toml`, and no decision reads free space.
   The one exception is `platform`, which carries a duplicate's times unchanged onto its replacement.
+  Ordering rustc's sessions by the stamp in their names is rustc's own rule, not an age.
 - Untrusted input (`auto.toml`, `owner.json`) is decoded only in `ingress`; files storage-scout writes are opened only in `store`; processes start only in `observe::git` and `platform::spawn`.
-- Runs are started by events (`--event`, `--detach`) and coalesce on a lock and a flag; nothing waits on a clock.
+- Runs are started by events (`--event`, `--detach`, filesystem events, a released lock) and coalesce on a lock and a flag; nothing waits on a clock.
 - Refusals are `Rejection` values; tests match them with `matches!`.
-- JSON is `schema_version: 2`; fields are only added within a version (`tests/schema/v2.json`).
+- JSON is `schema_version: 3`; fields are only added within a version (`tests/schema/v3.json`).
 
 ## Tests
 

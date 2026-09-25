@@ -29,8 +29,8 @@ name = "mount_boundary"
 path = "tests/mount_boundary.rs"
 
 [[test]]
-name = "schema_v2"
-path = "tests/schema_v2.rs"
+name = "schema_v3"
+path = "tests/schema_v3.rs"
 
 [[test]]
 name = "rendering"
@@ -39,6 +39,14 @@ path = "tests/rendering.rs"
 [[test]]
 name = "dedupe"
 path = "tests/dedupe.rs"
+
+[[test]]
+name = "prune"
+path = "tests/prune.rs"
+
+[[test]]
+name = "watch"
+path = "tests/watch.rs"
 
 [dependencies]
 storage-scout-core.workspace = true

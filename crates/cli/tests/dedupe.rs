@@ -9,9 +9,9 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use storage_scout::core::reject::Rejection;
-use storage_scout::core::select::Stop;
 use storage_scout::core::share::{Failure, MINIMUM, Method, Refusal, TEMPORARY_SUFFIX};
-use storage_scout::{Admission, AutoPolicy, DedupeRun, Mode, PairStatus, Scout, Status};
+use storage_scout::core::size::Bytes;
+use storage_scout::{Admission, AutoPolicy, DedupeRun, Mode, PairStatus, Scout};
 use testkit::{Built, tempdir, write_cache_tag, write_patterned, write_sized};
 
 const LEN: u64 = 256 * 1024;
@@ -392,16 +392,16 @@ fn an_interrupted_swap_is_finished_only_when_the_leftover_matches() {
     );
 }
 
-fn policy(root: &Path, min_free: &str) -> AutoPolicy {
+fn policy(root: &Path) -> AutoPolicy {
     AutoPolicy::parse(&format!(
-        "[trigger]\nvolume = {root:?}\nmin_free = {min_free:?}\n\n[select]\nroots = [{root:?}]\nmin_size = \"0\"\n",
+        "[select]\nroots = [{root:?}]\n",
         root = root.to_str().unwrap(),
     ))
     .unwrap()
 }
 
 #[test]
-fn auto_shares_only_under_pressure_and_before_it_evicts() {
+fn auto_shares_identical_files_whenever_it_runs_and_deletes_nothing_owned() {
     let temp = tempdir("dedupe-auto");
     let root = temp.path();
     let a = project(root, "a");
@@ -409,41 +409,20 @@ fn auto_shares_only_under_pressure_and_before_it_evicts() {
     write_patterned(&a.join(RLIB), LEN, 11);
     write_patterned(&b.join(RLIB), LEN, 11);
 
-    let relaxed = scout(root).auto(&policy(root, "1B"), Mode::DryRun).unwrap();
-    assert!(relaxed.dedupe.is_none());
-    assert_eq!(
-        relaxed.evict.as_ref().map(|evict| evict.stopped),
-        Some(Stop::NotBelowTrigger)
-    );
+    if capable(root).is_none() {
+        return;
+    }
+    let dry = scout(root).auto(&policy(root), Mode::DryRun).unwrap();
+    assert_eq!(dry.reap.selected, 0, "{dry:#?}");
+    assert_eq!(dry.dedupe.totals.shared.bytes, Bytes::new(LEN), "{dry:#?}");
 
-    let pressed = scout(root)
-        .auto(&policy(root, "1000000TiB"), Mode::DryRun)
-        .unwrap();
-    let shared = pressed.dedupe.as_ref().unwrap();
-    let evict = pressed.evict.as_ref().unwrap();
-    assert!(shared.free_after >= shared.free_before);
-    assert_eq!(evict.free_before, shared.free_after);
-    assert_eq!(evict.steps.len(), 2, "{pressed:#?}");
+    let run = scout(root).auto(&policy(root), Mode::Execute).unwrap();
+    assert!(!run.failed(), "{run:#?}");
+    assert_eq!(run.dedupe.totals.shared.bytes, Bytes::new(LEN), "{run:#?}");
+    assert_eq!(
+        fs::read(a.join(RLIB)).unwrap(),
+        fs::read(b.join(RLIB)).unwrap()
+    );
     testkit::assert_present(&a);
     testkit::assert_present(&b);
-}
-
-#[test]
-fn eviction_after_sharing_sees_the_files_as_they_are_now() {
-    let temp = tempdir("dedupe-evict");
-    let root = temp.path();
-    let a = project(root, "a");
-    let b = project(root, "b");
-    write_patterned(&a.join(RLIB), LEN, 13);
-    write_patterned(&b.join(RLIB), LEN, 13);
-    write_patterned(&b.join("debug/deps/libz.rlib"), LEN * 4, 14);
-    let evicted = testkit::location(&fs::canonicalize(&b).unwrap());
-    let run = scout(root)
-        .auto(&policy(root, "1000000TiB"), Mode::Execute)
-        .unwrap();
-    let evict = run.evict.as_ref().unwrap();
-    let first = evict.steps.first().unwrap();
-    assert_eq!(first.location, evicted);
-    assert_eq!(first.status, Status::Deleted, "{run:#?}");
-    testkit::assert_absent(&b);
 }

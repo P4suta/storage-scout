@@ -1,5 +1,5 @@
 include = ["*.toml", ".cargo/*.toml", ".config/*.toml", "crates/**/*.toml", "xtask/**/*.toml"]
-exclude = ["**/target/**", "reports/**"]
+exclude = ["**/target/**", "reports/**", "**/.storage-scout-*/**"]
 
 [formatting]
 align_entries = false

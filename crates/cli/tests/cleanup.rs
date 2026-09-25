@@ -24,7 +24,7 @@ use testkit::{
 };
 
 fn scout() -> Scout {
-    Scout::with(testkit::open_protection())
+    Scout::with(testkit::open_protection()).confined(vec![testkit::ceiling()])
 }
 
 fn options(root: &Path) -> ScanOptions {
@@ -396,7 +396,8 @@ fn a_broad_root_is_refused_but_a_root_around_the_current_directory_only_protects
     let temp = tempdir("cwd-root");
     let standing = write_cargo_project(&temp.path().join("standing"), 100);
     let beside = write_cargo_project(&temp.path().join("beside"), 100);
-    let scout = Scout::with(testkit::protection_at(&standing.join("debug"), Vec::new()));
+    let scout = Scout::with(testkit::protection_at(&standing.join("debug"), Vec::new()))
+        .confined(vec![testkit::ceiling()]);
     let report = scout.discover(&options(temp.path())).unwrap();
     let paths = report
         .candidates
@@ -529,7 +530,8 @@ fn an_application_owned_area_admits_only_declared_caches() {
         "test area",
         area,
         Reach::Subtree,
-    )]));
+    )]))
+    .confined(vec![testkit::ceiling()]);
     let _inferred = write_cargo_project(&temp.path().join("proj"), 4096);
     write_declared_target(&temp.path().join("sbt"), "debug");
     write_sized(&temp.path().join("sbt/debug/app"), 4096);
@@ -878,14 +880,28 @@ fn a_lock_name_inside_cargos_own_directories_is_not_a_lock() {
 #[test]
 fn a_marker_that_appears_after_discovery_is_heard_before_deletion() {
     let temp = tempdir("owned-late");
-    let target = write_cargo_project(&temp.path().join("proj"), 4096);
-    let report = discover(temp.path());
+    let run = temp.path().join("run");
+    testkit::write_owner_marker(
+        &run,
+        testkit::MarkerRole::Scratch,
+        testkit::MarkerKeep::Released,
+        None,
+    );
+    let target = write_cargo_project(&run.join("proj"), 4096);
+    let confined = scout().confined(vec![temp.path().to_path_buf()]);
+    let report = confined.discover(&options(temp.path())).unwrap();
+    let settled = report.candidates.clone();
+    assert_eq!(settled.len(), 1, "{report:#?}");
+    assert_eq!(
+        settled[0].candidate().settlement(),
+        storage_scout::core::ownership::Settlement::Released
+    );
     let plan = Scout::plan(
-        &report.candidates,
-        &ids(&report.candidates),
+        &settled,
+        &ids(&settled),
         Mandate {
             tiers: TierGrant::ROUTINE,
-            settlements: storage_scout::core::ownership::Admits::Evictable,
+            settlements: storage_scout::core::ownership::Admits::Settled,
         },
         &[],
     )
@@ -898,12 +914,15 @@ fn a_marker_that_appears_after_discovery_is_heard_before_deletion() {
         None,
     );
     fs::remove_file(kept.join("owner.lock")).unwrap();
-    let summary = apply(&plan, Mode::Execute);
+    let summary = confined.apply(&plan, Mode::Execute);
     assert!(
         matches!(
             status(&summary),
             Status::Rejected {
-                rejection: Rejection::Owned { .. }
+                rejection: Rejection::Owned {
+                    settlement: storage_scout::core::ownership::Settlement::Kept,
+                    ..
+                }
             }
         ),
         "{summary:#?}"

@@ -7,6 +7,14 @@ use storage_scout_core::candidate::Identity;
 use storage_scout_core::gate::{Boundary, Shape};
 use storage_scout_core::share::{Extras, Failure, Filesystem, Method, Mode, Owner, Sharing, Step};
 
+#[cfg_attr(target_os = "macos", path = "platform/events_macos.rs")]
+#[cfg_attr(target_os = "linux", path = "platform/events_linux.rs")]
+#[cfg_attr(windows, path = "platform/events_windows.rs")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    path = "platform/events_none.rs"
+)]
+mod events;
 #[cfg_attr(unix, path = "platform/unix.rs")]
 #[cfg_attr(windows, path = "platform/windows.rs")]
 mod imp;
@@ -18,6 +26,42 @@ mod imp;
 )]
 mod share;
 pub(crate) mod spawn;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    expect(dead_code, reason = "nothing is watched on this platform")
+)]
+pub(crate) enum Change {
+    Directory(PathBuf),
+    Lost,
+}
+
+pub(crate) struct Watcher(events::Source);
+
+impl Watcher {
+    pub(crate) fn start(
+        paths: &[PathBuf],
+        deliver: impl Fn(Change) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        events::Source::start(paths, Box::new(deliver)).map(Self)
+    }
+
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "only inotify adds watches one directory at a time"
+        )
+    )]
+    pub(crate) fn watch(&self, directories: &[&Path]) -> io::Result<()> {
+        self.0.watch(directories)
+    }
+
+    pub(crate) const fn recursive(&self) -> bool {
+        self.0.recursive()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FileMeasure {
@@ -162,6 +206,35 @@ pub(crate) fn file_facts(path: &Path, metadata: &Metadata) -> io::Result<FileFac
 )]
 pub(crate) fn extras(path: &Path, identity: Identity) -> Extras {
     share::extras(path, identity)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pruned {
+    Removed,
+    Moved,
+    Held,
+}
+
+pub(crate) struct Pruning(imp::Tree);
+
+impl Pruning {
+    pub(crate) fn open(root: &Path, expected: Identity) -> Result<Self, WalkError> {
+        imp::Tree::open(root, expected).map(Self)
+    }
+
+    pub(crate) fn prune_file(&self, relative: &Path, expected: Identity) -> io::Result<Pruned> {
+        self.0.prune_file(relative, expected)
+    }
+
+    pub(crate) fn prune_session(
+        &self,
+        relative: &Path,
+        lock: &std::ffi::OsStr,
+        expected: Identity,
+        shown: &Path,
+    ) -> Result<Pruned, WalkError> {
+        self.0.prune_session(relative, lock, expected, shown)
+    }
 }
 
 pub(crate) struct Tree(share::Tree);
@@ -479,5 +552,191 @@ mod tests {
         let before = testkit::group_of(&path);
         fixture.share(dup()).unwrap();
         assert_eq!(testkit::group_of(&path), before);
+    }
+
+    fn pruning(root: &Path) -> Option<Pruning> {
+        match Pruning::open(root, identity(root).unwrap()) {
+            Ok(pruning) => Some(pruning),
+            Err(WalkError::Io { error, .. }) if error.kind() == io::ErrorKind::Unsupported => {
+                let _skipped =
+                    Built::Unavailable(error.to_string()).or_skip("a tree that can be pruned");
+                None
+            },
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+
+    #[test]
+    fn pruning_removes_only_the_file_that_was_listed() {
+        let temp = testkit::tempdir("platform-prune-file");
+        let root = temp.path().join("root");
+        write_patterned(&root.join("deps/replaced.o"), 16, 1);
+        write_patterned(&root.join("deps/stale.o"), 16, 2);
+        let Some(pruning) = pruning(&root) else {
+            return;
+        };
+        let listed = identity(&root.join("deps/replaced.o")).unwrap();
+        let stale = identity(&root.join("deps/stale.o")).unwrap();
+        testkit::replace_file(&root.join("deps/replaced.o"), &[3; 16]);
+        let replaced = Path::new("deps/replaced.o");
+        assert_eq!(pruning.prune_file(replaced, listed).unwrap(), Pruned::Moved);
+        testkit::assert_present(root.join(replaced));
+        let deps = identity(&root.join("deps")).unwrap();
+        assert_eq!(
+            pruning.prune_file(Path::new("deps"), deps).unwrap(),
+            Pruned::Moved
+        );
+        for outside in [
+            "deps/missing.o",
+            "missing/stale.o",
+            "../root/deps/stale.o",
+            "",
+        ] {
+            assert_eq!(
+                pruning.prune_file(Path::new(outside), stale).unwrap(),
+                Pruned::Moved,
+                "{outside}"
+            );
+        }
+        assert_eq!(
+            pruning
+                .prune_file(Path::new("deps/stale.o"), stale)
+                .unwrap(),
+            Pruned::Removed
+        );
+        testkit::assert_absent(root.join("deps/stale.o"));
+    }
+
+    #[test]
+    fn a_session_goes_with_its_lock_and_only_if_it_is_the_one_listed() {
+        let temp = testkit::tempdir("platform-prune-session");
+        let root = temp.path().join("root");
+        let unit = root.join("incremental/app-1");
+        write_patterned(&unit.join("s-a-b-c/work/product.o"), 16, 1);
+        write_patterned(&unit.join("s-a-b.lock"), 0, 0);
+        write_patterned(&unit.join("s-d-e-f/query.bin"), 16, 1);
+        write_patterned(&unit.join("s-g-h-i/query.bin"), 16, 1);
+        let Some(pruning) = pruning(&root) else {
+            return;
+        };
+        let session = |name: &str| (Path::new("incremental/app-1").join(name), unit.join(name));
+        let (locked, locked_path) = session("s-a-b-c");
+        let locked_identity = identity(&locked_path).unwrap();
+        assert_eq!(
+            pruning
+                .prune_session(
+                    &locked,
+                    std::ffi::OsStr::new("s-a-b.lock"),
+                    locked_identity,
+                    &locked_path
+                )
+                .unwrap(),
+            Pruned::Removed
+        );
+        testkit::assert_absent(&locked_path);
+        testkit::assert_absent(unit.join("s-a-b.lock"));
+
+        let (lockless, lockless_path) = session("s-d-e-f");
+        let other = identity(&unit.join("s-g-h-i")).unwrap();
+        assert_eq!(
+            pruning
+                .prune_session(
+                    &lockless,
+                    std::ffi::OsStr::new("s-d-e.lock"),
+                    other,
+                    &lockless_path
+                )
+                .unwrap(),
+            Pruned::Moved
+        );
+        testkit::assert_present(lockless_path.join("query.bin"));
+        let own = identity(&lockless_path).unwrap();
+        assert_eq!(
+            pruning
+                .prune_session(
+                    &lockless,
+                    std::ffi::OsStr::new("s-d-e.lock"),
+                    own,
+                    &lockless_path
+                )
+                .unwrap(),
+            Pruned::Removed
+        );
+        testkit::assert_absent(&lockless_path);
+        assert_eq!(
+            pruning
+                .prune_session(
+                    &lockless,
+                    std::ffi::OsStr::new("s-d-e.lock"),
+                    own,
+                    &lockless_path
+                )
+                .unwrap(),
+            Pruned::Moved
+        );
+    }
+
+    #[test]
+    fn a_volume_reports_the_space_it_has_left() {
+        let temp = testkit::tempdir("platform-free");
+        assert!(free_space(temp.path()).unwrap() > 0);
+    }
+
+    #[test]
+    fn a_session_or_file_that_cannot_be_reached_is_an_error_not_a_move() {
+        let temp = testkit::tempdir("platform-prune-denied");
+        let root = temp.path().join("root");
+        let unit = root.join("incremental/app-1");
+        write_patterned(&unit.join("s-a-b-c/query.bin"), 16, 1);
+        write_patterned(&unit.join("s-a-b.lock"), 0, 0);
+        write_patterned(&unit.join("s-d-e-f/query.bin"), 16, 1);
+        write_patterned(&root.join("deps/sealed/stale.o"), 16, 2);
+        write_patterned(&root.join("deps/listed/stale.o"), 16, 3);
+        let Some(pruning) = pruning(&root) else {
+            return;
+        };
+        let locked = Path::new("incremental/app-1/s-a-b-c");
+        let locked_identity = identity(&root.join(locked)).unwrap();
+        let closed = Path::new("incremental/app-1/s-d-e-f");
+        let closed_identity = identity(&root.join(closed)).unwrap();
+        let sealed = identity(&root.join("deps/sealed/stale.o")).unwrap();
+        let listed = identity(&root.join("deps/listed/stale.o")).unwrap();
+        let Some(_lock) = testkit::restrict(&unit.join("s-a-b.lock"), 0o000) else {
+            return;
+        };
+        let Some(_closed) = testkit::restrict(&root.join(closed), 0o000) else {
+            return;
+        };
+        let Some(_sealed) = testkit::restrict(&root.join("deps/sealed"), 0o000) else {
+            return;
+        };
+        let Some(_listed) = testkit::restrict(&root.join("deps/listed"), 0o400) else {
+            return;
+        };
+        let unlocked = std::ffi::OsStr::new("s-a-b.lock");
+        assert!(matches!(
+            pruning.prune_session(locked, unlocked, locked_identity, &root.join(locked)),
+            Err(WalkError::Io { error, .. }) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        testkit::assert_present(root.join(locked).join("query.bin"));
+        let lockless = std::ffi::OsStr::new("s-d-e.lock");
+        assert!(matches!(
+            pruning.prune_session(closed, lockless, closed_identity, &root.join(closed)),
+            Err(WalkError::Io { error, .. }) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(
+            pruning
+                .prune_file(Path::new("deps/sealed/stale.o"), sealed)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            pruning
+                .prune_file(Path::new("deps/listed/stale.o"), listed)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 }

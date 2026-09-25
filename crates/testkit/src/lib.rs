@@ -60,11 +60,42 @@ impl Drop for Scratch {
     }
 }
 
+const SCRATCH: &str = ".storage-scout-tests";
+const SCRATCH_OWNER: &str = r#"{"schema": "storage-scout-temp-owner-v1", "pid": 0, "started": "tests", "kept": true, "role": "scratch"}"#;
+
+static HELD: std::sync::OnceLock<File> = std::sync::OnceLock::new();
+
+#[must_use]
+pub fn ceiling() -> PathBuf {
+    let scratch = std::env::current_dir()
+        .expect("a current directory")
+        .join(SCRATCH);
+    let _held = HELD.get_or_init(|| {
+        fs::create_dir_all(&scratch).expect("the tests' scratch directory");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(scratch.join("owner.lock"))
+            .expect("the tests' owner lock");
+        lock.lock_shared()
+            .expect("a share of the tests' owner lock");
+        let marker = scratch.join("owner.json");
+        if fs::symlink_metadata(&marker).is_err() {
+            let staged = scratch.join(format!("owner.json.{}", std::process::id()));
+            fs::write(&staged, SCRATCH_OWNER).expect("the tests' owner marker");
+            fs::rename(&staged, &marker).expect("the tests' owner marker in place");
+        }
+        lock
+    });
+    scratch
+}
+
 pub fn tempdir(prefix: &str) -> Scratch {
     Scratch(Some(
         tempfile::Builder::new()
             .prefix(&format!(".storage-scout-{prefix}-"))
-            .tempdir_in(std::env::current_dir().expect("a current directory"))
+            .tempdir_in(ceiling())
             .expect("a temporary directory inside the repository"),
     ))
 }
@@ -143,6 +174,21 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) {
         fs::create_dir_all(parent).expect("parent directories");
     }
     fs::write(path, bytes).expect("a file with the given bytes");
+}
+
+pub fn make_dir(path: &Path) {
+    fs::create_dir_all(path).expect("a fixture directory");
+}
+
+pub fn remove_tree(path: &Path) {
+    fs::remove_dir_all(path).expect("a fixture tree that can be removed");
+}
+
+pub fn replace_file(path: &Path, bytes: &[u8]) {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".replacement");
+    fs::write(&staged, bytes).expect("a replacement");
+    fs::rename(&staged, path).expect("the replacement takes the name");
 }
 
 pub fn write_patterned(path: &Path, size: u64, seed: u8) {
@@ -321,6 +367,16 @@ pub fn hard_link(link: &Path, target: &Path) -> Built {
         Ok(()) => Built::Yes(link.to_path_buf()),
         Err(error) => Built::Unavailable(error.to_string()),
     }
+}
+
+#[must_use]
+pub fn watches_subtrees() -> bool {
+    let whole = cfg!(any(target_os = "macos", windows));
+    if !whole {
+        let _skipped = Built::Unavailable(String::from("inotify watches one directory at a time"))
+            .or_skip("a watcher that reports every directory below a root");
+    }
+    whole
 }
 
 #[must_use]
@@ -651,6 +707,21 @@ pub fn write_owner_marker(
     keep: MarkerKeep,
     keyed_to: Option<&Path>,
 ) {
+    write_owner_json(directory, role, keep, keyed_to);
+    write_owner_lock(directory);
+}
+
+pub fn write_owner_lock(directory: &Path) {
+    fs::create_dir_all(directory).expect("the owned directory");
+    fs::write(directory.join("owner.lock"), b"").expect("an owner lock");
+}
+
+pub fn write_owner_json(
+    directory: &Path,
+    role: MarkerRole,
+    keep: MarkerKeep,
+    keyed_to: Option<&Path>,
+) {
     fs::create_dir_all(directory).expect("the owned directory");
     let role = match role {
         MarkerRole::Scratch => "scratch",
@@ -667,7 +738,6 @@ pub fn write_owner_marker(
         "{{\"schema\": \"njutest-temp-owner-v1\", \"pid\": 1, \"started\": \"x\", \"kept\": {kept}, \"role\": \"{role}\"{key}}}"
     );
     fs::write(directory.join("owner.json"), document).expect("an owner marker");
-    fs::write(directory.join("owner.lock"), b"").expect("an owner lock");
 }
 
 #[must_use]
@@ -737,4 +807,98 @@ impl Git {
         );
         self.run(repository, &["commit", "--quiet", "-m", &message]);
     }
+}
+
+const COMMAND_LEN: usize = 24;
+const SYMBOLS_AT: usize = 32 + COMMAND_LEN;
+
+fn little(value: usize) -> [u8; 4] {
+    u32::try_from(value)
+        .expect("a fixture field that fits in 32 bits")
+        .to_le_bytes()
+}
+
+pub fn write_macho_image(path: &Path, objects: &[&str]) {
+    let mut strings = vec![b' ', 0];
+    let mut symbols = Vec::new();
+    for object in objects.iter().copied().chain(["_main"]) {
+        let kind: u8 = if object == "_main" { 0x0f } else { 0x66 };
+        symbols.extend_from_slice(&little(strings.len()));
+        symbols.extend_from_slice(&[kind, 0, 0, 0]);
+        symbols.extend_from_slice(&0u64.to_le_bytes());
+        strings.extend_from_slice(object.as_bytes());
+        strings.push(0);
+    }
+    let strings_at = SYMBOLS_AT
+        .checked_add(symbols.len())
+        .expect("a small symbol table");
+    let count = objects.len().checked_add(1).expect("a small symbol table");
+    let mut bytes = Vec::new();
+    for field in [0xfeed_facf_u32, 0x0100_000c, 0, 2, 1] {
+        bytes.extend_from_slice(&field.to_le_bytes());
+    }
+    bytes.extend_from_slice(&little(COMMAND_LEN));
+    bytes.extend_from_slice(&[0; 8]);
+    for field in [2, COMMAND_LEN, SYMBOLS_AT, count, strings_at, strings.len()] {
+        bytes.extend_from_slice(&little(field));
+    }
+    bytes.extend_from_slice(&symbols);
+    bytes.extend_from_slice(&strings);
+    write_bytes(path, &bytes);
+    let _executable = executable(path);
+}
+
+#[derive(Debug)]
+pub struct Holder(std::process::Child);
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        drop(self.0.stdin.take());
+        let _exited = self.0.wait();
+    }
+}
+
+#[must_use]
+pub fn hold_session_lock(path: &Path) -> Option<Holder> {
+    if cfg!(windows) {
+        let _skipped =
+            Built::Unavailable(String::from("rustc locks sessions with LockFileEx here"))
+                .or_skip("a process that holds a rustc session lock");
+        return None;
+    }
+    let script = if cfg!(target_os = "linux") {
+        "use Fcntl qw(:flock); open(my $f, '+<', $ARGV[0]) or die $!; flock($f, LOCK_EX | LOCK_NB) or die $!; $| = 1; print \"held\\n\"; <STDIN>;"
+    } else {
+        "use Fcntl; open(my $f, '+<', $ARGV[0]) or die $!; fcntl($f, F_SETLK, pack('q q l s s', 0, 0, 0, F_WRLCK, SEEK_SET)) or die $!; $| = 1; print \"held\\n\"; <STDIN>;"
+    };
+    let spawned = Command::new("perl")
+        .args(["-e", script])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            let _skipped =
+                Built::Unavailable(error.to_string()).or_skip("a process that holds a lock");
+            return None;
+        },
+    };
+    let mut line = String::new();
+    let Some(stdout) = child.stdout.take() else {
+        panic!("the holder has no stdout");
+    };
+    if let Err(error) = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line)
+    {
+        panic!("the holder did not report: {error}");
+    }
+    assert_eq!(
+        line,
+        "held\n",
+        "the holder could not take {}",
+        path.display()
+    );
+    Some(Holder(child))
 }

@@ -13,10 +13,12 @@ mod measure;
 mod observe;
 mod owners;
 mod platform;
+mod prune;
 mod report;
 mod scan;
 mod store;
 pub mod trace;
+mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -27,23 +29,23 @@ use storage_scout_core::gate::Mandate;
 use storage_scout_core::reject::Rejection;
 
 pub use crate::apply::{Mode, Outcome, Plan, Status, Summary};
-pub use crate::auto::{
-    AutoPolicy, AutoRun, Deduping, EvictStep, Evicting, PolicyError, Reaping, Selection, Watch,
-};
+pub use crate::auto::{AutoPolicy, AutoRun, PolicyError, Reaping, Selection};
 pub use crate::dedupe::{Admission, DedupeRun, PairOutcome, PairStatus, Subject, Tally, Totals};
 pub use crate::doctor::{Diagnosis, PolicyFile, Warning};
 pub use crate::explain::Explanation;
 pub use crate::host::HostError;
 pub use crate::measure::Measure;
+pub use crate::prune::{PruneAdmission, PruneFailure, PruneRun, PruneSubject, Removed};
 pub use crate::report::{
     Color, render_auto, render_clean, render_dedupe, render_doctor, render_explain, render_json,
-    render_scan,
+    render_prune, render_scan, render_watch,
 };
 pub use crate::scan::{
     DEFAULT_MIN_SIZE, DEFAULT_TOP, DirectoryUsage, Found, ScanOptions, ScanReport, ScanStats,
 };
+pub use crate::watch::{Cause, WatchError, WatchRecord};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Scout {
@@ -80,12 +82,51 @@ impl Scout {
         &self.protection
     }
 
+    pub(crate) const fn owners(&self) -> &owners::Owners {
+        &self.owners
+    }
+
     #[must_use]
     pub fn scan(&self, options: &ScanOptions) -> ScanReport {
         scan::scan(options, &self.protection, &self.owners)
     }
 
     pub fn discover(&self, options: &ScanOptions) -> Result<ScanReport, Rejection> {
+        let validated = self.validated(options)?;
+        Ok(scan::scan(&validated, &self.protection, &self.owners))
+    }
+
+    pub fn sight(&self, options: &ScanOptions) -> Result<ScanReport, Rejection> {
+        let validated = self.validated(options)?;
+        Ok(scan::sight(
+            &validated,
+            &self.protection,
+            &self.owners,
+            scan::Reach::Everything,
+        )
+        .report)
+    }
+
+    pub(crate) fn sighting(
+        &self,
+        options: &ScanOptions,
+        reach: scan::Reach,
+    ) -> Result<scan::Sighting, Rejection> {
+        let validated = self.validated(options)?;
+        Ok(scan::sight(
+            &validated,
+            &self.protection,
+            &self.owners,
+            reach,
+        ))
+    }
+
+    #[must_use]
+    pub(crate) fn refreshed(&self) -> Self {
+        self.clone()
+    }
+
+    fn validated(&self, options: &ScanOptions) -> Result<ScanOptions, Rejection> {
         let mut roots = Vec::new();
         for root in &options.roots {
             match scan::validate_root(root, &self.protection) {
@@ -104,12 +145,11 @@ impl Scout {
         if roots.is_empty() {
             return Err(Rejection::NoRoots);
         }
-        let validated = ScanOptions {
+        Ok(ScanOptions {
             roots,
             measure: Measure::Allocated,
             ..options.clone()
-        };
-        Ok(scan::scan(&validated, &self.protection, &self.owners))
+        })
     }
 
     pub fn plan(
@@ -141,15 +181,7 @@ impl Scout {
         excludes: &[PathBuf],
         mode: Mode,
     ) -> Result<DedupeRun, Rejection> {
-        let report = self.discover(&ScanOptions {
-            roots: roots.to_vec(),
-            top: 0,
-            min_size: storage_scout_core::size::Bytes::ZERO,
-            max_depth: Some(0),
-            excludes: excludes.to_vec(),
-            threads: None,
-            measure: Measure::Allocated,
-        })?;
+        let report = self.sight(&ScanOptions::sighting(roots, excludes))?;
         Ok(dedupe::run(
             &report.candidates,
             &scan::excludes(excludes),
@@ -158,8 +190,34 @@ impl Scout {
         ))
     }
 
+    pub fn prune(
+        &self,
+        roots: &[PathBuf],
+        excludes: &[PathBuf],
+        mode: Mode,
+    ) -> Result<PruneRun, Rejection> {
+        let report = self.sight(&ScanOptions::sighting(roots, excludes))?;
+        Ok(prune::run(
+            &report.candidates,
+            &scan::excludes(excludes),
+            &self.protection,
+            &self.owners,
+            mode,
+        ))
+    }
+
     pub fn auto(&self, policy: &AutoPolicy, mode: Mode) -> Result<AutoRun, Rejection> {
         auto::run(self, policy, mode)
+    }
+
+    #[must_use]
+    pub fn watch(
+        &self,
+        policy: &AutoPolicy,
+        config: &Path,
+        render: &dyn Fn(&WatchRecord) -> std::io::Result<()>,
+    ) -> WatchError {
+        watch::watch(self, policy, config, render)
     }
 
     #[must_use]

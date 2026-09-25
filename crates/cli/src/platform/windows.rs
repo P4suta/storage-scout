@@ -4,25 +4,25 @@
 )]
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, Metadata};
+use std::fs::{self, File, Metadata, TryLockError};
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
-use std::os::windows::io::AsRawHandle;
-use std::path::Path;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use storage_scout_core::candidate::Identity;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileStandardInfo, GetDiskFreeSpaceExW,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileStandardInfo, GetDiskFreeSpaceExW,
     GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 
-use super::{FileMeasure, WalkError};
+use super::{FileMeasure, Pruned, WalkError};
 
 const REPARSE_POINT: u32 = 0x0400;
 
@@ -36,8 +36,25 @@ impl Drop for OwnedHandle {
 }
 
 pub(super) fn open_regular(path: &Path) -> io::Result<File> {
-    let file = File::open(path)?;
-    if file.metadata()?.is_file() {
+    let path = wide(path);
+    // SAFETY: the UTF-16 path is NUL-terminated and every pointer argument is valid for the call.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `CreateFileW` just returned this handle and nothing else owns it.
+    let file = File::from(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) });
+    if file.metadata()?.file_type().is_file() {
         Ok(file)
     } else {
         Err(io::Error::from(io::ErrorKind::InvalidInput))
@@ -240,4 +257,132 @@ pub(super) fn remove_tree(
     release();
     clear(root, &BTreeSet::new())?;
     remove_dir(root).map_err(io)
+}
+
+pub(super) struct Tree {
+    root: PathBuf,
+}
+
+fn inside(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut components = relative.components().peekable();
+    components.peek()?;
+    components
+        .all(|component| matches!(component, Component::Normal(_)))
+        .then(|| root.join(relative))
+}
+
+fn vanished(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+enum SessionLock {
+    Taken(File),
+    Absent,
+    Held,
+}
+
+fn session_lock(path: &Path) -> io::Result<SessionLock> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if vanished(&error) => return Ok(SessionLock::Absent),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(SessionLock::Taken(file)),
+        Err(TryLockError::WouldBlock) => Ok(SessionLock::Held),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    File,
+    Directory,
+}
+
+fn same(path: &Path, expected: Identity, entry: Entry) -> io::Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if vanished(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let found = if metadata.is_dir() {
+        Entry::Directory
+    } else {
+        Entry::File
+    };
+    if is_reparse_point(&metadata) || found != entry {
+        return Ok(false);
+    }
+    Ok(identity(path)? == expected)
+}
+
+impl Tree {
+    pub(super) fn open(root: &Path, expected: Identity) -> Result<Self, WalkError> {
+        match same(root, expected, Entry::Directory) {
+            Ok(true) => Ok(Self {
+                root: root.to_path_buf(),
+            }),
+            Ok(false) => Err(WalkError::Moved {
+                path: root.to_path_buf(),
+            }),
+            Err(error) => Err(WalkError::Io {
+                path: root.to_path_buf(),
+                error,
+            }),
+        }
+    }
+
+    pub(super) fn prune_file(&self, relative: &Path, expected: Identity) -> io::Result<Pruned> {
+        let Some(path) = inside(&self.root, relative) else {
+            return Ok(Pruned::Moved);
+        };
+        if !same(&path, expected, Entry::File)? {
+            return Ok(Pruned::Moved);
+        }
+        match remove_file(&path) {
+            Ok(()) => Ok(Pruned::Removed),
+            Err(error) if vanished(&error) => Ok(Pruned::Moved),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn prune_session(
+        &self,
+        relative: &Path,
+        lock: &std::ffi::OsStr,
+        expected: Identity,
+        shown: &Path,
+    ) -> Result<Pruned, WalkError> {
+        let io = |error| WalkError::Io {
+            path: shown.to_path_buf(),
+            error,
+        };
+        let Some(directory) = inside(&self.root, relative) else {
+            return Ok(Pruned::Moved);
+        };
+        let lock = directory.with_file_name(lock);
+        let held = match session_lock(&lock).map_err(io)? {
+            SessionLock::Taken(file) => Some(file),
+            SessionLock::Absent => None,
+            SessionLock::Held => return Ok(Pruned::Held),
+        };
+        if !same(&directory, expected, Entry::Directory).map_err(io)? {
+            return Ok(Pruned::Moved);
+        }
+        clear(&directory, &BTreeSet::new())?;
+        remove_dir(&directory).map_err(io)?;
+        if held.is_some() {
+            match remove_file(&lock) {
+                Ok(()) => {},
+                Err(error) if vanished(&error) => {},
+                Err(error) => return Err(io(error)),
+            }
+        }
+        drop(held);
+        Ok(Pruned::Removed)
+    }
 }
