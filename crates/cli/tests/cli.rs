@@ -54,6 +54,20 @@ fn help_syntax_and_strict_exit_codes() {
 }
 
 #[test]
+fn git_is_not_asked_above_a_ceiling() {
+    let temp = tempdir("cli-ceiling");
+    let target = write_cargo_project(&temp.path().join("proj"), 16);
+    testkit::write_cache_tag(&target);
+    let explained = cli(&["explain", target.to_str().unwrap(), "--json"]);
+    assert_eq!(
+        json(&explained)["ownership"]["basis"],
+        "nothing",
+        "{}",
+        String::from_utf8_lossy(&explained.stdout)
+    );
+}
+
+#[test]
 fn clean_discovers_dry_runs_refuses_unconfirmed_and_executes_by_id() {
     let temp = tempdir("cli-clean");
     if !open_space(temp.path()) {

@@ -724,6 +724,14 @@ mod tests {
         testkit::write_sized(&root.join("bare").join("Cargo.toml"), 1);
         testkit::write_sized(&deep.join("Cargo.toml"), 1);
         testkit::write_sized(&root.join("plain").join("readme"), 1);
+        testkit::write_sized(
+            &root
+                .join("repo")
+                .join(".git")
+                .join("modules")
+                .join("Cargo.toml"),
+            1,
+        );
         let options = ScanOptions::sighting(std::slice::from_ref(&root), &[]);
         let protection = testkit::open_protection();
         let owners = Owners::default();

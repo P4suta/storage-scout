@@ -62,11 +62,10 @@ fn open(path: &Path) -> io::Result<Directory> {
 }
 
 fn word(bytes: &[u8], at: usize) -> Option<u32> {
-    let end = at.checked_add(4)?;
-    match bytes.get(at..end) {
-        Some(&[a, b, c, d]) => Some(u32::from_le_bytes([a, b, c, d])),
-        Some(_) | None => None,
-    }
+    bytes
+        .get(at..)?
+        .first_chunk::<4>()
+        .map(|word| u32::from_le_bytes(*word))
 }
 
 fn changed(bytes: &[u8], root: &Path, deliver: &Deliver) {

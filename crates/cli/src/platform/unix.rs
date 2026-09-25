@@ -70,12 +70,7 @@ pub(super) fn free_space(path: &Path) -> io::Result<u64> {
     }
     // SAFETY: `statvfs` returned 0, so it initialised the buffer.
     let stat = unsafe { stat.assume_init() };
-    let block = if stat.f_frsize == 0 {
-        stat.f_bsize
-    } else {
-        stat.f_frsize
-    };
-    Ok(widen(stat.f_bavail).saturating_mul(widen(block)))
+    Ok(widen(stat.f_bavail).saturating_mul(widen(stat.f_frsize)))
 }
 
 fn widen<T: Into<u64>>(value: T) -> u64 {

@@ -888,4 +888,38 @@ mod tests {
         assert!(!groups.iter().any(|group| stale.group(group)));
         assert!(groups.iter().all(|group| Focus::Everything.group(group)));
     }
+
+    #[test]
+    fn a_stock_names_only_the_files_it_had_not_seen() {
+        let temp = testkit::tempdir("dedupe-stock");
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let target = testkit::write_cargo_project(&root.join("app"), 1);
+        testkit::write_cache_tag(&target);
+        testkit::write_sized(&target.join("debug/.cargo-lock"), 0);
+        testkit::write_patterned(&target.join("debug/deps/one.rlib"), MINIMUM, 1);
+        let sighted = crate::scan::sight(
+            &crate::ScanOptions::sighting(std::slice::from_ref(&root), &[]),
+            &testkit::open_protection(),
+            &crate::owners::Owners::default(),
+            crate::scan::Reach::Everything,
+        );
+        let found = sighted.report.candidates.first().unwrap().clone();
+        let protection = testkit::open_protection();
+        let mut pool = Pool::default();
+        let first = pool.stock(&found, &[], &protection);
+        let admitted = pool.stocks.get(found.path()).unwrap().method.is_some();
+        if !admitted {
+            let required = std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_some();
+            assert!(!required, "this volume must share blocks");
+            let _skipped = testkit::Built::Unavailable(String::from("sharing is refused here"))
+                .or_skip("a volume that shares blocks");
+            return;
+        }
+        let one = platform::identity(&target.join("debug/deps/one.rlib")).unwrap();
+        assert_eq!(first, BTreeSet::from([one]));
+        assert!(pool.stock(&found, &[], &protection).is_empty());
+        testkit::write_patterned(&target.join("debug/deps/two.rlib"), MINIMUM, 2);
+        let two = platform::identity(&target.join("debug/deps/two.rlib")).unwrap();
+        assert_eq!(pool.stock(&found, &[], &protection), BTreeSet::from([two]));
+    }
 }

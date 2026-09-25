@@ -185,6 +185,22 @@ fn wait_for(lock: PathBuf, root: PathBuf, sender: Sender<Signal>) -> io::Result<
 }
 
 impl Session<'_> {
+    fn lets_go(&self, found: &Found) -> bool {
+        if !let_go(found) {
+            return false;
+        }
+        let Some(survey) = surveyed(found.path()) else {
+            return false;
+        };
+        matches!(busy::held(&survey.locks), busy::Holding::Free)
+            && Admits::Settled.admits(
+                self.scout
+                    .owners()
+                    .of(found.path(), &survey.markers)
+                    .settlement(),
+            )
+    }
+
     fn owner(&self, directory: &Path) -> Option<PathBuf> {
         directory
             .ancestors()
@@ -260,7 +276,7 @@ impl Session<'_> {
             .filter(|found| self.policy.selection.admits(found.candidate()))
             .collect::<Vec<_>>();
         let (settled, remaining): (Vec<&Found>, Vec<&Found>) =
-            sighted.iter().partition(|found| let_go(found));
+            sighted.iter().partition(|found| self.lets_go(found));
         let reap = auto::reap(&self.scout, &self.policy.selection, &settled, Mode::Execute);
         let remaining = remaining.into_iter().cloned().collect::<Vec<_>>();
         let pruned = prune::run(
@@ -353,17 +369,12 @@ impl Session<'_> {
         for root in vanished {
             self.forget(&root);
         }
-        let settled = sighted
-            .values()
-            .filter(|found| let_go(found))
-            .collect::<Vec<_>>();
+        let (settled, remaining): (Vec<&Found>, Vec<&Found>) =
+            sighted.values().partition(|found| self.lets_go(found));
         let reap = self.reap(&settled);
-        for (root, found) in &sighted {
-            if let_go(found) {
-                continue;
-            }
-            if self.world.contains_key(root) {
-                self.world.insert(root.clone(), found.clone());
+        for found in remaining {
+            if self.world.contains_key(found.path()) {
+                self.world.insert(found.path().to_path_buf(), found.clone());
             } else {
                 self.adopt(found.clone())?;
             }
@@ -437,12 +448,10 @@ impl Session<'_> {
                 }
             }
         }
-        let settled = appeared
-            .iter()
-            .filter(|found| let_go(found))
-            .collect::<Vec<_>>();
+        let (settled, remaining): (Vec<&Found>, Vec<&Found>) =
+            appeared.iter().partition(|found| self.lets_go(found));
         let reap = self.reap(&settled);
-        for found in appeared.iter().filter(|found| !let_go(found)) {
+        for found in remaining {
             self.adopt(found.clone())?;
         }
         self.record(&WatchRecord {
@@ -748,6 +757,15 @@ mod tests {
         old
     }
 
+    fn last_cause(state: &Path) -> Option<String> {
+        let last = fs::read_dir(state)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().ends_with(".last.json"))?;
+        let document: serde_json::Value = serde_json::from_slice(&fs::read(last).unwrap()).unwrap();
+        document["cause"].as_str().map(str::to_owned)
+    }
+
     fn pruned_so_far(records: &Records) -> u64 {
         records
             .borrow()
@@ -778,6 +796,7 @@ mod tests {
                 assert!(session.world.contains_key(&target));
                 assert_eq!(records.borrow().len(), 1);
                 assert_eq!(records.borrow()[0].cause, Cause::Start);
+                assert_eq!(last_cause(&session.hooks.state).as_deref(), Some("start"));
                 let debug = target.join("debug");
                 let old = build(&debug, "one");
                 session
@@ -786,6 +805,22 @@ mod tests {
                 assert_eq!(pruned_so_far(records), 1);
                 testkit::assert_absent(&old);
                 assert!(session.dirty.is_empty());
+                let quiet = records.borrow().len();
+                session.turn(vec![changed(&debug.join("deps"))]).unwrap();
+                assert_eq!(records.borrow().len(), quiet);
+
+                let batched = build(&debug, "three");
+                let state = session.hooks.state.clone();
+                session
+                    .turn(vec![
+                        changed(&state),
+                        changed(&root.join("repo/.git/refs/heads")),
+                        changed(&root.join("repo/.git/objects/ab")),
+                        changed(&debug.join("incremental/three")),
+                    ])
+                    .unwrap();
+                assert_eq!(pruned_so_far(records), 2);
+                testkit::assert_absent(&batched);
 
                 let holder = File::open(debug.join(".cargo-lock")).unwrap();
                 holder.lock().unwrap();
@@ -793,14 +828,14 @@ mod tests {
                 session.turn(vec![changed(&debug.join("deps"))]).unwrap();
                 assert!(session.waiting.contains_key(&target));
                 session.turn(vec![changed(&debug.join("deps"))]).unwrap();
-                assert_eq!(pruned_so_far(records), 1);
+                assert_eq!(pruned_so_far(records), 2);
                 testkit::assert_present(&busy);
                 drop(holder);
                 session.waiting.remove(&target).unwrap().join().unwrap();
                 session
                     .turn(vec![Signal::Released(target.clone())])
                     .unwrap();
-                assert_eq!(pruned_so_far(records), 2);
+                assert_eq!(pruned_so_far(records), 3);
                 testkit::assert_absent(&busy);
                 assert!(!session.waiting.contains_key(&target));
             },
@@ -828,6 +863,11 @@ mod tests {
                 assert_eq!(pruned_so_far(records), 1);
                 testkit::assert_absent(&old);
 
+                let unannounced = build(&debug, "two");
+                let quiet = profile(root, "quiet");
+                let state = session.hooks.state.clone();
+                session.turn(vec![changed(&state)]).unwrap();
+                assert!(!session.world.contains_key(&root.join("quiet/target")));
                 let run = root.join("run");
                 testkit::write_owner_lock(&run);
                 write_sized(&run.join("scratch.bin"), 64);
@@ -837,6 +877,13 @@ mod tests {
                 assert_eq!(reaped(records), 1);
                 testkit::assert_absent(&run);
                 assert!(!session.world.contains_key(&run));
+                assert_eq!(pruned_so_far(records), 1);
+                testkit::assert_present(&unannounced);
+
+                let deep = profile(root, "deep");
+                session.turn(vec![changed(deep.parent().unwrap())]).unwrap();
+                assert!(session.world.contains_key(&root.join("deep/target")));
+                drop(quiet);
             },
         );
     }
@@ -861,6 +908,25 @@ mod tests {
                 assert_eq!(reaped(records), 1);
                 testkit::assert_absent(&run);
 
+                let held = root.join("held");
+                testkit::write_owner_marker(
+                    &held,
+                    MarkerRole::Cache,
+                    MarkerKeep::Released,
+                    Some(&root.join("missing")),
+                );
+                write_sized(&held.join("debug/.cargo-lock"), 0);
+                let build = File::open(held.join("debug/.cargo-lock")).unwrap();
+                build.lock().unwrap();
+                session.turn(vec![changed(root)]).unwrap();
+                assert!(session.waiting.contains_key(&held));
+                assert_eq!(reaped(records), 1);
+                drop(build);
+                session.waiting.remove(&held).unwrap().join().unwrap();
+                session.turn(vec![Signal::Released(held.clone())]).unwrap();
+                assert_eq!(reaped(records), 2);
+                testkit::assert_absent(&held);
+
                 let target = root.join("gone/target");
                 assert!(session.world.contains_key(&target));
                 testkit::remove_tree(&target);
@@ -877,11 +943,19 @@ mod tests {
             |root| {
                 let key = root.with_file_name("key");
                 testkit::make_dir(&key);
+                for name in ["cache", "guarded"] {
+                    testkit::write_owner_marker(
+                        &root.join(name),
+                        MarkerRole::Cache,
+                        MarkerKeep::Released,
+                        Some(&key),
+                    );
+                }
                 testkit::write_owner_marker(
-                    &root.join("cache"),
-                    MarkerRole::Cache,
-                    MarkerKeep::Released,
-                    Some(&key),
+                    &root.join("guarded/inner"),
+                    MarkerRole::Scratch,
+                    MarkerKeep::Kept,
+                    None,
                 );
                 let key_two = root.with_file_name("key-two");
                 testkit::make_dir(&key_two);
@@ -891,25 +965,45 @@ mod tests {
                     MarkerKeep::Released,
                     Some(&key_two),
                 );
+                let _app = profile(root, "app");
+                let _doomed = profile(root, "doomed");
             },
             |session, root, records| {
-                assert_eq!(session.world.len(), 2);
+                assert_eq!(session.world.len(), 5, "{:?}", session.world.keys());
+                let recursive = session.watcher.recursive();
                 testkit::remove_tree(&root.with_file_name("key"));
                 session.turn(vec![]).unwrap();
                 assert_eq!(reaped(records), 0);
+                let unannounced = build(&root.join("app/target/debug"), "one");
+                let fresh = profile(root, "fresh");
+                testkit::remove_tree(&root.join("doomed/target"));
                 session.hooks.station.raise().unwrap();
                 session.turn(vec![]).unwrap();
                 assert_eq!(reaped(records), 1);
                 assert_eq!(records.borrow().last().unwrap().cause, Cause::Hook);
                 testkit::assert_absent(root.join("cache"));
+                assert!(session.world.contains_key(&root.join("guarded")));
+                assert_eq!(
+                    session
+                        .world
+                        .contains_key(&fresh.parent().unwrap().to_path_buf()),
+                    !recursive
+                );
+                assert_eq!(
+                    session.world.contains_key(&root.join("doomed/target")),
+                    recursive
+                );
+                assert_eq!(pruned_so_far(records), 0);
+                testkit::assert_present(&unannounced);
 
                 testkit::remove_tree(&root.with_file_name("key-two"));
                 let refs = root.join("repo/.git/refs/remotes/origin");
                 session.turn(vec![changed(&refs)]).unwrap();
-                let expected = usize::from(session.watcher.recursive());
+                let expected = usize::from(recursive);
                 assert_eq!(reaped(records), 1 + expected);
 
                 let late = profile(root, "unseen");
+                let waste = build(&late, "one");
                 session.turn(vec![Signal::Changed(Change::Lost)]).unwrap();
                 assert!(
                     session
@@ -918,6 +1012,12 @@ mod tests {
                 );
                 assert_eq!(reaped(records), 2);
                 testkit::assert_absent(root.join("second"));
+                assert!(!session.world.contains_key(&root.join("second")));
+                assert!(!session.world.contains_key(&root.join("doomed/target")));
+                assert!(session.world.contains_key(&root.join("guarded")));
+                assert_eq!(pruned_so_far(records), 2);
+                testkit::assert_absent(&unannounced);
+                testkit::assert_absent(&waste);
             },
         );
     }

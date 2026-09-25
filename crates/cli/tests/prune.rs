@@ -219,28 +219,59 @@ fn only_objects_the_unit_image_no_longer_names_are_stale() {
     let directory = deps.join("app-1.d.old.rcgu.o");
     write_sized(&directory.join("inside"), 16);
     image(&deps.join("one-4"), &[]);
+    let unnamed = ["tiny-6.a.one.rcgu.o", "tiny-6.a.two.rcgu.o"].map(|name| object(&deps, name));
+    write_macho_image(&deps.join("tiny-6"), &[]);
+    let cut = ["cut-7.a.new.rcgu.o", "cut-7.a.old.rcgu.o"].map(|name| object(&deps, name));
+    let truncated = deps.join("cut-7");
+    image(&truncated, &named(&deps, &["cut-7.a.new.rcgu.o"]));
+    let whole = fs::read(&truncated).unwrap();
+    fs::write(&truncated, whole.split_last().unwrap().1).unwrap();
 
     let dry = prune(root, Mode::DryRun);
-    assert_eq!(dry.totals.stale_objects.files, 4, "{dry:#?}");
+    assert_eq!(dry.totals.stale_objects.files, 6, "{dry:#?}");
     let Some(run) = pruned(root) else {
         return;
     };
     assert!(!run.failed(), "{run:#?}");
-    assert_eq!(run.totals.stale_objects.files, 4, "{run:#?}");
-    assert_eq!(run.totals.stale_objects.bytes, Bytes::new(4 * 2048));
-    assert_eq!(subject(&run).unreadable_images, 1);
-    for gone in stale.iter().chain([&dylib_stale, &script_stale]) {
+    assert_eq!(run.totals.stale_objects.files, 6, "{run:#?}");
+    assert_eq!(run.totals.stale_objects.bytes, Bytes::new(6 * 2048));
+    assert_eq!(subject(&run).unreadable_images, 2);
+    for gone in stale
+        .iter()
+        .chain(&unnamed)
+        .chain([&dylib_stale, &script_stale])
+    {
         testkit::assert_absent(gone);
     }
     for present in kept
         .iter()
         .chain(&imageless)
         .chain(&unreadable)
+        .chain(&cut)
         .chain([&dylib, &script, &single, &directory])
     {
         testkit::assert_present(present);
     }
     testkit::assert_present(deps.join("app-1"));
+}
+
+#[test]
+fn an_image_that_cannot_be_read_keeps_every_object_of_its_unit() {
+    let temp = tempdir("prune-sealed-image");
+    let root = temp.path();
+    let deps = profile(root, "app").join("deps");
+    let objects = ["app-1.a.new.rcgu.o", "app-1.a.old.rcgu.o"].map(|name| object(&deps, name));
+    let sealed = deps.join("app-1");
+    image(&sealed, &named(&deps, &["app-1.a.new.rcgu.o"]));
+    let Some(_restricted) = testkit::restrict(&sealed, 0o000) else {
+        return;
+    };
+    let run = prune(root, Mode::Execute);
+    assert_eq!(run.totals.files(), 0, "{run:#?}");
+    assert_eq!(subject(&run).unreadable_images, 1, "{run:#?}");
+    for present in &objects {
+        testkit::assert_present(present);
+    }
 }
 
 #[test]

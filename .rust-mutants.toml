@@ -203,38 +203,6 @@ outcome = "survived"
 
 [[mutation.expect]]
 path = "crates/cli/src/platform/unix.rs"
-item = "free_space"
-rule = "condition-to-false"
-original = "stat.f_frsize == 0"
-reason = "every filesystem a test runs on reports f_frsize; the fallback is for those that do not"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/platform/unix.rs"
-item = "free_space"
-rule = "eq-to-neq"
-original = "=="
-reason = "every filesystem a test runs on reports f_frsize; the fallback is for those that do not"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/platform/unix.rs"
-item = "free_space"
-rule = "negate-condition"
-original = "stat.f_frsize == 0"
-reason = "every filesystem a test runs on reports f_frsize; the fallback is for those that do not"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/platform/unix.rs"
-item = "stat_at"
-rule = "condition-to-false"
-original = "result != 0"
-reason = "fstatat of a name just listed in an open directory does not fail"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/platform/unix.rs"
 item = "stat_fd"
 rule = "condition-to-false"
 original = "result != 0"

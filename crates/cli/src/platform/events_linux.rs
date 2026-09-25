@@ -26,12 +26,8 @@ const MASK: u32 = libc::IN_CREATE
 const HEADER: usize = 16;
 const BUFFER: usize = 64 * 1024;
 
-fn field(bytes: &[u8], at: usize) -> Option<u32> {
-    let end = at.checked_add(4)?;
-    match bytes.get(at..end) {
-        Some(&[a, b, c, d]) => Some(u32::from_ne_bytes([a, b, c, d])),
-        Some(_) | None => None,
-    }
+fn field(bytes: &[u8], at: usize) -> Option<[u8; 4]> {
+    bytes.get(at..)?.first_chunk::<4>().copied()
 }
 
 fn dispatch(bytes: &[u8], watches: &Watches, deliver: &Deliver) {
@@ -41,7 +37,8 @@ fn dispatch(bytes: &[u8], watches: &Watches, deliver: &Deliver) {
         field(bytes, at.saturating_add(4)),
         field(bytes, at.saturating_add(12)),
     ) {
-        let Ok(len) = usize::try_from(len) else {
+        let (wd, mask) = (i32::from_ne_bytes(wd), u32::from_ne_bytes(mask));
+        let Ok(len) = usize::try_from(u32::from_ne_bytes(len)) else {
             return;
         };
         let Some(next) = at
@@ -56,9 +53,6 @@ fn dispatch(bytes: &[u8], watches: &Watches, deliver: &Deliver) {
             deliver(Change::Lost);
             continue;
         }
-        let Ok(wd) = i32::try_from(wd) else {
-            continue;
-        };
         let mut known = match watches.lock() {
             Ok(known) => known,
             Err(poisoned) => poisoned.into_inner(),
@@ -181,12 +175,14 @@ mod tests {
         let bytes = [
             event(9, libc::IN_CREATE, b"unknown"),
             event(1, libc::IN_CLOSE_WRITE, b"libx.rlib"),
+            event(1, libc::IN_CREATE, b"liby.rlib"),
             event(2, libc::IN_CREATE, b"app-1"),
         ]
         .concat();
         assert_eq!(
             collect(&bytes, &watches),
             vec![
+                Change::Directory(PathBuf::from("/w/deps")),
                 Change::Directory(PathBuf::from("/w/deps")),
                 Change::Directory(PathBuf::from("/w/incremental")),
             ]
