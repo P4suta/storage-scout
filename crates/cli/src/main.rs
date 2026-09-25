@@ -20,7 +20,7 @@ use storage_scout::trace::{self, Verbosity};
 use storage_scout::{
     AutoPolicy, Color, DEFAULT_TOP, Found, Measure, Mode, Plan, SCHEMA_VERSION, ScanOptions, Scout,
     Summary, render_auto, render_clean, render_dedupe, render_doctor, render_explain, render_json,
-    render_prune, render_scan,
+    render_prune, render_scan, render_watch,
 };
 
 #[derive(Debug, Parser)]
@@ -45,6 +45,7 @@ enum Command {
     Auto(AutoArgs),
     Dedupe(DedupeArgs),
     Prune(DedupeArgs),
+    Watch(WatchArgs),
     Doctor(Output),
     Explain(ExplainArgs),
 }
@@ -151,6 +152,12 @@ struct DedupeArgs {
     execution: Execution,
     #[command(flatten)]
     output: Output,
+}
+
+#[derive(Debug, Args)]
+struct WatchArgs {
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +270,7 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Auto(args) => auto(&scout, args),
         Command::Dedupe(args) => dedupe(&scout, &args),
         Command::Prune(args) => prune(&scout, &args),
+        Command::Watch(args) => watch(&scout, args),
         Command::Doctor(output) => doctor(&scout, &output),
         Command::Explain(args) => explain(&scout, &args),
     }
@@ -472,11 +480,35 @@ fn prune(scout: &Scout, args: &DedupeArgs) -> Result<ExitCode> {
     Ok(ExitCode::from(u8::from(run.failed())))
 }
 
-fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
-    let config = match args.config {
-        Some(config) => config,
-        None => default_policy_path().context("no --config given and no home directory is set")?,
+fn policy_path(given: Option<PathBuf>) -> Result<PathBuf> {
+    match given {
+        Some(config) => Ok(config),
+        None => default_policy_path().context("no --config given and no home directory is set"),
+    }
+}
+
+fn load_policy(config: &std::path::Path) -> Result<AutoPolicy> {
+    let text = fs::read_to_string(config)
+        .with_context(|| format!("cannot read policy {}", config.display()))?;
+    AutoPolicy::parse(&text)
+        .map_err(|error| anyhow!("invalid policy {}: {error}", config.display()))
+}
+
+fn watch(scout: &Scout, args: WatchArgs) -> Result<ExitCode> {
+    let config = policy_path(args.config)?;
+    let config = fs::canonicalize(&config)
+        .with_context(|| format!("cannot resolve policy {}", config.display()))?;
+    let policy = load_policy(&config)?;
+    let render = |record: &storage_scout::WatchRecord| {
+        let mut out = io::stdout().lock();
+        render_watch(record, &mut out)?;
+        out.flush()
     };
+    Err(anyhow!(scout.watch(&policy, &config, &render)))
+}
+
+fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
+    let config = policy_path(args.config)?;
     if let Some(event) = args.event {
         let event = event.event();
         let mut input = Vec::new();
@@ -504,10 +536,7 @@ fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let text = fs::read_to_string(&config)
-        .with_context(|| format!("cannot read policy {}", config.display()))?;
-    let policy = AutoPolicy::parse(&text)
-        .map_err(|error| anyhow!("invalid policy {}: {error}", config.display()))?;
+    let policy = load_policy(&config)?;
     let format = args.output.format();
     let show = |run: &storage_scout::AutoRun| -> Result<()> {
         let mut out = io::stdout().lock();

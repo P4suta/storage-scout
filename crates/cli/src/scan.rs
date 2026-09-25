@@ -23,6 +23,7 @@ pub const DEFAULT_TOP: usize = 20;
 pub const DEFAULT_MIN_SIZE: Bytes = Bytes::new(10 * 1024 * 1024);
 pub(crate) const MAX_ISSUES: usize = 50;
 const GIT_DIRECTORY: &str = ".git";
+const CARGO_MANIFEST: &str = "Cargo.toml";
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -118,12 +119,25 @@ pub struct ScanReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Descent {
     Measure,
-    Sight,
+    Sight(Reach),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    Everything,
+    Children,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Sighting {
+    pub report: ScanReport,
+    pub hosts: Vec<PathBuf>,
 }
 
 struct Collector<'a> {
     options: &'a ScanOptions,
     descent: Descent,
+    hosts: &'a Mutex<Vec<PathBuf>>,
     protection: &'a Protection,
     owners: &'a Owners,
     excludes: Vec<Location>,
@@ -180,16 +194,32 @@ pub(crate) fn excludes(paths: &[PathBuf]) -> Vec<Location> {
 }
 
 pub(crate) fn scan(options: &ScanOptions, protection: &Protection, owners: &Owners) -> ScanReport {
-    collect(options, protection, owners, Descent::Measure)
+    collect(
+        options,
+        protection,
+        owners,
+        Descent::Measure,
+        &Mutex::new(Vec::new()),
+    )
 }
 
-pub(crate) fn sight(options: &ScanOptions, protection: &Protection, owners: &Owners) -> ScanReport {
+pub(crate) fn sight(
+    options: &ScanOptions,
+    protection: &Protection,
+    owners: &Owners,
+    reach: Reach,
+) -> Sighting {
     let sighting = ScanOptions {
         measure: Measure::Logical,
         min_size: Bytes::ZERO,
         ..options.clone()
     };
-    collect(&sighting, protection, owners, Descent::Sight)
+    let hosts = Mutex::new(Vec::new());
+    let report = collect(&sighting, protection, owners, Descent::Sight(reach), &hosts);
+    let mut hosts = drain(hosts);
+    hosts.sort();
+    hosts.dedup();
+    Sighting { report, hosts }
 }
 
 pub(crate) fn measured(found: &Found, protection: &Protection) -> Result<Found, Rejection> {
@@ -205,10 +235,12 @@ fn collect(
     protection: &Protection,
     owners: &Owners,
     descent: Descent,
+    hosts: &Mutex<Vec<PathBuf>>,
 ) -> ScanReport {
     let collector = Collector {
         options,
         descent,
+        hosts,
         protection,
         owners,
         excludes: excludes(&options.excludes),
@@ -378,6 +410,50 @@ enum Region<'a> {
     Artifact,
 }
 
+struct Here<'a> {
+    directory: &'a Path,
+    metadata: &'a Metadata,
+    location: &'a Location,
+}
+
+fn admission(
+    here: &Here<'_>,
+    region: Region<'_>,
+    contents: &Contents,
+    collector: &Collector<'_>,
+) -> Option<Admission> {
+    let Here {
+        directory,
+        metadata,
+        location,
+    } = *here;
+    match region {
+        Region::Root | Region::Artifact => None,
+        Region::Open { parent } => {
+            let listing = Listing::new(
+                parent.clone(),
+                contents.names.clone(),
+                observe::tags(directory, &contents.names),
+            );
+            let site = Site {
+                location,
+                shape: Shape::Directory,
+                boundary: match platform::device(metadata) {
+                    Some(device) => Boundary::Same { device },
+                    None => Boundary::Unreported,
+                },
+                listing: &listing,
+                protection: collector.protection,
+                excludes: &collector.excludes,
+            };
+            match gate::admit(&site) {
+                Ok(admission) => Some(admission),
+                Err(_not_a_candidate) => None,
+            }
+        },
+    }
+}
+
 fn walk(
     directory: &Path,
     metadata: &Metadata,
@@ -393,7 +469,7 @@ fn walk(
         },
     };
     if collector.excluded(&location)
-        || (collector.descent == Descent::Sight
+        || (collector.descent != Descent::Measure
             && directory.file_name() == Some(std::ffi::OsStr::new(GIT_DIRECTORY)))
     {
         return Tally::empty(collector.options.measure);
@@ -403,37 +479,28 @@ fn walk(
     };
     collector.directory_count.fetch_add(1, Ordering::Relaxed);
 
-    let admission = match region {
-        Region::Root | Region::Artifact => None,
-        Region::Open { parent } => {
-            let listing = Listing::new(
-                parent.clone(),
-                contents.names.clone(),
-                observe::tags(directory, &contents.names),
-            );
-            let site = Site {
-                location: &location,
-                shape: Shape::Directory,
-                boundary: match platform::device(metadata) {
-                    Some(device) => Boundary::Same { device },
-                    None => Boundary::Unreported,
-                },
-                listing: &listing,
-                protection: collector.protection,
-                excludes: &collector.excludes,
-            };
-            match gate::admit(&site) {
-                Ok(admission) => Some(admission),
-                Err(_not_a_candidate) => None,
-            }
-        },
+    let here = Here {
+        directory,
+        metadata,
+        location: &location,
     };
+    let admission = admission(&here, region, &contents, collector);
+    if admission.is_none()
+        && collector.descent != Descent::Measure
+        && contents.names.has_file(CARGO_MANIFEST)
+        && let Ok(mut hosts) = collector.hosts.lock()
+    {
+        hosts.push(directory.to_path_buf());
+    }
     let admission = match (collector.descent, admission) {
-        (Descent::Sight, Some(admission)) => {
+        (Descent::Sight(_), Some(admission)) => {
             sighted(directory, admission, collector);
             return Tally::empty(collector.options.measure);
         },
-        (Descent::Measure, admission) | (Descent::Sight, admission @ None) => admission,
+        (Descent::Sight(Reach::Children), None) if depth > 0 => {
+            return Tally::empty(collector.options.measure);
+        },
+        (Descent::Measure | Descent::Sight(_), admission) => admission,
     };
     let inside = match (region, &admission) {
         (Region::Artifact, _) | (Region::Root | Region::Open { .. }, Some(_)) => true,
@@ -442,7 +509,7 @@ fn walk(
 
     let mut tally = match collector.descent {
         Descent::Measure => files(&contents.files, collector),
-        Descent::Sight => Tally::empty(collector.options.measure),
+        Descent::Sight(_) => Tally::empty(collector.options.measure),
     };
     if collector.descent == Descent::Measure && contents.names.has_file(crate::owners::MARKER_NAME)
     {

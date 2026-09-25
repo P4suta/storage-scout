@@ -7,6 +7,13 @@ use storage_scout_core::candidate::Identity;
 use storage_scout_core::gate::{Boundary, Shape};
 use storage_scout_core::share::{Extras, Failure, Filesystem, Method, Mode, Owner, Sharing, Step};
 
+#[cfg_attr(target_os = "macos", path = "platform/events_macos.rs")]
+#[cfg_attr(target_os = "linux", path = "platform/events_linux.rs")]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    path = "platform/events_none.rs"
+)]
+mod events;
 #[cfg_attr(unix, path = "platform/unix.rs")]
 #[cfg_attr(windows, path = "platform/windows.rs")]
 mod imp;
@@ -18,6 +25,38 @@ mod imp;
 )]
 mod share;
 pub(crate) mod spawn;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    expect(dead_code, reason = "nothing is watched on this platform")
+)]
+pub(crate) enum Change {
+    Directory(PathBuf),
+    Lost,
+}
+
+pub(crate) struct Watcher(events::Source);
+
+impl Watcher {
+    pub(crate) fn start(
+        paths: &[PathBuf],
+        deliver: impl Fn(Change) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        events::Source::start(paths, Box::new(deliver)).map(Self)
+    }
+
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "only inotify adds watches one directory at a time"
+        )
+    )]
+    pub(crate) fn watch(&self, directories: &[&Path]) -> io::Result<()> {
+        self.0.watch(directories)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FileMeasure {
@@ -165,6 +204,10 @@ pub(crate) fn extras(path: &Path, identity: Identity) -> Extras {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    windows,
+    expect(dead_code, reason = "nothing is pruned in place on Windows yet")
+)]
 pub(crate) enum Pruned {
     Removed,
     Moved,

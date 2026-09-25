@@ -256,10 +256,18 @@ impl Tree {
         })
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "Windows has no handle-bound pruning yet"
+    )]
     pub(super) fn prune_file(&self, _relative: &Path, _expected: Identity) -> io::Result<Pruned> {
         Err(unsupported())
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "Windows has no handle-bound pruning yet"
+    )]
     pub(super) fn prune_session(
         &self,
         _relative: &Path,

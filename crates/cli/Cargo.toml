@@ -44,6 +44,10 @@ path = "tests/dedupe.rs"
 name = "prune"
 path = "tests/prune.rs"
 
+[[test]]
+name = "watch"
+path = "tests/watch.rs"
+
 [dependencies]
 storage-scout-core.workspace = true
 anyhow.workspace = true

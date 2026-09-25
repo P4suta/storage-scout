@@ -1,7 +1,7 @@
 mod capability;
 
 use std::borrow::Borrow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -371,8 +371,8 @@ fn settle<'f>(
     }
 }
 
-fn free_space(found: &[Found]) -> Volumes {
-    Volumes::sample(found.iter().map(|each| {
+fn free_space<'f>(found: impl Iterator<Item = &'f Found>) -> Volumes {
+    Volumes::sample(found.map(|each| {
         (
             each.candidate().identity().volume,
             each.path().parent().unwrap_or_else(|| each.path()),
@@ -380,53 +380,223 @@ fn free_space(found: &[Found]) -> Volumes {
     }))
 }
 
-fn survey<'f>(found: &'f [Found], terms: &Terms<'_>) -> (Vec<Subject>, Vec<Item<'f>>) {
-    let mut subjects = Vec::with_capacity(found.len());
-    let mut items = Vec::new();
-    let mut seen = BTreeSet::new();
-    for each in found {
-        let admitted = admit(each, terms)
-            .and_then(|method| inventory(each.path()).map(|listed| (method, listed)));
-        let admission = match admitted {
-            Err(rejection) => Admission::Rejected { rejection },
-            Ok((method, listed)) => {
-                let files = listed.files.len();
-                for (path, relative, facts) in listed.files {
-                    if seen.insert(facts.identity)
-                        && let Ok(location) = host::locate(&path)
-                    {
-                        items.push(Item {
-                            record: Record {
-                                location,
-                                len: facts.len,
-                                identity: facts.identity,
-                                method,
-                                links: facts.links,
-                                owner: facts.owner,
-                                mode: facts.mode,
-                                extras: Extras::Unobserved,
-                                sharing: facts.sharing,
-                            },
-                            found: each,
-                            path,
-                            relative,
-                        });
-                    }
-                }
+struct Stock {
+    found: Found,
+    subject: Subject,
+    method: Option<Method>,
+    files: Vec<(PathBuf, PathBuf, FileFacts)>,
+}
+
+#[derive(Default)]
+pub(crate) struct Pool {
+    stocks: BTreeMap<PathBuf, Stock>,
+}
+
+pub(crate) enum Focus<'a> {
+    Everything,
+    Fresh {
+        roots: &'a BTreeSet<PathBuf>,
+        identities: &'a BTreeSet<Identity>,
+    },
+}
+
+impl Focus<'_> {
+    fn subject(&self, root: &Path) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Fresh { roots, .. } => roots.contains(root),
+        }
+    }
+
+    fn group<T: Borrow<Record>>(&self, group: &Group<'_, T>) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Fresh { identities, .. } => group
+                .members
+                .iter()
+                .any(|member| identities.contains(&(*member).borrow().identity)),
+        }
+    }
+}
+
+impl Pool {
+    pub(crate) fn stock(
+        &mut self,
+        found: &Found,
+        excludes: &[Location],
+        protection: &Protection,
+    ) -> BTreeSet<Identity> {
+        let terms = Terms {
+            excludes,
+            protection,
+        };
+        let known = self
+            .stocks
+            .get(found.path())
+            .map(|stock| {
+                stock
+                    .files
+                    .iter()
+                    .map(|(_, _, facts)| facts.identity)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let admitted = admit(found, &terms)
+            .and_then(|method| inventory(found.path()).map(|listed| (method, listed)));
+        let (admission, method, files) = match admitted {
+            Err(rejection) => (Admission::Rejected { rejection }, None, Vec::new()),
+            Ok((method, listed)) => (
                 Admission::Admitted {
                     method,
-                    files,
+                    files: listed.files.len(),
                     unreadable: listed.unreadable,
-                }
-            },
+                },
+                Some(method),
+                listed.files,
+            ),
         };
-        subjects.push(Subject {
-            id: each.candidate().id().clone(),
-            location: each.candidate().location().clone(),
-            admission,
-        });
+        let fresh = files
+            .iter()
+            .map(|(_, _, facts)| facts.identity)
+            .filter(|identity| !known.contains(identity))
+            .collect();
+        self.stocks.insert(
+            found.path().to_path_buf(),
+            Stock {
+                found: found.clone(),
+                subject: Subject {
+                    id: found.candidate().id().clone(),
+                    location: found.candidate().location().clone(),
+                    admission,
+                },
+                method,
+                files,
+            },
+        );
+        fresh
     }
-    (subjects, items)
+
+    pub(crate) fn forget(&mut self, root: &Path) {
+        self.stocks.remove(root);
+    }
+
+    fn items(&self, focus: &Focus<'_>) -> (Vec<Subject>, Vec<Item<'_>>) {
+        let mut subjects = Vec::new();
+        let mut items = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (root, stock) in &self.stocks {
+            if focus.subject(root) {
+                subjects.push(stock.subject.clone());
+            }
+            let Some(method) = stock.method else {
+                continue;
+            };
+            for (path, relative, facts) in &stock.files {
+                if seen.insert(facts.identity)
+                    && let Ok(location) = host::locate(path)
+                {
+                    items.push(Item {
+                        record: Record {
+                            location,
+                            len: facts.len,
+                            identity: facts.identity,
+                            method,
+                            links: facts.links,
+                            owner: facts.owner,
+                            mode: facts.mode,
+                            extras: Extras::Unobserved,
+                            sharing: facts.sharing,
+                        },
+                        found: &stock.found,
+                        path: path.clone(),
+                        relative: relative.clone(),
+                    });
+                }
+            }
+        }
+        (subjects, items)
+    }
+
+    pub(crate) fn share(
+        &self,
+        focus: &Focus<'_>,
+        excludes: &[Location],
+        protection: &Protection,
+        mode: Mode,
+    ) -> DedupeRun {
+        let terms = Terms {
+            excludes,
+            protection,
+        };
+        let found = || self.stocks.values().map(|stock| &stock.found);
+        let before = match mode {
+            Mode::Execute => Some(free_space(found())),
+            Mode::DryRun => None,
+        };
+        let (subjects, items) = self.items(focus);
+        let sized = share::groups(&items)
+            .into_iter()
+            .filter(|group| focus.group(group))
+            .collect::<Vec<_>>();
+        let sampled = refine(&sized, sample);
+        let confirmed = refine(&sampled, full);
+        let observed = confirmed
+            .par_iter()
+            .map(|group| {
+                group
+                    .members
+                    .par_iter()
+                    .map(|member| member.observed())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let groups = confirmed
+            .iter()
+            .zip(&observed)
+            .map(|(group, members)| Group {
+                len: group.len,
+                members: members.iter().collect(),
+            })
+            .collect::<Vec<_>>();
+        let mut pairs = share::plan(&groups);
+        pairs.sort_by(|left, right| {
+            left.duplicate
+                .found
+                .candidate()
+                .location()
+                .cmp(right.duplicate.found.candidate().location())
+        });
+        let mut held = None;
+        let mut totals = Totals::default();
+        let mut outcomes = Vec::with_capacity(pairs.len());
+        for pair in &pairs {
+            let status = settle(pair, mode, &mut held, &terms);
+            let tally = match status {
+                PairStatus::WouldShare | PairStatus::Shared => &mut totals.shared,
+                PairStatus::AlreadyShared => &mut totals.already_shared,
+                PairStatus::Refused { .. } => &mut totals.refused,
+                PairStatus::Withheld { .. } => &mut totals.withheld,
+                PairStatus::Failed { .. } => &mut totals.failed,
+            };
+            tally.add(pair.len);
+            outcomes.push(PairOutcome {
+                keeper: pair.keeper.record.location.clone(),
+                duplicate: pair.duplicate.record.location.clone(),
+                len: Bytes::new(pair.len),
+                status,
+            });
+        }
+        drop(held);
+        DedupeRun {
+            schema_version: SCHEMA_VERSION,
+            command: "dedupe",
+            mode,
+            subjects,
+            totals,
+            observed_freed: before.and_then(|before| before.gained(&free_space(found()))),
+            pairs: outcomes,
+        }
+    }
 }
 
 pub(crate) fn run(
@@ -435,74 +605,11 @@ pub(crate) fn run(
     protection: &Protection,
     mode: Mode,
 ) -> DedupeRun {
-    let terms = Terms {
-        excludes,
-        protection,
-    };
-    let before = match mode {
-        Mode::Execute => Some(free_space(found)),
-        Mode::DryRun => None,
-    };
-    let (subjects, items) = survey(found, &terms);
-    let sized = share::groups(&items);
-    let sampled = refine(&sized, sample);
-    let confirmed = refine(&sampled, full);
-    let observed = confirmed
-        .par_iter()
-        .map(|group| {
-            group
-                .members
-                .par_iter()
-                .map(|member| member.observed())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let groups = confirmed
-        .iter()
-        .zip(&observed)
-        .map(|(group, members)| Group {
-            len: group.len,
-            members: members.iter().collect(),
-        })
-        .collect::<Vec<_>>();
-    let mut pairs = share::plan(&groups);
-    pairs.sort_by(|left, right| {
-        left.duplicate
-            .found
-            .candidate()
-            .location()
-            .cmp(right.duplicate.found.candidate().location())
-    });
-    let mut held = None;
-    let mut totals = Totals::default();
-    let mut outcomes = Vec::with_capacity(pairs.len());
-    for pair in &pairs {
-        let status = settle(pair, mode, &mut held, &terms);
-        let tally = match status {
-            PairStatus::WouldShare | PairStatus::Shared => &mut totals.shared,
-            PairStatus::AlreadyShared => &mut totals.already_shared,
-            PairStatus::Refused { .. } => &mut totals.refused,
-            PairStatus::Withheld { .. } => &mut totals.withheld,
-            PairStatus::Failed { .. } => &mut totals.failed,
-        };
-        tally.add(pair.len);
-        outcomes.push(PairOutcome {
-            keeper: pair.keeper.record.location.clone(),
-            duplicate: pair.duplicate.record.location.clone(),
-            len: Bytes::new(pair.len),
-            status,
-        });
+    let mut pool = Pool::default();
+    for each in found {
+        let _fresh = pool.stock(each, excludes, protection);
     }
-    drop(held);
-    DedupeRun {
-        schema_version: SCHEMA_VERSION,
-        command: "dedupe",
-        mode,
-        subjects,
-        totals,
-        observed_freed: before.and_then(|before| before.gained(&free_space(found))),
-        pairs: outcomes,
-    }
+    pool.share(&Focus::Everything, excludes, protection, mode)
 }
 
 #[cfg(test)]

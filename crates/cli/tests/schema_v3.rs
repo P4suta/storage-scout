@@ -40,6 +40,35 @@ fn field_paths(value: &Value, prefix: &str, into: &mut BTreeSet<String>) {
     }
 }
 
+fn pairs(place: &storage_scout::core::location::Location) -> [PairOutcome; 6] {
+    [
+        PairStatus::WouldShare,
+        PairStatus::Shared,
+        PairStatus::AlreadyShared,
+        PairStatus::Refused {
+            refusal: Refusal::HardLinked { links: 2 },
+        },
+        PairStatus::Withheld {
+            rejection: Rejection::NoRoots,
+        },
+        PairStatus::Failed {
+            failure: Failure::Io {
+                step: Step::Clone,
+                error: IoFailure {
+                    kind: IoKind::Other,
+                    code: Some(1),
+                },
+            },
+        },
+    ]
+    .map(|status| PairOutcome {
+        keeper: place.clone(),
+        duplicate: place.clone(),
+        len: Bytes::new(1),
+        status,
+    })
+}
+
 fn documents() -> BTreeMap<String, Value> {
     let temp = tempdir("schema");
     let root = temp.path();
@@ -80,33 +109,26 @@ fn documents() -> BTreeMap<String, Value> {
         write_patterned(&shared.join(name).join("blob"), 128 * 1024, 1);
     }
     let dedupe = scout.dedupe(&[shared], &[], Mode::DryRun).unwrap();
+    let pruned = scout
+        .prune(&[root.to_path_buf()], &[], Mode::DryRun)
+        .unwrap();
+    let policy = storage_scout::AutoPolicy::parse(&format!(
+        "[select]\nroots = [{:?}]\n",
+        root.to_str().unwrap()
+    ))
+    .unwrap();
+    let auto = scout.auto(&policy, Mode::DryRun).unwrap();
+    let watched = storage_scout::WatchRecord {
+        schema_version: SCHEMA_VERSION,
+        command: "watch",
+        cause: storage_scout::Cause::Written,
+        watching: 1,
+        reap: Some(summary.clone()),
+        prune: Some(pruned.clone()),
+        dedupe: Some(dedupe.clone()),
+    };
     let place = testkit::location(root);
-    let pairs = [
-        PairStatus::WouldShare,
-        PairStatus::Shared,
-        PairStatus::AlreadyShared,
-        PairStatus::Refused {
-            refusal: Refusal::HardLinked { links: 2 },
-        },
-        PairStatus::Withheld {
-            rejection: Rejection::NoRoots,
-        },
-        PairStatus::Failed {
-            failure: Failure::Io {
-                step: Step::Clone,
-                error: IoFailure {
-                    kind: IoKind::Other,
-                    code: Some(1),
-                },
-            },
-        },
-    ]
-    .map(|status| PairOutcome {
-        keeper: place.clone(),
-        duplicate: place.clone(),
-        len: Bytes::new(1),
-        status,
-    });
+    let pairs = pairs(&place);
     let to_value = |value: &dyn erased::Erased| value.value();
     let mut documents = BTreeMap::new();
     documents.insert("scan".to_owned(), to_value(&scan));
@@ -117,6 +139,9 @@ fn documents() -> BTreeMap<String, Value> {
     documents.insert("explain-refused".to_owned(), to_value(&refused));
     documents.insert("doctor".to_owned(), to_value(&scout.diagnose(None)));
     documents.insert("dedupe".to_owned(), to_value(&dedupe));
+    documents.insert("prune".to_owned(), to_value(&pruned));
+    documents.insert("auto".to_owned(), to_value(&auto));
+    documents.insert("watch".to_owned(), to_value(&watched));
     documents.insert(
         "detached".to_owned(),
         json!({
@@ -128,17 +153,26 @@ fn documents() -> BTreeMap<String, Value> {
         "dedupe-pairs".to_owned(),
         json!({ "pairs": to_value(&pairs) }),
     );
-    documents.insert(
-        "vocabulary".to_owned(),
-        json!({
-            "kinds": Kind::ALL.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
-            "tiers": Tier::ALL.iter().map(|tier| tier.as_str()).collect::<Vec<_>>(),
-            "provenance": Provenance::ALL.iter().map(|provenance| provenance.as_str()).collect::<Vec<_>>(),
-            "gates": Gate::ALL.iter().map(|gate| gate.name()).collect::<Vec<_>>(),
-            "pair-gates": to_value(&PairGate::ALL),
-        }),
-    );
+    documents.insert("vocabulary".to_owned(), vocabulary());
     documents
+}
+
+fn vocabulary() -> Value {
+    let to_value = |value: &dyn erased::Erased| value.value();
+    json!({
+        "kinds": Kind::ALL.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
+        "tiers": Tier::ALL.iter().map(|tier| tier.as_str()).collect::<Vec<_>>(),
+        "provenance": Provenance::ALL.iter().map(|provenance| provenance.as_str()).collect::<Vec<_>>(),
+        "gates": Gate::ALL.iter().map(|gate| gate.name()).collect::<Vec<_>>(),
+        "pair-gates": to_value(&PairGate::ALL),
+        "prune-rules": to_value(&storage_scout::core::prune::Rule::ALL),
+        "watch-causes": to_value(&[
+            storage_scout::Cause::Start,
+            storage_scout::Cause::Hook,
+            storage_scout::Cause::Appeared,
+            storage_scout::Cause::Written,
+        ]),
+    })
 }
 
 mod erased {

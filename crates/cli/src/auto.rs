@@ -86,7 +86,12 @@ fn sight(scout: &Scout, selection: &Selection) -> Result<Vec<Found>, Rejection> 
         .collect())
 }
 
-fn reap(scout: &Scout, selection: &Selection, settled: &[&Found], mode: Mode) -> Option<Summary> {
+pub(crate) fn reap(
+    scout: &Scout,
+    selection: &Selection,
+    settled: &[&Found],
+    mode: Mode,
+) -> Option<Summary> {
     if settled.is_empty() {
         return None;
     }

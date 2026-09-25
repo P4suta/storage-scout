@@ -878,17 +878,24 @@ fn a_lock_name_inside_cargos_own_directories_is_not_a_lock() {
 #[test]
 fn a_marker_that_appears_after_discovery_is_heard_before_deletion() {
     let temp = tempdir("owned-late");
-    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let run = temp.path().join("run");
     testkit::write_owner_marker(
-        &target.join("tmp/released"),
+        &run,
         testkit::MarkerRole::Scratch,
         testkit::MarkerKeep::Released,
         None,
     );
+    let target = write_cargo_project(&run.join("proj"), 4096);
     let report = discover(temp.path());
+    let settled = report.candidates.clone();
+    assert_eq!(settled.len(), 1, "{report:#?}");
+    assert_eq!(
+        settled[0].candidate().settlement(),
+        storage_scout::core::ownership::Settlement::Released
+    );
     let plan = Scout::plan(
-        &report.candidates,
-        &ids(&report.candidates),
+        &settled,
+        &ids(&settled),
         Mandate {
             tiers: TierGrant::ROUTINE,
             settlements: storage_scout::core::ownership::Admits::Settled,
@@ -909,7 +916,10 @@ fn a_marker_that_appears_after_discovery_is_heard_before_deletion() {
         matches!(
             status(&summary),
             Status::Rejected {
-                rejection: Rejection::Owned { .. }
+                rejection: Rejection::Owned {
+                    settlement: storage_scout::core::ownership::Settlement::Kept,
+                    ..
+                }
             }
         ),
         "{summary:#?}"

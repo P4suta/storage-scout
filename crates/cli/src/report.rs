@@ -16,6 +16,7 @@ use crate::doctor::{Diagnosis, PolicyFile, Warning};
 use crate::explain::Explanation;
 use crate::prune::{PruneAdmission, PruneRun};
 use crate::scan::ScanReport;
+use crate::watch::{Cause, WatchRecord};
 
 const BANNER: &str = concat!("storage-scout ", env!("CARGO_PKG_VERSION"));
 
@@ -484,4 +485,36 @@ pub fn render_prune(run: &PruneRun, out: &mut dyn Write) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn render_watch(record: &WatchRecord, out: &mut dyn Write) -> io::Result<()> {
+    let cause = match record.cause {
+        Cause::Start => "start",
+        Cause::Hook => "hook",
+        Cause::Appeared => "appeared",
+        Cause::Written => "written",
+    };
+    let reaped = record
+        .reap
+        .as_ref()
+        .map_or(0, |summary| summary.outcomes.len());
+    let pruned = record
+        .prune
+        .as_ref()
+        .map_or_else(Tally::default, |run| Tally {
+            files: run.totals.files(),
+            bytes: run.totals.bytes(),
+        });
+    let shared = record
+        .dedupe
+        .as_ref()
+        .map_or_else(Tally::default, |run| run.totals.shared);
+    writeln!(
+        out,
+        "{cause}: watching {}, reaped {reaped}, pruned {}, shared {}{}",
+        record.watching,
+        counted(pruned, "entry", "entries"),
+        tally(shared),
+        if record.failed() { " (FAILURES)" } else { "" }
+    )
 }

@@ -178,11 +178,12 @@ impl Owners {
     }
 
     pub(crate) fn of(&self, path: &Path, nested: &[PathBuf]) -> Ownership {
-        let mut markers = nested
+        let inside = nested
             .iter()
             .filter(|directory| directory.as_path() != path)
             .filter_map(|directory| marker(directory))
             .collect::<Vec<_>>();
+        let mut markers = Vec::new();
         let mut worktree = None;
         for directory in path.ancestors() {
             if self.ceiling(directory) {
@@ -200,7 +201,7 @@ impl Owners {
                 }
             }
         }
-        Ownership::resolve(markers, worktree)
+        Ownership::resolve(markers, inside, worktree)
     }
 }
 

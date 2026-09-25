@@ -18,6 +18,7 @@ mod report;
 mod scan;
 mod store;
 pub mod trace;
+mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -37,11 +38,12 @@ pub use crate::measure::Measure;
 pub use crate::prune::{PruneAdmission, PruneFailure, PruneRun, PruneSubject, Removed};
 pub use crate::report::{
     Color, render_auto, render_clean, render_dedupe, render_doctor, render_explain, render_json,
-    render_prune, render_scan,
+    render_prune, render_scan, render_watch,
 };
 pub use crate::scan::{
     DEFAULT_MIN_SIZE, DEFAULT_TOP, DirectoryUsage, Found, ScanOptions, ScanReport, ScanStats,
 };
+pub use crate::watch::{Cause, WatchError, WatchRecord};
 
 pub const SCHEMA_VERSION: u32 = 3;
 
@@ -96,7 +98,32 @@ impl Scout {
 
     pub fn sight(&self, options: &ScanOptions) -> Result<ScanReport, Rejection> {
         let validated = self.validated(options)?;
-        Ok(scan::sight(&validated, &self.protection, &self.owners))
+        Ok(scan::sight(
+            &validated,
+            &self.protection,
+            &self.owners,
+            scan::Reach::Everything,
+        )
+        .report)
+    }
+
+    pub(crate) fn sighting(
+        &self,
+        options: &ScanOptions,
+        reach: scan::Reach,
+    ) -> Result<scan::Sighting, Rejection> {
+        let validated = self.validated(options)?;
+        Ok(scan::sight(
+            &validated,
+            &self.protection,
+            &self.owners,
+            reach,
+        ))
+    }
+
+    #[must_use]
+    pub(crate) fn refreshed(&self) -> Self {
+        self.clone()
     }
 
     fn validated(&self, options: &ScanOptions) -> Result<ScanOptions, Rejection> {
@@ -181,6 +208,16 @@ impl Scout {
 
     pub fn auto(&self, policy: &AutoPolicy, mode: Mode) -> Result<AutoRun, Rejection> {
         auto::run(self, policy, mode)
+    }
+
+    #[must_use]
+    pub fn watch(
+        &self,
+        policy: &AutoPolicy,
+        config: &Path,
+        render: &dyn Fn(&WatchRecord) -> std::io::Result<()>,
+    ) -> WatchError {
+        watch::watch(self, policy, config, render)
     }
 
     #[must_use]

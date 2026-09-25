@@ -174,6 +174,24 @@ impl Contention {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum Holding<'a> {
+    Free,
+    Held(&'a Path),
+    Unknown,
+}
+
+pub(crate) fn held(locks: &[Lock]) -> Holding<'_> {
+    for lock in locks {
+        match attempt(lock) {
+            Attempt::Vanished | Attempt::Taken(_) => {},
+            Attempt::Held => return Holding::Held(&lock.path),
+            Attempt::Unknown => return Holding::Unknown,
+        }
+    }
+    Holding::Free
+}
+
 pub(crate) fn probe(locks: &[Lock]) -> Result<(), Contention> {
     for lock in locks {
         match attempt(lock) {

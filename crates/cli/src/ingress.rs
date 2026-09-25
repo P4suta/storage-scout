@@ -129,3 +129,46 @@ pub(crate) fn owner(bytes: &[u8]) -> Option<Declaration> {
         keyed_to: document.keyed_to,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_policy_names_only_where_to_look() {
+        let policy = policy(
+            "[select]\nroots = ['/work']\nkinds = ['rust-target']\nexclude = ['/work/keep']\ninclude_tier = ['reinstallable']\n[report]\nlog_file = '/log'\n",
+        )
+        .unwrap();
+        assert_eq!(policy.selection.roots, vec![PathBuf::from("/work")]);
+        assert_eq!(policy.selection.kinds, vec![Kind::RustTarget]);
+        assert_eq!(policy.selection.excludes, vec![PathBuf::from("/work/keep")]);
+        assert!(policy.selection.tiers.admits(Tier::Reinstallable));
+        assert_eq!(policy.log_file, Some(PathBuf::from("/log")));
+    }
+
+    #[test]
+    fn retired_settings_are_refused_with_the_reason() {
+        for (text, error) in [
+            (
+                "[select]\nroots = ['/work']\nolder_than = '3d'\n",
+                PolicyError::RetiredAge,
+            ),
+            (
+                "[select]\nroots = ['/work']\nmin_size = '0'\n",
+                PolicyError::RetiredMinSize,
+            ),
+            (
+                "[trigger]\nmin_free = '1G'\n[select]\nroots = ['/work']\n",
+                PolicyError::RetiredTrigger,
+            ),
+            ("[select]\nroots = []\n", PolicyError::NoRoots),
+        ] {
+            assert_eq!(policy(text), Err(error), "{text}");
+        }
+        assert!(matches!(
+            policy("[select]\nroots = ['/work']\nguess = 1\n"),
+            Err(PolicyError::Syntax(_))
+        ));
+    }
+}

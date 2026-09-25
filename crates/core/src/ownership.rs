@@ -214,30 +214,60 @@ impl Worktree {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "basis", rename_all = "kebab-case")]
 pub enum Ownership {
-    Markers { markers: Vec<Marker> },
-    Worktree { worktree: Worktree },
+    Markers {
+        markers: Vec<Marker>,
+    },
+    Worktree {
+        worktree: Worktree,
+    },
+    Holders {
+        holders: Vec<Marker>,
+        worktree: Option<Worktree>,
+    },
     Nothing,
+}
+
+const fn protects(settlement: Settlement) -> bool {
+    match settlement {
+        Settlement::Active | Settlement::Kept => true,
+        Settlement::Released | Settlement::Landed | Settlement::Unclaimed => false,
+    }
+}
+
+fn strongest(settlements: impl Iterator<Item = Settlement>) -> Settlement {
+    settlements
+        .max_by_key(|settlement| protection(*settlement))
+        .unwrap_or(Settlement::Unclaimed)
 }
 
 impl Ownership {
     #[must_use]
-    pub fn resolve(markers: Vec<Marker>, worktree: Option<Worktree>) -> Self {
-        match (markers.is_empty(), worktree) {
-            (false, _) => Self::Markers { markers },
-            (true, Some(worktree)) => Self::Worktree { worktree },
-            (true, None) => Self::Nothing,
+    pub fn resolve(own: Vec<Marker>, nested: Vec<Marker>, worktree: Option<Worktree>) -> Self {
+        let holders = nested
+            .into_iter()
+            .filter(|marker| protects(marker.settlement()))
+            .collect::<Vec<_>>();
+        match (own.is_empty(), holders.is_empty(), worktree) {
+            (false, _, _) => Self::Markers {
+                markers: own.into_iter().chain(holders).collect(),
+            },
+            (true, false, worktree) => Self::Holders { holders, worktree },
+            (true, true, Some(worktree)) => Self::Worktree { worktree },
+            (true, true, None) => Self::Nothing,
         }
     }
 
     #[must_use]
     pub fn settlement(&self) -> Settlement {
         match self {
-            Self::Markers { markers } => markers
-                .iter()
-                .map(Marker::settlement)
-                .max_by_key(|settlement| protection(*settlement))
-                .unwrap_or(Settlement::Unclaimed),
+            Self::Markers { markers } => strongest(markers.iter().map(Marker::settlement)),
             Self::Worktree { worktree } => worktree.settlement(),
+            Self::Holders { holders, worktree } => strongest(
+                holders
+                    .iter()
+                    .map(Marker::settlement)
+                    .chain(worktree.iter().map(Worktree::settlement)),
+            ),
             Self::Nothing => Settlement::Unclaimed,
         }
     }
@@ -361,10 +391,54 @@ mod tests {
         let released = marker(Role::Scratch, Keep::Released, OwnerLock::Free, Key::Unkeyed);
         let kept = marker(Role::Scratch, Keep::Kept, OwnerLock::Free, Key::Unkeyed);
         let held = marker(Role::Scratch, Keep::Released, OwnerLock::Held, Key::Unkeyed);
-        let busy = Ownership::resolve(vec![released.clone(), held.clone()], None);
+        let busy = Ownership::resolve(vec![released.clone(), held.clone()], Vec::new(), None);
         assert_eq!(busy.settlement(), Settlement::Active);
-        let kept = Ownership::resolve(vec![held, kept, released], None);
+        let kept = Ownership::resolve(vec![held, kept, released], Vec::new(), None);
         assert_eq!(kept.settlement(), Settlement::Kept);
+    }
+
+    #[test]
+    fn a_marker_inside_protects_what_holds_it_and_never_lets_it_go() {
+        let released = marker(Role::Scratch, Keep::Released, OwnerLock::Free, Key::Unkeyed);
+        let held = marker(Role::Scratch, Keep::Released, OwnerLock::Held, Key::Unkeyed);
+        let kept = marker(Role::Scratch, Keep::Kept, OwnerLock::Free, Key::Unkeyed);
+        let orphaned = Worktree::Orphaned { root: at("/work") };
+        let primary = Worktree::Primary { root: at("/work") };
+        assert_eq!(
+            Ownership::resolve(Vec::new(), vec![released.clone()], Some(primary.clone())),
+            Ownership::Worktree { worktree: primary }
+        );
+        assert_eq!(
+            Ownership::resolve(Vec::new(), vec![released.clone()], None),
+            Ownership::Nothing
+        );
+        let holding = Ownership::resolve(Vec::new(), vec![held.clone()], Some(orphaned.clone()));
+        assert_eq!(holding.settlement(), Settlement::Active);
+        assert_eq!(
+            Ownership::resolve(Vec::new(), vec![released.clone()], Some(orphaned.clone()))
+                .settlement(),
+            Settlement::Released
+        );
+        assert_eq!(
+            Ownership::resolve(Vec::new(), vec![kept.clone()], None).settlement(),
+            Settlement::Kept
+        );
+        assert_eq!(
+            Ownership::resolve(vec![released.clone()], vec![held], None).settlement(),
+            Settlement::Active
+        );
+        assert_eq!(
+            Ownership::resolve(vec![released.clone()], vec![released], None).settlement(),
+            Settlement::Released
+        );
+        assert_eq!(
+            Ownership::Holders {
+                holders: vec![kept],
+                worktree: Some(orphaned)
+            }
+            .settlement(),
+            Settlement::Kept
+        );
     }
 
     #[test]
@@ -372,15 +446,15 @@ mod tests {
         let released = marker(Role::Scratch, Keep::Released, OwnerLock::Free, Key::Unkeyed);
         let primary = Worktree::Primary { root: at("/work") };
         assert_eq!(
-            Ownership::resolve(vec![released], Some(primary.clone())).settlement(),
+            Ownership::resolve(vec![released], Vec::new(), Some(primary.clone())).settlement(),
             Settlement::Released
         );
         assert_eq!(
-            Ownership::resolve(Vec::new(), Some(primary)).settlement(),
+            Ownership::resolve(Vec::new(), Vec::new(), Some(primary)).settlement(),
             Settlement::Active
         );
         assert_eq!(
-            Ownership::resolve(Vec::new(), None).settlement(),
+            Ownership::resolve(Vec::new(), Vec::new(), None).settlement(),
             Settlement::Unclaimed
         );
     }
