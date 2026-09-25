@@ -280,6 +280,15 @@ pub const fn group_of(_path: &Path) -> Option<u32> {
 }
 
 #[must_use]
+pub fn shares_extents(path: &Path) -> Option<bool> {
+    let output = Command::new("filefrag").arg("-v").arg(path).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).contains("shared"))
+}
+
+#[must_use]
 pub fn other_group(path: &Path) -> Built {
     #[cfg(unix)]
     {

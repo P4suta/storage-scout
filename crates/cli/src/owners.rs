@@ -220,5 +220,6 @@ mod tests {
         assert!(Owners::from_ceilings(None).ceilings.is_empty());
         let empty = OsString::new();
         assert!(Owners::from_ceilings(Some(&empty)).ceilings.is_empty());
+        assert_eq!(owners.clone().ceilings, owners.ceilings);
     }
 }

@@ -1,5 +1,5 @@
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use core::fmt;
 use core::str::FromStr;
 
@@ -235,11 +235,6 @@ impl Candidate {
     #[must_use]
     pub const fn ownership(&self) -> &Ownership {
         &self.ownership
-    }
-
-    #[must_use]
-    pub fn describe(&self) -> String {
-        self.location.to_string()
     }
 }
 

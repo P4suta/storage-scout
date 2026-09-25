@@ -125,6 +125,9 @@ fn identical_build_outputs_come_to_share_their_blocks_without_changing_a_byte() 
         [b.join(RLIB), c.join(RLIB), b.join(EDGE)].map(|path| identity(&path)),
         before
     );
+    if let Some(shared) = testkit::shares_extents(&b.join(RLIB)) {
+        assert!(shared, "the kernel does not report the extents as shared");
+    }
 
     let again = dedupe(root, Mode::DryRun);
     match method {
@@ -315,6 +318,20 @@ fn extended_attributes_decide_whether_a_replacement_would_be_faithful() {
     .collect::<Vec<_>>();
     expected.sort();
     assert_eq!(found, expected, "{run:#?}");
+}
+
+#[test]
+fn a_file_named_like_a_temporary_is_never_paired() {
+    let temp = tempdir("dedupe-temporary-name");
+    let root = temp.path();
+    let a = project(root, "a");
+    let b = project(root, "b");
+    write_patterned(&a.join(RLIB), LEN, 18);
+    write_patterned(&leftover(&b), LEN, 18);
+    if capable(root).is_none() {
+        return;
+    }
+    assert!(dedupe(root, Mode::DryRun).pairs.is_empty());
 }
 
 #[test]
