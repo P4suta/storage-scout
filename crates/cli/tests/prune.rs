@@ -8,10 +8,10 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use storage_scout::core::ownership::Settlement;
-use storage_scout::core::reject::Rejection;
+use storage_scout::core::reject::{IoFailure, IoKind, Rejection};
 use storage_scout::core::size::Bytes;
 use storage_scout::{AutoPolicy, Mode, PruneAdmission, PruneRun, Scout};
-use testkit::{MarkerKeep, MarkerRole, tempdir, write_macho_image, write_sized};
+use testkit::{Built, MarkerKeep, MarkerRole, tempdir, write_macho_image, write_sized};
 
 fn scout(root: &Path) -> Scout {
     Scout::with(testkit::open_protection()).confined(vec![root.to_path_buf()])
@@ -19,6 +19,33 @@ fn scout(root: &Path) -> Scout {
 
 fn prune(root: &Path, mode: Mode) -> PruneRun {
     scout(root).prune(&[root.to_path_buf()], &[], mode).unwrap()
+}
+
+fn unsupported(run: &PruneRun) -> bool {
+    run.subjects.iter().any(|subject| {
+        matches!(
+            &subject.admission,
+            PruneAdmission::Rejected {
+                rejection: Rejection::Io {
+                    failure: IoFailure {
+                        kind: IoKind::Unsupported,
+                        ..
+                    },
+                    ..
+                }
+            }
+        )
+    })
+}
+
+fn pruned(root: &Path) -> Option<PruneRun> {
+    let run = prune(root, Mode::Execute);
+    if unsupported(&run) {
+        let _skipped = Built::Unavailable(String::from("pruning in place is not supported"))
+            .or_skip("a platform that prunes in place");
+        return None;
+    }
+    Some(run)
 }
 
 fn profile(root: &Path, name: &str) -> PathBuf {
@@ -66,7 +93,9 @@ fn rustc_keeps_only_its_newest_session_and_the_rest_goes() {
     testkit::assert_present(&old);
     testkit::assert_present(&working);
 
-    let run = prune(root, Mode::Execute);
+    let Some(run) = pruned(root) else {
+        return;
+    };
     assert!(!run.failed(), "{run:#?}");
     assert_eq!(run.totals.superseded_sessions.files, 1);
     assert_eq!(run.totals.abandoned_sessions.files, 1);
@@ -94,7 +123,9 @@ fn a_session_its_rustc_still_holds_is_left_alone() {
     let Some(holder) = testkit::hold_session_lock(&lock_of(&old)) else {
         return;
     };
-    let run = prune(root, Mode::Execute);
+    let Some(run) = pruned(root) else {
+        return;
+    };
     assert!(!run.failed(), "{run:#?}");
     assert_eq!(subject(&run).held.files, 1, "{run:#?}");
     assert_eq!(run.totals.superseded_sessions.files, 0);
@@ -160,7 +191,9 @@ fn only_objects_the_unit_image_no_longer_names_are_stale() {
     let single = object(&deps, "one-4.a.x.rcgu.o");
     image(&deps.join("one-4"), &[]);
 
-    let run = prune(root, Mode::Execute);
+    let Some(run) = pruned(root) else {
+        return;
+    };
     assert!(!run.failed(), "{run:#?}");
     assert_eq!(run.totals.stale_objects.files, 4, "{run:#?}");
     assert_eq!(run.totals.stale_objects.bytes, Bytes::new(4 * 2048));
@@ -242,6 +275,9 @@ fn auto_prunes_whenever_it_runs() {
     ))
     .unwrap();
     let run = scout(root).auto(&policy, Mode::Execute).unwrap();
+    if unsupported(&run.prune) {
+        return;
+    }
     assert!(!run.failed(), "{run:#?}");
     assert_eq!(run.prune.totals.superseded_sessions.files, 1, "{run:#?}");
     testkit::assert_absent(&old);

@@ -1,6 +1,7 @@
 #![expect(
     clippy::disallowed_methods,
     clippy::unwrap_used,
+    clippy::unwrap_in_result,
     reason = "tests drive a real watcher over real trees"
 )]
 
@@ -29,10 +30,11 @@ impl Drop for Watching {
 }
 
 impl Watching {
-    fn start(name: &str) -> Self {
+    fn start(name: &str, setup: impl FnOnce(&Path)) -> Option<Self> {
         let temp = tempdir(name);
         let root = temp.path().join("work");
         fs::create_dir_all(&root).unwrap();
+        setup(&root);
         let state = temp.path().join("state");
         fs::create_dir_all(&state).unwrap();
         let config = temp.path().join("auto.toml");
@@ -46,11 +48,23 @@ impl Watching {
             .env("GIT_CEILING_DIRECTORIES", temp.path())
             .env("STORAGE_SCOUT_STATE_DIR", &state)
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        Self {
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let Some(started) = lines.next() else {
+            let output = child.wait_with_output().unwrap();
+            let complaint = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                complaint.contains("cannot watch for changes here"),
+                "{complaint}"
+            );
+            let _skipped = Built::Unavailable(complaint).or_skip("a filesystem watcher");
+            return None;
+        };
+        let started = started.unwrap();
+        assert!(started.starts_with("start: watching"), "{started}");
+        Some(Self {
             child,
             lines,
             ceiling: temp.path().to_path_buf(),
@@ -58,7 +72,7 @@ impl Watching {
             root,
             config,
             state,
-        }
+        })
     }
 
     fn next(&mut self) -> String {
@@ -94,11 +108,12 @@ fn build(profile: &Path, unit: &str, stamp: &str) -> PathBuf {
 
 #[test]
 fn a_build_is_pruned_once_it_ends_and_not_while_it_runs() {
-    let mut watching = Watching::start("watch-build");
-    let debug = profile(&watching.root.clone(), "app");
-    let started = watching.next();
-    assert!(started.starts_with("start: watching"), "{started}");
-
+    let Some(mut watching) = Watching::start("watch-build", |root| {
+        let _debug = profile(root, "app");
+    }) else {
+        return;
+    };
+    let debug = watching.root.join("app/target/debug");
     let old = build(&debug, "one", "a");
     let first = watching.next();
     assert!(first.contains("pruned 1 entry"), "{first}");
@@ -118,9 +133,9 @@ fn a_build_is_pruned_once_it_ends_and_not_while_it_runs() {
 
 #[test]
 fn released_scratch_is_reaped_the_moment_its_owner_lets_go() {
-    let mut watching = Watching::start("watch-owner");
-    let started = watching.next();
-    assert!(started.starts_with("start: watching"), "{started}");
+    let Some(mut watching) = Watching::start("watch-owner", |_| {}) else {
+        return;
+    };
     let staged = watching.root.with_file_name("staged");
     testkit::write_owner_marker(&staged, MarkerRole::Scratch, MarkerKeep::Released, None);
     write_sized(&staged.join("scratch.bin"), 1024);
@@ -140,15 +155,17 @@ fn released_scratch_is_reaped_the_moment_its_owner_lets_go() {
 
 #[test]
 fn a_build_that_repeats_another_projects_bytes_is_shared_when_it_ends() {
-    let mut watching = Watching::start("watch-share");
-    let started = watching.next();
-    assert!(started.starts_with("start: watching"), "{started}");
-    let one = profile(&watching.root.clone(), "one");
-    testkit::write_patterned(&one.join("deps/libdep-1.rlib"), 256 * 1024, 7);
-    let two = profile(&watching.root.clone(), "two");
+    let Some(mut watching) = Watching::start("watch-share", |root| {
+        let one = profile(root, "one");
+        testkit::write_patterned(&one.join("deps/libdep-1.rlib"), 256 * 1024, 7);
+    }) else {
+        return;
+    };
     if !capable(&watching.root) {
         return;
     }
+    let one = watching.root.join("one/target/debug");
+    let two = profile(&watching.root.clone(), "two");
     testkit::write_patterned(&two.join("deps/libdep-1.rlib"), 256 * 1024, 7);
     loop {
         let line = watching.next();
@@ -185,15 +202,17 @@ fn capable(root: &Path) -> bool {
 
 #[test]
 fn a_cache_whose_key_is_gone_is_reaped_as_soon_as_a_hook_says_so() {
-    let mut watching = Watching::start("watch-hook");
-    let key = watching.root.with_file_name("key");
-    fs::create_dir_all(&key).unwrap();
+    let Some(mut watching) = Watching::start("watch-hook", |root| {
+        let key = root.with_file_name("key");
+        fs::create_dir_all(&key).unwrap();
+        let cache = root.join("cache");
+        testkit::write_owner_marker(&cache, MarkerRole::Cache, MarkerKeep::Released, Some(&key));
+        write_sized(&cache.join("blob"), 1024);
+    }) else {
+        return;
+    };
     let cache = watching.root.join("cache");
-    testkit::write_owner_marker(&cache, MarkerRole::Cache, MarkerKeep::Released, Some(&key));
-    write_sized(&cache.join("blob"), 1024);
-    let started = watching.next();
-    assert!(started.starts_with("start: watching"), "{started}");
-    fs::remove_dir(&key).unwrap();
+    fs::remove_dir(watching.root.with_file_name("key")).unwrap();
     let poked = Command::new(env!("CARGO_BIN_EXE_storage-scout"))
         .args([
             "auto",
@@ -223,14 +242,15 @@ fn a_cache_whose_key_is_gone_is_reaped_as_soon_as_a_hook_says_so() {
 
 #[test]
 fn writes_inside_a_cache_nobody_locks_change_nothing() {
-    let mut watching = Watching::start("watch-unlocked");
+    let Some(mut watching) = Watching::start("watch-unlocked", |root| {
+        testkit::write_cache_tag(&root.join("cache"));
+        let _debug = profile(root, "app");
+    }) else {
+        return;
+    };
     let cache = watching.root.join("cache");
-    testkit::write_cache_tag(&cache);
-    let started = watching.next();
-    assert!(started.starts_with("start: watching"), "{started}");
-    let debug = profile(&watching.root.clone(), "app");
     write_sized(&cache.join("blob"), 4096);
-    let old = build(&debug, "one", "a");
+    let old = build(&watching.root.join("app/target/debug"), "one", "a");
     let first = watching.next();
     assert!(first.contains("pruned 1 entry"), "{first}");
     testkit::assert_absent(&old);

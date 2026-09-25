@@ -69,6 +69,28 @@ fn pairs(place: &storage_scout::core::location::Location) -> [PairOutcome; 6] {
     })
 }
 
+fn subjects(place: &storage_scout::core::location::Location) -> [storage_scout::Subject; 2] {
+    let id = "0"
+        .repeat(64)
+        .parse::<storage_scout::core::candidate::CandidateId>()
+        .unwrap();
+    [
+        storage_scout::Admission::Admitted {
+            method: storage_scout::core::share::Method::CloneAndSwap,
+            files: 1,
+            unreadable: 0,
+        },
+        storage_scout::Admission::Rejected {
+            rejection: Rejection::NoRoots,
+        },
+    ]
+    .map(|admission| storage_scout::Subject {
+        id: id.clone(),
+        location: place.clone(),
+        admission,
+    })
+}
+
 fn documents() -> BTreeMap<String, Value> {
     let temp = tempdir("schema");
     let root = temp.path();
@@ -140,7 +162,9 @@ fn documents() -> BTreeMap<String, Value> {
     documents.insert("doctor".to_owned(), to_value(&scout.diagnose(None)));
     documents.insert("dedupe".to_owned(), to_value(&dedupe));
     documents.insert("prune".to_owned(), to_value(&pruned));
-    documents.insert("auto".to_owned(), to_value(&auto));
+    let mut auto = to_value(&auto);
+    *auto.pointer_mut("/dedupe/subjects").unwrap() = to_value(&subjects(&place));
+    documents.insert("auto".to_owned(), auto);
     documents.insert("watch".to_owned(), to_value(&watched));
     documents.insert(
         "detached".to_owned(),

@@ -121,8 +121,16 @@ impl PruneRun {
 
     #[must_use]
     pub(crate) fn summarized(mut self) -> Self {
-        self.subjects
-            .retain(|subject| subject.removed.files() > 0 || subject.held.files > 0);
+        self.subjects.retain(|subject| {
+            subject.removed.files() > 0
+                || subject.held.files > 0
+                || matches!(
+                    subject.admission,
+                    PruneAdmission::Rejected {
+                        rejection: Rejection::Io { .. }
+                    }
+                )
+        });
         self
     }
 }
