@@ -80,6 +80,14 @@ pub(super) struct Source {
 }
 
 impl Source {
+    #[expect(
+        clippy::unused_self,
+        reason = "each directory is watched on its own here"
+    )]
+    pub(super) const fn recursive(&self) -> bool {
+        false
+    }
+
     pub(super) fn start(paths: &[PathBuf], deliver: Deliver) -> io::Result<Self> {
         // SAFETY: `inotify_init1` takes only flags.
         let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };

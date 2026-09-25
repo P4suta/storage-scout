@@ -275,7 +275,42 @@ impl Session<'_> {
         })
     }
 
+    fn reown(&mut self) -> Result<(), WatchError> {
+        let settled = self
+            .world
+            .iter()
+            .filter(|(root, found)| {
+                let markers = match found.candidate().kind().protocol() {
+                    Some(_) => surveyed(root)
+                        .map(|survey| survey.markers)
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                Admits::Settled.admits(self.scout.owners().of(root, &markers).settlement())
+            })
+            .map(|(_, found)| found.clone())
+            .collect::<Vec<_>>();
+        let reap = self.reap(&settled.iter().collect::<Vec<_>>());
+        self.record(&WatchRecord {
+            schema_version: SCHEMA_VERSION,
+            command: "watch",
+            watching: self.world.len(),
+            cause: Cause::Hook,
+            reap,
+            prune: None,
+            dedupe: None,
+        })
+    }
+
     fn refresh(&mut self) -> Result<(), WatchError> {
+        if self.watcher.recursive() {
+            self.reown()
+        } else {
+            self.resight()
+        }
+    }
+
+    fn resight(&mut self) -> Result<(), WatchError> {
         let sighting = self
             .scout
             .sighting(&self.policy.selection.options(), Reach::Everything)
@@ -469,12 +504,13 @@ impl Session<'_> {
 
     fn turn(&mut self, signals: Vec<Signal>) -> Result<(), WatchError> {
         self.scout = self.scout.refreshed();
-        let mut hooked = self.hooks.raised().map_err(WatchError::Station)?;
+        let hooked = self.hooks.raised().map_err(WatchError::Station)?;
+        let mut lost = false;
         let mut appeared = BTreeSet::new();
         for signal in signals {
             match signal {
                 Signal::Changed(Change::Lost) => {
-                    hooked = true;
+                    lost = true;
                     self.dirty.extend(self.world.keys().cloned());
                 },
                 Signal::Changed(Change::Directory(directory)) => {
@@ -497,7 +533,9 @@ impl Session<'_> {
                 },
             }
         }
-        if hooked {
+        if lost {
+            self.resight()?;
+        } else if hooked {
             self.refresh()?;
         } else if !appeared.is_empty() {
             self.appear(&appeared)?;

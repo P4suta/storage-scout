@@ -236,6 +236,14 @@ impl Source {
 
     #[expect(
         clippy::unused_self,
+        reason = "a stream always reports every directory below its roots"
+    )]
+    pub(super) const fn recursive(&self) -> bool {
+        true
+    }
+
+    #[expect(
+        clippy::unused_self,
         clippy::unnecessary_wraps,
         reason = "FSEvents already reports every directory below the roots"
     )]

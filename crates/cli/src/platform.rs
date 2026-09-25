@@ -56,6 +56,10 @@ impl Watcher {
     pub(crate) fn watch(&self, directories: &[&Path]) -> io::Result<()> {
         self.0.watch(directories)
     }
+
+    pub(crate) const fn recursive(&self) -> bool {
+        self.0.recursive()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
