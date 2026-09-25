@@ -766,6 +766,21 @@ fn every_usable_root_is_scanned_once_whatever_comes_before_it() {
     ] {
         let report = scout().scan(&with_roots(roots.clone()));
         assert_eq!(report.candidates.len(), 1, "{roots:?}");
+        if roots.len() == 4 {
+            assert_eq!(report.stats.errors, 3);
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|issue| matches!(issue, Rejection::Link { .. }))
+            );
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|issue| matches!(issue, Rejection::NotADirectory { .. }))
+            );
+        }
         assert_eq!(report.roots, vec![testkit::location(root)], "{roots:?}");
     }
 }
@@ -879,6 +894,62 @@ fn a_marker_that_appears_after_discovery_is_heard_before_deletion() {
             status(&summary),
             Status::Rejected {
                 rejection: Rejection::Owned { .. }
+            }
+        ),
+        "{summary:#?}"
+    );
+    testkit::assert_present(&target);
+}
+
+#[test]
+fn a_candidate_measured_only_by_length_cannot_be_planned() {
+    let temp = tempdir("plan-unmeasured");
+    let _target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let logical = ScanOptions {
+        measure: Measure::Logical,
+        ..options(temp.path())
+    };
+    let report = scout().scan(&logical);
+    assert!(matches!(
+        plan(&report.candidates, &ids(&report.candidates), &[]),
+        Err(Rejection::Unmeasured { .. })
+    ));
+}
+
+#[test]
+fn a_declared_target_is_still_declared_when_it_is_deleted() {
+    let temp = tempdir("declared-delete");
+    let target = temp.path().join("sbt");
+    write_declared_target(&target, "debug");
+    write_sized(&target.join("debug/app"), 4096);
+    let report = discover(temp.path());
+    assert_eq!(only(&report).candidate().provenance(), Provenance::Declared);
+    let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    let summary = apply(&plan, Mode::Execute);
+    assert_eq!(status(&summary), &Status::Deleted, "{summary:#?}");
+}
+
+#[test]
+fn a_manifest_replaced_by_a_link_is_no_longer_evidence() {
+    let temp = tempdir("manifest-link");
+    let project = temp.path().join("proj");
+    let target = write_cargo_project(&project, 4096);
+    let report = discover(temp.path());
+    let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    write_sized(&temp.path().join("elsewhere.toml"), 1);
+    fs::remove_file(project.join("Cargo.toml")).unwrap();
+    let Built::Yes(_) = testkit::symlink_file(
+        &project.join("Cargo.toml"),
+        &temp.path().join("elsewhere.toml"),
+    ) else {
+        return;
+    };
+    let summary = apply(&plan, Mode::Execute);
+    assert!(
+        matches!(
+            status(&summary),
+            Status::Rejected {
+                rejection: Rejection::EvidenceLost { .. }
             }
         ),
         "{summary:#?}"

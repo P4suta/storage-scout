@@ -250,6 +250,20 @@ mod tests {
             ),
             Err(ProtectionError::Executable(Syntax::Unix))
         ));
+        assert!(matches!(
+            Protection::new(
+                Syntax::Unix,
+                Case::Sensitive,
+                unix("/x"),
+                unix("/bin/x"),
+                vec![Rule::app_owned(
+                    "AppData",
+                    windows(r"C:\\x"),
+                    Reach::Subtree
+                )]
+            ),
+            Err(ProtectionError::Rule(Syntax::Unix))
+        ));
         let rule = Rule::app_owned("~/Library", unix("/lib"), Reach::Subtree);
         let protection = Protection::new(
             Syntax::Unix,

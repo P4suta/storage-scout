@@ -272,10 +272,15 @@ mod tests {
         write_patterned(&temp.path().join("one/file"), 1, 1);
         write_patterned(&temp.path().join("two/file"), 1, 1);
         let other = identity(&temp.path().join("two")).unwrap();
-        assert!(matches!(
-            Tree::open(&temp.path().join("one"), other),
-            Err(WalkError::Moved { .. })
-        ));
+        match Tree::open(&temp.path().join("one"), other) {
+            Err(WalkError::Moved { .. }) => {},
+            Err(WalkError::Io { error, .. }) if error.kind() == io::ErrorKind::Unsupported => {
+                let _skipped = Built::Unavailable(error.to_string()).or_skip("a directory tree");
+            },
+            Ok(_) | Err(WalkError::Boundary { .. } | WalkError::Io { .. }) => {
+                panic!("a tree opened as another directory")
+            },
+        }
     }
 
     #[test]

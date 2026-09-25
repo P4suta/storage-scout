@@ -86,6 +86,8 @@ mod tests {
         flag: Cell<bool>,
         held: Cell<bool>,
         broken: Cell<bool>,
+        holds_left: Cell<Option<usize>>,
+        raise_on_release: Cell<bool>,
         log: RefCell<Vec<&'static str>>,
     }
 
@@ -94,6 +96,9 @@ mod tests {
     impl Drop for Token<'_> {
         fn drop(&mut self) {
             self.0.held.set(false);
+            if self.0.raise_on_release.replace(false) {
+                self.0.flag.set(true);
+            }
         }
     }
 
@@ -117,6 +122,12 @@ mod tests {
         }
 
         fn hold(&self) -> io::Result<Option<Token<'a>>> {
+            if let Some(left) = self.holds_left.get() {
+                if left == 0 {
+                    return Ok(None);
+                }
+                self.holds_left.set(Some(left.saturating_sub(1)));
+            }
             if self.held.replace(true) {
                 Ok(None)
             } else {
@@ -200,5 +211,28 @@ mod tests {
             Coalescing::Ran { runs: 1 }
         );
         assert!(!Rendezvous::lower(&station).unwrap());
+    }
+
+    #[test]
+    fn a_request_arriving_as_the_lock_is_released_is_still_served() {
+        let memory = Memory::default();
+        memory.raise_on_release.set(true);
+        let outcome = drive(&&memory, || -> Result<(), ()> {
+            memory.log.borrow_mut().push("run");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(outcome, Coalescing::Ran { runs: 2 });
+        assert!(!memory.flag.get());
+    }
+
+    #[test]
+    fn a_holder_that_ran_and_then_lost_the_lock_still_says_it_ran() {
+        let memory = Memory::default();
+        memory.holds_left.set(Some(1));
+        memory.raise_on_release.set(true);
+        let outcome = drive(&&memory, || -> Result<(), ()> { Ok(()) }).unwrap();
+        assert_eq!(outcome, Coalescing::Ran { runs: 1 });
+        assert!(memory.flag.get());
     }
 }

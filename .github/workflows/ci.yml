@@ -172,7 +172,7 @@ jobs:
           cargo +1.98.0 install \
             --git https://github.com/P4suta/njutest \
             --rev ${{ env.NJUTEST_REV }} \
-            --locked njutest-cli
+            --locked njutest
       - run: njutest doctor
       - name: Verify
         run: njutest verify --ui=plain

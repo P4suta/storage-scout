@@ -54,14 +54,6 @@ operators = [
 ]
 
 [[mutation.expect]]
-path = "crates/cli/src/apply.rs"
-item = "check"
-rule = "ignore-question-statement"
-original = "?"
-reason = "clear() asks every gate again, so an ignored recheck only moves the same refusal after the measurement it exists to avoid"
-outcome = "survived"
-
-[[mutation.expect]]
 path = "crates/cli/src/busy.rs"
 item = "Lease::keys"
 rule = "return-default"
@@ -75,14 +67,6 @@ item = "Tally::allocated"
 rule = "le-to-lt"
 original = "<="
 reason = "a file always has at least one link, and the linked table counts a single-link file exactly as the unlinked sum does"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/measure.rs"
-item = "Volumes::gained"
-rule = "return-some-default"
-original = "self.0\n            .iter()\n            .try_fold(Bytes::ZERO, |total, (volume, before)| {\n                let after = after.0.get(volume)?;\n                Some(total.saturating_add(Bytes::new(after.saturating_sub(*before))))\n            })"
-reason = "free space is measured on the whole volume while other tests write to it, so a test sees that it was measured but not by how much"
 outcome = "survived"
 
 [execution]

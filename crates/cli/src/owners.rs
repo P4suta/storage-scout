@@ -120,13 +120,16 @@ impl Owners {
     }
 
     pub(crate) fn detect() -> Self {
-        let ceilings = match std::env::var_os("GIT_CEILING_DIRECTORIES") {
-            Some(value) => std::env::split_paths(&value)
+        Self::from_ceilings(std::env::var_os("GIT_CEILING_DIRECTORIES").as_deref())
+    }
+
+    fn from_ceilings(value: Option<&std::ffi::OsStr>) -> Self {
+        Self::new(match value {
+            Some(value) => std::env::split_paths(value)
                 .filter(|path| path.is_absolute())
                 .collect(),
             None => Vec::new(),
-        };
-        Self::new(ceilings)
+        })
     }
 
     fn ceiling(&self, directory: &Path) -> bool {
@@ -198,5 +201,24 @@ impl Owners {
             }
         }
         Ownership::resolve(markers, worktree)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::*;
+
+    #[test]
+    fn only_absolute_ceilings_are_taken_from_the_environment() {
+        let temp = testkit::tempdir("owners-ceilings");
+        let absolute = fs::canonicalize(temp.path()).unwrap();
+        let listed = std::env::join_paths([absolute.as_path(), Path::new("relative")]).unwrap();
+        let owners = Owners::from_ceilings(Some(&listed));
+        assert_eq!(owners.ceilings, vec![absolute]);
+        assert!(Owners::from_ceilings(None).ceilings.is_empty());
+        let empty = OsString::new();
+        assert!(Owners::from_ceilings(Some(&empty)).ceilings.is_empty());
     }
 }

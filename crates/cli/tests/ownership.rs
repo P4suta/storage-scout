@@ -214,6 +214,60 @@ fn work_that_main_never_took_stays_active_even_when_main_touched_the_same_file()
 }
 
 #[test]
+fn a_squash_that_main_took_in_two_commits_has_landed() {
+    let repo = Repo::new("own-split");
+    let feat = repo.worktree("feat", &["-b", "feat"]);
+    repo.git
+        .commit_file(&feat, "src/lib.rs", "pub fn one() {}\npub fn two() {}\n");
+    repo.git
+        .commit_file(&feat, "src/other.rs", "pub fn other() {}\n");
+    let target = build(&feat);
+    repo.git.commit_file(
+        &repo.upstream,
+        "src/lib.rs",
+        "pub fn one() {}\npub fn two() {}\n",
+    );
+    repo.git
+        .commit_file(&repo.upstream, "src/other.rs", "pub fn other() {}\n");
+    repo.git.run(&repo.work, &["fetch", "--quiet"]);
+    assert_eq!(repo.settlement(&target), Settlement::Landed);
+}
+
+#[test]
+fn a_detached_commit_that_changed_nothing_has_no_work_of_its_own() {
+    let repo = Repo::new("own-empty");
+    let detached = repo.worktree("detached", &["--detach"]);
+    repo.git.run(
+        &detached,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "own-empty nothing",
+        ],
+    );
+    assert_eq!(repo.settlement(&build(&detached)), Settlement::Landed);
+}
+
+#[test]
+fn the_nearest_repository_owns_what_is_inside_it() {
+    let temp = tempdir("own-nearest");
+    let root = temp.path();
+    let outer = root.join("outer");
+    write_bytes(&outer.join(".git"), b"gitdir: /nonexistent/storage-scout\n");
+    let inner = outer.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    let git = Git::isolated(root);
+    git.run(&inner, &["init", "--quiet"]);
+    git.commit_file(&inner, "Cargo.toml", "[package]\nname = \"inner\"\n");
+    git.commit_file(&inner, ".gitignore", "target/\n");
+    let target = build(&inner);
+    let scout = Scout::with(testkit::open_protection()).confined(vec![root.to_path_buf()]);
+    assert_eq!(settlement(&scout, root, &target), Settlement::Active);
+}
+
+#[test]
 fn a_history_unrelated_to_main_is_active() {
     let repo = Repo::new("own-unrelated");
     let lonely = repo.worktree("lonely", &["--detach"]);
