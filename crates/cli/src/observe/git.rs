@@ -140,12 +140,6 @@ fn run(root: &Path, query: Query<'_>) -> Result<Answer, GitFailure> {
     for name in SCRUBBED {
         command.env_remove(name);
     }
-    for (name, _) in std::env::vars_os() {
-        let name = name.to_string_lossy();
-        if name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_") {
-            command.env_remove(name.as_ref());
-        }
-    }
     let Output { status, stdout, .. } =
         command.output().map_err(|error| GitFailure::Unavailable {
             failure: failure::describe(&error),
@@ -188,6 +182,34 @@ pub(crate) fn defaults(root: &Path) -> Result<Vec<String>, GitFailure> {
     )
 }
 
+fn landed_since(root: &Path, default: &str, base: &str) -> Result<Option<Landing>, GitFailure> {
+    let changed = git::names(&output(root, Query::ChangedSince { base })?);
+    let Some(first) = changed.first() else {
+        return Ok(Some(Landing::NoOwnWork {
+            into: default.to_owned(),
+        }));
+    };
+    if contained(root, default, &changed)? {
+        return Ok(Some(Landing::Contained {
+            into: default.to_owned(),
+        }));
+    }
+    let first = String::from_utf8_lossy(first);
+    let touching = Query::Touching {
+        base,
+        tip: default,
+        path: &first,
+    };
+    for commit in parse(touching, git::commits(&output(root, touching)?))? {
+        if contained(root, &commit, &changed)? {
+            return Ok(Some(Landing::Contained {
+                into: default.to_owned(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn landing(root: &Path) -> Result<Landing, GitFailure> {
     let defaults = defaults(root)?;
     if defaults.is_empty() {
@@ -201,44 +223,10 @@ fn landing(root: &Path) -> Result<Landing, GitFailure> {
         }
     }
     for default in &defaults {
-        let Answer::Yes(base) = run(root, Query::MergeBase { with: default })? else {
-            continue;
-        };
-        let base = String::from_utf8_lossy(&base).trim().to_owned();
-        let changed = git::names(&output(root, Query::ChangedSince { base: &base })?);
-        let Some(first) = changed.first() else {
-            return Ok(Landing::NoOwnWork {
-                into: default.clone(),
-            });
-        };
-        if contained(root, default, &changed)? {
-            return Ok(Landing::Contained {
-                into: default.clone(),
-            });
-        }
-        let Ok(first) = std::str::from_utf8(first) else {
-            continue;
-        };
-        let touching = parse(
-            Query::Touching {
-                base: &base,
-                tip: default,
-                path: first,
-            },
-            git::commits(&output(
-                root,
-                Query::Touching {
-                    base: &base,
-                    tip: default,
-                    path: first,
-                },
-            )?),
-        )?;
-        for commit in touching {
-            if contained(root, &commit, &changed)? {
-                return Ok(Landing::Contained {
-                    into: default.clone(),
-                });
+        if let Answer::Yes(base) = run(root, Query::MergeBase { with: default })? {
+            let base = String::from_utf8_lossy(&base).trim().to_owned();
+            if let Some(landing) = landed_since(root, default, &base)? {
+                return Ok(landing);
             }
         }
     }

@@ -15,6 +15,44 @@ include = [
     "crates/cli/src/platform/*.rs",
 ]
 
+[mutation]
+operators = [
+    "true-to-false",
+    "false-to-true",
+    "negate-condition",
+    "negate-loop-condition",
+    "remove-not",
+    "negate-bool-method",
+    "and-to-or",
+    "or-to-and",
+    "eq-to-neq",
+    "neq-to-eq",
+    "lt-to-le",
+    "le-to-lt",
+    "gt-to-ge",
+    "ge-to-gt",
+    "range-to-inclusive",
+    "inclusive-to-range",
+    "add-to-sub",
+    "sub-to-add",
+    "mul-to-div",
+    "div-to-mul",
+    "rem-to-mul",
+    "remove-unary-minus",
+    "return-default",
+    "return-ok-default",
+    "return-some-default",
+    "return-true",
+    "return-err-default",
+    "ignore-question-statement",
+    "delete-match-arm",
+    "remove-match-guard",
+    "break-to-continue",
+    "continue-to-break",
+    "condition-to-true",
+    "condition-to-false",
+]
+
 [[mutation.expect]]
 path = "crates/cli/src/apply.rs"
 item = "check"

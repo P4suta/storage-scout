@@ -260,14 +260,25 @@ pub fn render_auto(run: &AutoRun, out: &mut dyn Write) -> io::Result<()> {
             Stop::Exhausted => "nothing left to evict",
         }
     )?;
-    write_statuses(
-        evict
-            .steps
-            .iter()
-            .map(|step| (&step.location, None, &step.status)),
-        out,
-    )?;
+    for step in &evict.steps {
+        writeln!(
+            out,
+            "  [{}] {} ({} free after)",
+            status_text(&step.status),
+            step.location,
+            step.free_after
+        )?;
+    }
     Ok(())
+}
+
+fn status_text(status: &Status) -> String {
+    match status {
+        Status::WouldDelete => "would delete".to_owned(),
+        Status::Deleted => "deleted".to_owned(),
+        Status::Rejected { rejection } => format!("withheld: {rejection}"),
+        Status::Failed { rejection } => format!("FAILED: {rejection}"),
+    }
 }
 
 fn write_statuses<'a>(
@@ -275,12 +286,7 @@ fn write_statuses<'a>(
     out: &mut dyn Write,
 ) -> io::Result<()> {
     for (location, logical, status) in statuses {
-        let status = match status {
-            Status::WouldDelete => "would delete".to_owned(),
-            Status::Deleted => "deleted".to_owned(),
-            Status::Rejected { rejection } => format!("withheld: {rejection}"),
-            Status::Failed { rejection } => format!("FAILED: {rejection}"),
-        };
+        let status = status_text(status);
         let logical = logical.map_or_else(|| "-".to_owned(), |bytes| bytes.to_string());
         writeln!(out, "  {logical:>11} [{status}] {location}")?;
     }

@@ -52,9 +52,6 @@ pub(crate) fn entries(directory: &Path) -> Result<Entries, Rejection> {
             .file_type()
             .map_err(|e| failure::io(&entry.path(), FsOp::FileType, &e))?;
         let name = entry.file_name();
-        if kind.is_symlink() {
-            continue;
-        }
         if kind.is_dir() {
             entries.dir(name.as_encoded_bytes());
         } else if kind.is_file() {

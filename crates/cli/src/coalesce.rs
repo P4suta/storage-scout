@@ -85,6 +85,7 @@ mod tests {
     struct Memory {
         flag: Cell<bool>,
         held: Cell<bool>,
+        broken: Cell<bool>,
         log: RefCell<Vec<&'static str>>,
     }
 
@@ -100,6 +101,9 @@ mod tests {
         type Held = Token<'a>;
 
         fn raise(&self) -> io::Result<()> {
+            if self.broken.get() {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
             self.flag.set(true);
             Ok(())
         }
@@ -159,5 +163,42 @@ mod tests {
         let _running = (&memory).hold().unwrap();
         assert!(handed_off(&&memory).unwrap());
         assert!(memory.flag.get());
+    }
+
+    #[test]
+    fn a_flag_that_cannot_be_raised_stops_the_run_and_says_so() {
+        let memory = Memory::default();
+        memory.broken.set(true);
+        let outcome = drive(&&memory, || -> Result<(), ()> {
+            memory.log.borrow_mut().push("run");
+            Ok(())
+        });
+        assert!(matches!(outcome, Err(Driven::Io(_))));
+        assert!(memory.log.borrow().is_empty());
+        let _refused = handed_off(&&memory).unwrap_err();
+    }
+
+    #[test]
+    fn the_station_on_disk_keeps_the_same_promises() {
+        let temp = testkit::tempdir("coalesce-station");
+        let station = Station::for_policy(temp.path(), &temp.path().join("auto.toml"));
+        assert_eq!(
+            drive(&station, || -> Result<(), ()> { Ok(()) }).unwrap(),
+            Coalescing::Ran { runs: 1 }
+        );
+        assert!(!Rendezvous::raised(&station).unwrap());
+        let holder = Rendezvous::hold(&station).unwrap().unwrap();
+        assert!(Rendezvous::hold(&station).unwrap().is_none());
+        assert_eq!(
+            drive(&station, || -> Result<(), ()> { Ok(()) }).unwrap(),
+            Coalescing::Handed
+        );
+        assert!(Rendezvous::raised(&station).unwrap());
+        drop(holder);
+        assert_eq!(
+            drive(&station, || -> Result<(), ()> { Ok(()) }).unwrap(),
+            Coalescing::Ran { runs: 1 }
+        );
+        assert!(!Rendezvous::lower(&station).unwrap());
     }
 }

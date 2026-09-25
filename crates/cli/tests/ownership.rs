@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use storage_scout::core::ownership::Settlement;
 use storage_scout::core::size::Bytes;
 use storage_scout::{AutoPolicy, Measure, Mode, ScanOptions, Scout, Status};
-use testkit::{Git, MarkerKeep, MarkerRole, claim, tempdir, write_owner_marker, write_sized};
+use testkit::{
+    Built, Git, MarkerKeep, MarkerRole, claim, tempdir, write_bytes, write_owner_marker,
+    write_sized,
+};
 
 struct Repo {
     temp: testkit::Scratch,
@@ -198,6 +201,76 @@ fn a_branch_whose_upstream_was_deleted_has_landed() {
 }
 
 #[test]
+fn work_that_main_never_took_stays_active_even_when_main_touched_the_same_file() {
+    let repo = Repo::new("own-diverged");
+    let feat = repo.worktree("feat", &["-b", "feat"]);
+    repo.git
+        .commit_file(&feat, "src/lib.rs", "pub fn one() {}\npub fn two() {}\n");
+    let target = build(&feat);
+    repo.git
+        .commit_file(&repo.upstream, "src/lib.rs", "pub fn other() {}\n");
+    repo.git.run(&repo.work, &["fetch", "--quiet"]);
+    assert_eq!(repo.settlement(&target), Settlement::Active);
+}
+
+#[test]
+fn a_history_unrelated_to_main_is_active() {
+    let repo = Repo::new("own-unrelated");
+    let lonely = repo.worktree("lonely", &["--detach"]);
+    repo.git
+        .run(&lonely, &["switch", "--quiet", "--orphan", "lonely"]);
+    repo.git
+        .commit_file(&lonely, "Cargo.toml", "[package]\nname = \"lonely\"\n");
+    repo.git.commit_file(&lonely, ".gitignore", "target/\n");
+    assert_eq!(repo.settlement(&build(&lonely)), Settlement::Active);
+}
+
+#[test]
+fn a_worktree_that_names_its_repository_relatively_is_still_understood() {
+    let repo = Repo::new("own-relative");
+    let relative = repo.worktree("relative", &["--detach"]);
+    write_bytes(
+        &relative.join(".git"),
+        b"gitdir: ../work/.git/worktrees/relative\n",
+    );
+    repo.git.run(&relative, &["status", "--short"]);
+    assert_eq!(repo.settlement(&build(&relative)), Settlement::Landed);
+}
+
+#[test]
+fn a_worktree_whose_repository_cannot_be_read_is_not_called_forgotten() {
+    let repo = Repo::new("own-sealed");
+    let detached = repo.worktree("detached", &["--detach"]);
+    let target = build(&detached);
+    let Some(restricted) = testkit::restrict(&repo.work.join(".git/worktrees"), 0o000) else {
+        return;
+    };
+    let settled = repo.settlement(&target);
+    drop(restricted);
+    assert_eq!(settled, Settlement::Active);
+}
+
+#[test]
+fn a_git_link_that_is_a_symbolic_link_is_not_trusted() {
+    let temp = tempdir("own-linked-git");
+    let root = temp.path();
+    let project = root.join("proj");
+    write_sized(&project.join("Cargo.toml"), 1);
+    let target = build(&project);
+    write_bytes(
+        &root.join("elsewhere/gitfile"),
+        b"gitdir: /nonexistent/storage-scout\n",
+    );
+    let Built::Yes(_) =
+        testkit::symlink_file(&project.join(".git"), &root.join("elsewhere/gitfile"))
+    else {
+        return;
+    };
+    let scout = Scout::with(testkit::open_protection()).confined(vec![root.to_path_buf()]);
+    assert_eq!(settlement(&scout, root, &target), Settlement::Active);
+}
+
+#[test]
 fn a_worktree_whose_repository_forgot_it_is_released() {
     let repo = Repo::new("own-orphan");
     let orphan = repo.worktree("orphan", &["--detach"]);
@@ -271,6 +344,28 @@ fn a_marker_says_who_owns_a_directory_and_whether_they_let_go() {
             directory.display()
         );
     }
+}
+
+#[test]
+fn a_key_that_cannot_be_looked_at_keeps_the_cache() {
+    let temp = tempdir("own-sealed-key");
+    let root = temp.path();
+    let sealed = root.join("sealed");
+    fs::create_dir_all(sealed.join("source")).unwrap();
+    let cache = marked(
+        root,
+        "cache",
+        MarkerRole::Cache,
+        MarkerKeep::Released,
+        Some(&sealed.join("source")),
+    );
+    let scout = Scout::with(testkit::open_protection()).confined(vec![root.to_path_buf()]);
+    let Some(restricted) = testkit::restrict(&sealed, 0o000) else {
+        return;
+    };
+    let settled = settlement(&scout, root, &cache);
+    drop(restricted);
+    assert_eq!(settled, Settlement::Active);
 }
 
 #[test]

@@ -713,6 +713,21 @@ fn a_removal_the_filesystem_refuses_is_a_failure_not_a_refusal() {
 }
 
 #[test]
+fn a_cache_tag_without_the_signature_is_not_evidence() {
+    let temp = tempdir("forged-tag");
+    let cache = temp.path().join("cache");
+    let forged = vec![b'x'; testkit::CACHE_TAG.len()];
+    testkit::write_bytes(&cache.join("CACHEDIR.TAG"), &forged);
+    write_sized(&cache.join("blob"), 4096);
+    assert!(discover(temp.path()).candidates.is_empty());
+    write_cache_tag(&cache);
+    assert_eq!(
+        only(&discover(temp.path())).candidate().kind(),
+        Kind::TaggedCache
+    );
+}
+
+#[test]
 fn a_locked_tier_is_refused_by_the_gate() {
     let temp = tempdir("tier");
     write_cache_tag(&temp.path().join("cache"));

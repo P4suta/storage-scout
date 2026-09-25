@@ -120,18 +120,12 @@ impl Owners {
     }
 
     pub(crate) fn detect() -> Self {
-        let separator = if cfg!(windows) { ';' } else { ':' };
-        let ceilings = std::env::var_os("GIT_CEILING_DIRECTORIES")
-            .map(|value| {
-                value
-                    .to_string_lossy()
-                    .split(separator)
-                    .filter(|entry| !entry.is_empty())
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_absolute())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let ceilings = match std::env::var_os("GIT_CEILING_DIRECTORIES") {
+            Some(value) => std::env::split_paths(&value)
+                .filter(|path| path.is_absolute())
+                .collect(),
+            None => Vec::new(),
+        };
         Self::new(ceilings)
     }
 

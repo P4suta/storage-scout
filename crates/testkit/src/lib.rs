@@ -227,6 +227,21 @@ pub fn link_dir(link: &Path, target: &Path) -> Built {
 }
 
 #[must_use]
+pub fn symlink_file(link: &Path, target: &Path) -> Built {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent).expect("parent directories");
+    }
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, link);
+    match made {
+        Ok(()) => Built::Yes(link.to_path_buf()),
+        Err(error) => Built::Unavailable(error.to_string()),
+    }
+}
+
+#[must_use]
 pub fn hard_link(link: &Path, target: &Path) -> Built {
     if let Some(parent) = link.parent() {
         fs::create_dir_all(parent).expect("parent directories");
