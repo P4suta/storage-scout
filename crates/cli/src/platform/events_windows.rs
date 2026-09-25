@@ -5,19 +5,22 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::mem::zeroed;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    ReadDirectoryChangesW,
 };
+use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
 use super::Change;
 
@@ -46,7 +49,7 @@ fn open(path: &Path) -> io::Result<Directory> {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null(),
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
             null_mut(),
         )
     };
@@ -100,43 +103,77 @@ fn changed(bytes: &[u8], root: &Path, deliver: &Deliver) {
     }
 }
 
-fn follow(directory: &Directory, root: &Path, deliver: &Deliver) {
-    let mut buffer = vec![0u32; WORDS];
-    let Ok(capacity) = u32::try_from(WORDS.saturating_mul(4)) else {
-        return;
+fn arm(directory: &Directory, buffer: &mut [u32], overlapped: &mut OVERLAPPED) -> io::Result<()> {
+    let capacity = u32::try_from(buffer.len().saturating_mul(4))
+        .map_err(|_wide| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: the handle is an open directory, the buffer is DWORD-aligned and `capacity` bytes long, and both it and `overlapped` stay in place until the read completes.
+    let result = unsafe {
+        ReadDirectoryChangesW(
+            directory.0.as_raw_handle(),
+            buffer.as_mut_ptr().cast(),
+            capacity,
+            1,
+            FILTER,
+            null_mut(),
+            overlapped,
+            None,
+        )
     };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn follow(
+    directory: &Directory,
+    root: &Path,
+    deliver: &Deliver,
+    armed: &mpsc::SyncSender<io::Result<()>>,
+) {
+    let mut buffer = vec![0u32; WORDS];
+    // SAFETY: an all-zero bit pattern is a valid value of this plain C struct.
+    let mut overlapped = unsafe { zeroed::<OVERLAPPED>() };
+    let first = arm(directory, &mut buffer, &mut overlapped);
+    let refused = first.is_err();
+    let _told = armed.send(first);
+    if refused {
+        return;
+    }
     loop {
         let mut returned = 0u32;
-        // SAFETY: the handle is an open directory, the buffer is DWORD-aligned and `capacity` bytes long, and the call is synchronous.
-        let result = unsafe {
-            ReadDirectoryChangesW(
+        // SAFETY: a read was issued on this handle with this `overlapped`, which has not moved, and the call waits for it to complete.
+        let completed = unsafe {
+            GetOverlappedResult(
                 directory.0.as_raw_handle(),
-                buffer.as_mut_ptr().cast(),
-                capacity,
-                1,
-                FILTER,
+                &raw const overlapped,
                 &raw mut returned,
-                null_mut(),
-                None,
+                1,
             )
         };
-        if result == 0 {
+        if completed == 0 {
             deliver(Change::Lost);
             return;
         }
-        if returned == 0 {
-            deliver(Change::Lost);
-            continue;
-        }
-        let Ok(returned) = usize::try_from(returned) else {
-            continue;
+        let bytes = match usize::try_from(returned) {
+            Ok(returned) => buffer
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .take(returned)
+                .collect::<Vec<_>>(),
+            Err(_wide) => Vec::new(),
         };
-        let bytes = buffer
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .take(returned)
-            .collect::<Vec<_>>();
-        changed(&bytes, root, deliver);
+        let rearmed = arm(directory, &mut buffer, &mut overlapped);
+        if bytes.is_empty() {
+            deliver(Change::Lost);
+        } else {
+            changed(&bytes, root, deliver);
+        }
+        if rearmed.is_err() {
+            deliver(Change::Lost);
+            return;
+        }
     }
 }
 
@@ -149,9 +186,14 @@ impl Source {
             let directory = open(path)?;
             let root = path.clone();
             let deliver = Arc::clone(&deliver);
+            let (armed, ready) = mpsc::sync_channel(1);
             std::thread::Builder::new()
                 .name("storage-scout-events".to_owned())
-                .spawn(move || follow(&directory, &root, &deliver))?;
+                .spawn(move || follow(&directory, &root, &deliver, &armed))?;
+            match ready.recv() {
+                Ok(outcome) => outcome?,
+                Err(_ended) => return Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+            }
         }
         Ok(Self)
     }
@@ -171,5 +213,28 @@ impl Source {
     )]
     pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn a_change_made_as_soon_as_the_watch_starts_is_seen() {
+        let temp = testkit::tempdir("events-windows-armed");
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let _source = Source::start(
+            std::slice::from_ref(&root),
+            Box::new(move |change| {
+                let _sent = sender.send(change);
+            }),
+        )
+        .unwrap();
+        testkit::write_sized(&root.join("file"), 1);
+        assert_eq!(receiver.recv().unwrap(), Change::Directory(root));
     }
 }
