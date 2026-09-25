@@ -21,7 +21,10 @@ pub(crate) struct Owners {
 
 impl Clone for Owners {
     fn clone(&self) -> Self {
-        Self::new(self.ceilings.clone())
+        Self {
+            ceilings: self.ceilings.clone(),
+            worktrees: Mutex::new(BTreeMap::new()),
+        }
     }
 }
 
@@ -103,9 +106,15 @@ fn gitdir(file: &Path) -> Option<PathBuf> {
 }
 
 impl Owners {
-    pub(crate) const fn new(ceilings: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(ceilings: Vec<PathBuf>) -> Self {
         Self {
-            ceilings,
+            ceilings: ceilings
+                .into_iter()
+                .map(|path| match fs::canonicalize(&path) {
+                    Ok(canonical) => canonical,
+                    Err(_unresolvable) => path,
+                })
+                .collect(),
             worktrees: Mutex::new(BTreeMap::new()),
         }
     }
@@ -120,10 +129,6 @@ impl Owners {
                     .filter(|entry| !entry.is_empty())
                     .map(PathBuf::from)
                     .filter(|path| path.is_absolute())
-                    .map(|path| match fs::canonicalize(&path) {
-                        Ok(canonical) => canonical,
-                        Err(_unresolvable) => path,
-                    })
                     .collect()
             })
             .unwrap_or_default();
