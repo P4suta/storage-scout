@@ -1,0 +1,21 @@
+---
+source: crates/cli/tests/rendering.rs
+expression: "render(|out| render_scan(&report, Color::Never, out))"
+---
+storage-scout <VERSION> — read-only scan
+Roots: <PATH>
+Total logical size: 96.1 KiB
+Total allocation: unmeasured
+Scanned 5 directories and 4 files (0 links, 0 filesystem boundaries skipped, 0 errors)
+
+Largest directories:
+  96.1 KiB  <PATH>
+  64.0 KiB  <PATH>
+
+Build artifacts (2):
+  [ routine ] Rust target              1 dirs  64.0 KiB
+  [reinstall] CACHEDIR.TAG cache       1 dirs  32.1 KiB
+
+Largest individual artifacts:
+  64.0 KiB [ routine ] unclaimed [Rust target] <PATH>
+  32.1 KiB [reinstall] unclaimed [CACHEDIR.TAG cache] <PATH>

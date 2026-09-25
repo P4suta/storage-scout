@@ -1,0 +1,19 @@
+---
+source: crates/cli/tests/rendering.rs
+expression: kinds
+---
+rust-target          routine Rust target
+dotnet-output        routine .NET bin/obj
+solution-build       routine solution build
+visual-studio-cache  routine Visual Studio .vs
+gradle-output        routine Gradle output
+maven-target         routine Maven target
+js-output            routine JS build output
+python-cache         routine Python cache
+cmake-output         routine CMake output
+node-modules         reinstallable node_modules
+python-venv          reinstallable Python venv
+unity-output         expensive Unity output
+tagged-cache         reinstallable CACHEDIR.TAG cache
+owned-scratch        routine owned scratch
+owned-cache          routine owned cache

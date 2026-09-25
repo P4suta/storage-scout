@@ -1,0 +1,111 @@
+[tools]
+typos = "latest"
+taplo = "latest"
+actionlint = "latest"
+lefthook = "latest"
+
+
+[tasks.fmt]
+description = "Format the workspace"
+run = "cargo fmt"
+
+[tasks."fmt:check"]
+description = "Fail if anything is unformatted"
+run = "cargo fmt --check"
+
+[tasks.clippy]
+description = "Lint every target with the workspace's strict lint set"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.gates]
+description = "Structural rules: no comments, confined APIs, unsafe only in platform"
+run = "cargo xtask gates"
+
+[tasks.pure]
+description = "Prove the decision core cannot do I/O by building it for bare metal"
+run = "cargo build --package storage-scout-core --target thumbv7em-none-eabi"
+
+[tasks.test]
+description = "Run every test on this host"
+run = "cargo nextest run --workspace --all-targets"
+
+[tasks."test:doc"]
+description = "Run documentation tests"
+run = "cargo test --workspace --doc"
+
+[tasks.check]
+description = "Everything CI runs on one platform"
+depends = ["fmt:check", "clippy", "gates", "pure", "test", "test:doc", "lint:repo"]
+
+[tasks."lint:repo"]
+description = "Spelling, TOML formatting, and the workflows"
+run = ["typos", "taplo fmt --check", "actionlint"]
+
+[tasks.doctor]
+description = "Show what this host resolved: protected areas, gates, free space"
+run = "cargo run --quiet --package storage-scout -- doctor"
+
+[tasks.explain]
+description = "Account for one path: mise run explain -- <PATH>"
+run = "cargo run --quiet --package storage-scout -- explain"
+
+[tasks.coverage]
+description = "Line coverage over the whole suite"
+run = "cargo llvm-cov nextest --workspace --html"
+
+[tasks.mutants]
+description = "Would the safety tests notice if a rule quietly changed?"
+run = "rust-mutants run"
+
+[tasks."mutants:dry"]
+description = "How many mutants there are and roughly what they cost, running none"
+run = "rust-mutants run --dry-run"
+
+[tasks."mutants:changed"]
+description = "Only the files that differ from HEAD"
+run = "rust-mutants run --changed"
+
+[tasks."mutants:branch"]
+description = "Only the files this branch changes from main, as a pull request measures them"
+run = "rust-mutants run --changed-from origin/main"
+
+[tasks."mutants:explain"]
+description = "Account for one mutant: mise run mutants:explain -- <ID-PREFIX>"
+run = "rust-mutants explain"
+
+[tasks."mutants:report"]
+description = "One page showing every survivor in place"
+run = "rust-mutants report --format html"
+
+[tasks."mutants:doctor"]
+description = "Whether this machine can measure, and what it would cost"
+run = "rust-mutants doctor"
+
+[tasks.verify]
+description = "The full assurance contract: tests, coverage routing, mutation, soundness"
+run = "njutest verify --ui=plain"
+
+[tasks."verify:doctor"]
+description = "Whether this machine can run the assurance contract"
+run = "njutest doctor"
+
+[tasks."verify:changed"]
+description = "The contract over what differs from the default branch"
+run = "njutest verify --changed=origin/main --ui=plain"
+
+[tasks."schema:bless"]
+description = "Record newly added JSON fields after reviewing the diff"
+run = "STORAGE_SCOUT_BLESS_SCHEMA=1 cargo test --package storage-scout --test schema_v2"
+
+[tasks.cross]
+description = "Type-check the targets this host is not"
+run = """
+for target in x86_64-pc-windows-msvc aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+  echo "== $target"
+  cargo clippy --workspace --target "$target" -- -D warnings || exit 1
+done
+"""
+
+[tasks.install]
+description = "Install the binary from this checkout"
+run = "cargo install --locked --path crates/cli"

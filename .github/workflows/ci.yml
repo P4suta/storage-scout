@@ -1,26 +1,267 @@
-name: Windows CI
+name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NJUTEST_REV: 0821533b67b451d80fcff38517f1c7db1d25481a
+
 jobs:
   quality:
-    runs-on: windows-latest
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15, ubuntu-24.04]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: rustfmt, clippy
-      - uses: taiki-e/install-action@nextest
-      - name: Format
-        run: cargo fmt --check
-      - name: Test all targets with nextest
-        run: cargo nextest run --all-targets --all-features --profile ci
-      - name: Test documentation
-        run: cargo test --doc --all-features
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: nextest
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo xtask gates
+      - run: cargo nextest run --workspace --all-targets --profile ci
+      - run: cargo test --workspace --doc
+      - run: cargo run --quiet --package storage-scout -- doctor --json > doctor-${{ matrix.os }}.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: doctor-${{ matrix.os }}
+          path: doctor-${{ matrix.os }}.json
+          if-no-files-found: warn
+
+  sharing:
+    name: sharing on ${{ matrix.filesystem }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        filesystem: [btrfs, xfs]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: nextest
+      - name: Mount a volume that shares blocks
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs xfsprogs
+          truncate -s 2G "$RUNNER_TEMP/volume.img"
+          case "${{ matrix.filesystem }}" in
+            btrfs) mkfs.btrfs -q "$RUNNER_TEMP/volume.img" ;;
+            xfs) mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/volume.img" ;;
+          esac
+          sudo mkdir -p /mnt/share
+          sudo mount -o loop "$RUNNER_TEMP/volume.img" /mnt/share
+          sudo chown "$(id -u):$(id -g)" /mnt/share
+          rsync -a --exclude target ./ /mnt/share/repo/
+      - name: Share identical files on it
+        working-directory: /mnt/share/repo
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          STORAGE_SCOUT_REQUIRE_SHARING: "1"
+        run: cargo nextest run --package storage-scout --test dedupe --profile ci
+
+  mutants:
+    name: mutants of the changed files
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install rust-mutants
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          cargo +1.98.0 install \
+            --git https://github.com/P4suta/njutest \
+            --rev ${{ env.NJUTEST_REV }} \
+            --locked rust-mutants-cli
+      - run: cargo fetch --locked
+      - name: Measure on a volume that shares blocks, so sharing is exercised
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs
+          truncate -s 10G "$RUNNER_TEMP/volume.img"
+          mkfs.btrfs -q "$RUNNER_TEMP/volume.img"
+          sudo mkdir -p /mnt/share
+          sudo mount -o loop "$RUNNER_TEMP/volume.img" /mnt/share
+          sudo chown "$(id -u):$(id -g)" /mnt/share
+          mkdir /mnt/share/tmp
+          echo "TMPDIR=/mnt/share/tmp" >> "$GITHUB_ENV"
+          echo "STORAGE_SCOUT_REQUIRE_SHARING=1" >> "$GITHUB_ENV"
+      - name: Keep only the claims about the changed files
+        id: scope
+        env:
+          BASE: origin/${{ github.base_ref }}
+        run: |
+          python3 - <<'PY'
+          import fnmatch, json, os, subprocess, tomllib
+          changed = set(subprocess.run(["git", "diff", "--name-only", os.environ["BASE"] + "...HEAD"], capture_output=True, text=True, check=True).stdout.split())
+          config = tomllib.load(open(".rust-mutants.toml", "rb"))
+          measured = sorted(path for path in changed if any(fnmatch.fnmatch(path, pattern) for pattern in config["project"]["include"]))
+          mutation = config.get("mutation", {})
+          for key in ("expect", "skip"):
+              mutation[key] = [entry for entry in mutation.get(key, []) if entry["path"] in changed]
+          def value(item):
+              return "[" + ", ".join(value(each) for each in item) + "]" if isinstance(item, list) else json.dumps(item)
+          lines = []
+          for section in ("project", "execution"):
+              lines.append(f"[{section}]")
+              lines += [f"{key} = {value(item)}" for key, item in config.get(section, {}).items()]
+          lines.append("[mutation]")
+          lines += [f"{key} = {value(item)}" for key, item in mutation.items() if key not in ("expect", "skip")]
+          for key in ("expect", "skip"):
+              for entry in mutation[key]:
+                  lines.append(f"[[mutation.{key}]]")
+                  lines += [f"{name} = {value(item)}" for name, item in entry.items()]
+          open(os.environ["RUNNER_TEMP"] + "/rust-mutants.toml", "w").write("\n".join(lines) + "\n")
+          open(os.environ["GITHUB_OUTPUT"], "a").write(f"measure={'true' if measured else 'false'}\n")
+          print("measured:", *measured, sep="\n  ")
+          PY
+      - name: Measure the changed files
+        if: steps.scope.outputs.measure == 'true'
+        run: rust-mutants run --config "$RUNNER_TEMP/rust-mutants.toml" --changed-from "origin/${{ github.base_ref }}" --locked --offline
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: mutation-report
+          path: reports/mutation/
+          if-no-files-found: ignore
+
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: cargo-llvm-cov,nextest
+      - run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: coverage
+          path: lcov.info
+
+  msrv:
+    name: minimum supported Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo "+${{ steps.msrv.outputs.version }}" check --workspace --all-targets
+
+  pure:
+    name: decision core builds without std
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: rustup target add thumbv7em-none-eabi
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo build --package storage-scout-core --target thumbv7em-none-eabi
+
+  cross-check:
+    name: check ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo clippy --workspace --target ${{ matrix.target }} -- -D warnings
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  lint:
+    name: spelling, TOML, workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: typos,taplo
+      - run: bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12 "$RUNNER_TEMP"
+      - run: typos
+      - run: taplo fmt --check
+      - run: '"$RUNNER_TEMP/actionlint"'
+
+
+  ci-success:
+    name: ci-success
+    if: always()
+    needs: [quality, sharing, mutants, coverage, msrv, pure, cross-check, deny, lint]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          if jq --exit-status 'to_entries | all(.value.result == "success" or (.key == "mutants" and .value.result == "skipped"))' <<<"$NEEDS" >/dev/null; then
+            echo "every gate passed"
+          else
+            jq . <<<"$NEEDS"
+            exit 1
+          fi

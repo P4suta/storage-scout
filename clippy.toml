@@ -1,15 +1,81 @@
 avoid-breaking-exported-api = false
-cognitive-complexity-threshold = 15
-too-many-arguments-threshold = 7
+msrv = "1.98.0"
+cognitive-complexity-threshold = 18
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 100
 type-complexity-threshold = 250
-too-many-lines-threshold = 120
-trivial-copy-size-limit = 128
-pass-by-value-size-limit = 256
+max-fn-params-bools = 0
+pass-by-value-size-limit = 128
+enum-variant-size-threshold = 256
 
-# Tests legitimately use `unwrap`/`expect`/`panic`/`println`/`dbg` — gate them
-# only outside the test boundary.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-print-in-tests = true
 allow-dbg-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+doc-valid-idents = ["macOS", "APFS", "NTFS", "ReFS", "JSON", "TOML", "UNC"]
+
+disallowed-methods = [
+  { path = "std::time::SystemTime::now", reason = "nothing is decided by time" },
+  { path = "std::time::SystemTime::elapsed", reason = "nothing is decided by time" },
+  { path = "std::time::Instant::now", reason = "nothing is decided by time" },
+  { path = "std::time::Instant::elapsed", reason = "nothing is decided by time" },
+  { path = "std::thread::sleep", reason = "wait for the event, not the clock" },
+  { path = "std::thread::park_timeout", reason = "wait for the event, not the clock" },
+  { path = "std::sync::Condvar::wait_timeout", reason = "wait for the event, not the clock" },
+  { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "wait for the event, not the clock" },
+  { path = "std::fs::Metadata::modified", reason = "a file's age is not evidence" },
+  { path = "std::fs::Metadata::accessed", reason = "a file's age is not evidence" },
+  { path = "std::fs::Metadata::created", reason = "a file's age is not evidence" },
+  { path = "std::fs::File::set_modified", reason = "only platform::times carries timestamps" },
+  { path = "std::fs::File::set_times", reason = "only platform::times carries timestamps" },
+  { path = "std::os::unix::fs::MetadataExt::mtime", reason = "a file's age is not evidence", allow-invalid = true },
+  { path = "std::os::unix::fs::MetadataExt::mtime_nsec", reason = "a file's age is not evidence", allow-invalid = true },
+  { path = "std::os::unix::fs::MetadataExt::atime", reason = "a file's age is not evidence", allow-invalid = true },
+  { path = "std::os::unix::fs::MetadataExt::atime_nsec", reason = "a file's age is not evidence", allow-invalid = true },
+  { path = "std::os::unix::fs::MetadataExt::ctime", reason = "a file's age is not evidence", allow-invalid = true },
+  { path = "std::os::unix::fs::MetadataExt::ctime_nsec", reason = "a file's age is not evidence", allow-invalid = true },
+  { path = "std::os::windows::fs::MetadataExt::last_write_time", reason = "a file's age is not evidence", allow-invalid = true },
+  { path = "std::os::windows::fs::MetadataExt::last_access_time", reason = "a file's age is not evidence", allow-invalid = true },
+  { path = "std::os::windows::fs::MetadataExt::creation_time", reason = "a file's age is not evidence", allow-invalid = true },
+  { path = "std::fs::remove_dir_all", reason = "deletion goes through apply::capability" },
+  { path = "std::fs::remove_dir", reason = "deletion goes through apply::capability" },
+  { path = "std::fs::remove_file", reason = "deletion goes through apply::capability" },
+  { path = "std::fs::rename", reason = "only the state store replaces files" },
+  { path = "std::fs::write", reason = "only the state store writes files" },
+  { path = "std::fs::copy", reason = "storage-scout never copies user data" },
+  { path = "std::fs::create_dir", reason = "only the state store creates directories" },
+  { path = "std::fs::create_dir_all", reason = "only the state store creates directories" },
+  { path = "std::fs::File::create", reason = "only the state store creates files" },
+  { path = "std::fs::OpenOptions::new", reason = "only the state store opens files for writing" },
+  { path = "std::fs::set_permissions", reason = "storage-scout never changes permissions outside removal" },
+  { path = "std::process::Command::new", reason = "processes start only through observe::git and platform::spawn" },
+  { path = "std::process::exit", reason = "return an ExitCode from main" },
+  { path = "std::mem::forget", reason = "leaks destructors, including held locks" },
+  { path = "std::env::set_var", reason = "races with other threads" },
+  { path = "std::env::remove_var", reason = "races with other threads" },
+  { path = "std::path::Path::exists", reason = "erases the difference between absent and unreadable; match the error" },
+  { path = "std::path::Path::is_file", reason = "erases the difference between absent and unreadable; match the error" },
+  { path = "std::path::Path::is_dir", reason = "erases the difference between absent and unreadable; match the error" },
+  { path = "std::path::Path::try_exists", reason = "check by trying the operation itself" },
+  { path = "core::result::Result::ok", reason = "turns a failure into absence; match the error" },
+  { path = "core::result::Result::unwrap_or", reason = "turns a failure into a stand-in; match the error" },
+  { path = "core::result::Result::unwrap_or_default", reason = "turns a failure into a stand-in; match the error" },
+  { path = "core::result::Result::unwrap_or_else", reason = "turns a failure into a stand-in; match the error" },
+  { path = "core::result::Result::map_or", reason = "hides the error policy; match exhaustively" },
+  { path = "core::result::Result::map_or_else", reason = "hides the error policy; match exhaustively" },
+  { path = "core::result::Result::or", reason = "turns a failure into a stand-in; match the error" },
+  { path = "core::result::Result::or_else", reason = "hides the first failure; match the error" },
+  { path = "core::result::Result::is_ok_and", reason = "hides the error policy; match exhaustively" },
+  { path = "core::result::Result::is_err_and", reason = "hides the error policy; match exhaustively" },
+]
+
+disallowed-types = [
+  { path = "std::time::SystemTime", reason = "nothing is decided by time" },
+  { path = "std::time::Instant", reason = "nothing is decided by time" },
+  { path = "std::time::Duration", reason = "nothing is decided by time" },
+  { path = "std::collections::HashMap", reason = "iteration order must not decide anything; use BTreeMap" },
+  { path = "std::collections::HashSet", reason = "iteration order must not decide anything; use BTreeSet" },
+]
