@@ -40,7 +40,7 @@ fn field_paths(value: &Value, prefix: &str, into: &mut BTreeSet<String>) {
     }
 }
 
-fn pairs(place: &storage_scout::core::location::Location) -> [PairOutcome; 6] {
+fn pairs(place: &storage_scout::core::location::Location) -> [PairOutcome; 7] {
     [
         PairStatus::WouldShare,
         PairStatus::Shared,
@@ -50,6 +50,9 @@ fn pairs(place: &storage_scout::core::location::Location) -> [PairOutcome; 6] {
         },
         PairStatus::Withheld {
             rejection: Rejection::NoRoots,
+        },
+        PairStatus::Overtaken {
+            failure: Failure::KeeperChanged,
         },
         PairStatus::Failed {
             failure: Failure::Io {

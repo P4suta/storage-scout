@@ -396,6 +396,13 @@ fn write_sharing(run: &DedupeRun, out: &mut dyn Write) -> io::Result<()> {
                     pair.len, pair.duplicate
                 )?;
             },
+            PairStatus::Overtaken { failure } => {
+                writeln!(
+                    out,
+                    "  {:>11} [left alone: {failure}] {}",
+                    pair.len, pair.duplicate
+                )?;
+            },
             PairStatus::WouldShare
             | PairStatus::Shared
             | PairStatus::AlreadyShared

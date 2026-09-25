@@ -433,6 +433,16 @@ pub enum Failure {
     Io { step: Step, error: IoFailure },
 }
 
+impl Failure {
+    #[must_use]
+    pub const fn overtaken(&self) -> bool {
+        match self {
+            Self::KeeperChanged | Self::DuplicateChanged | Self::ContentDiffers => true,
+            Self::MetadataNotCarried | Self::Leftover | Self::Stranded | Self::Io { .. } => false,
+        }
+    }
+}
+
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -460,6 +470,31 @@ mod tests {
 
     use super::*;
     use crate::location::Syntax;
+
+    #[test]
+    fn only_a_file_that_changed_under_the_run_is_overtaken_rather_than_failed() {
+        for failure in [
+            Failure::KeeperChanged,
+            Failure::DuplicateChanged,
+            Failure::ContentDiffers,
+        ] {
+            assert!(failure.overtaken(), "{failure}");
+        }
+        for failure in [
+            Failure::MetadataNotCarried,
+            Failure::Leftover,
+            Failure::Stranded,
+            Failure::Io {
+                step: Step::Clone,
+                error: IoFailure {
+                    kind: crate::reject::IoKind::Other,
+                    code: None,
+                },
+            },
+        ] {
+            assert!(!failure.overtaken(), "{failure}");
+        }
+    }
 
     fn record_of(file: u128, len: u64, sharing: Sharing) -> Record {
         Record {

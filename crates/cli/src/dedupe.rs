@@ -62,6 +62,7 @@ pub enum PairStatus {
     AlreadyShared,
     Refused { refusal: Refusal },
     Withheld { rejection: Rejection },
+    Overtaken { failure: Failure },
     Failed { failure: Failure },
 }
 
@@ -97,6 +98,7 @@ pub struct Totals {
     pub already_shared: Tally,
     pub refused: Tally,
     pub withheld: Tally,
+    pub overtaken: Tally,
     pub failed: Tally,
 }
 
@@ -364,6 +366,7 @@ fn settle<'f>(
                 },
                 Ok(shareable) => match shareable.share(&request(pair)) {
                     Ok(()) => PairStatus::Shared,
+                    Err(failure) if failure.overtaken() => PairStatus::Overtaken { failure },
                     Err(failure) => PairStatus::Failed { failure },
                 },
             }
@@ -615,6 +618,7 @@ impl Pool {
                 PairStatus::AlreadyShared => &mut totals.already_shared,
                 PairStatus::Refused { .. } => &mut totals.refused,
                 PairStatus::Withheld { .. } => &mut totals.withheld,
+                PairStatus::Overtaken { .. } => &mut totals.overtaken,
                 PairStatus::Failed { .. } => &mut totals.failed,
             };
             tally.add(pair.len);
