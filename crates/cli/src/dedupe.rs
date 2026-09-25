@@ -484,17 +484,33 @@ impl Pool {
         self.stocks.remove(root);
     }
 
-    fn lengths(&self, focus: &Focus<'_>) -> Option<BTreeSet<u64>> {
+    fn lengths(&self, focus: &Focus<'_>) -> BTreeSet<u64> {
+        let mut counts = BTreeMap::<u64, usize>::new();
+        for (_, facts) in self
+            .stocks
+            .values()
+            .filter(|stock| stock.method.is_some())
+            .flat_map(|stock| &stock.files)
+        {
+            let count = counts.entry(facts.len).or_default();
+            *count = count.saturating_add(1);
+        }
+        let repeated = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(len, _)| len);
         match focus {
-            Focus::Everything => None,
-            Focus::Fresh { identities, .. } => Some(
-                self.stocks
+            Focus::Everything => repeated.collect(),
+            Focus::Fresh { identities, .. } => {
+                let fresh = self
+                    .stocks
                     .values()
                     .flat_map(|stock| &stock.files)
                     .filter(|(_, facts)| identities.contains(&facts.identity))
                     .map(|(_, facts)| facts.len)
-                    .collect(),
-            ),
+                    .collect::<BTreeSet<_>>();
+                repeated.filter(|len| fresh.contains(len)).collect()
+            },
         }
     }
 
@@ -511,10 +527,7 @@ impl Pool {
                 continue;
             };
             for (relative, facts) in &stock.files {
-                if lengths
-                    .as_ref()
-                    .is_some_and(|lengths| !lengths.contains(&facts.len))
-                {
+                if !lengths.contains(&facts.len) {
                     continue;
                 }
                 let path = root.join(relative);
