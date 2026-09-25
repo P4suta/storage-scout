@@ -226,16 +226,13 @@ fn auto_reaps_released_work_and_evicts_only_under_pressure() {
     testkit::assert_present(&free);
 
     write_policy(&policy, &work, Some((temp.path(), "100TiB")), &log);
-    let free_location = fs::canonicalize(&free).unwrap();
+    let free_location = serde_json::to_value(testkit::location(&free)).unwrap();
     let holder = File::open(busy.join("debug/.cargo-lock")).unwrap();
     holder.lock().unwrap();
     let pressed = cli(&["auto", "--config", config, "--execute", "--json"]);
     assert_eq!(pressed.status.code(), Some(0), "{pressed:#?}");
     let evicted = json(&pressed);
-    assert_eq!(
-        evicted["evict"]["steps"][0]["location"],
-        free_location.to_str().unwrap()
-    );
+    assert_eq!(evicted["evict"]["steps"][0]["location"], free_location);
     assert_eq!(evicted["evict"]["steps"][0]["status"]["status"], "deleted");
     let stopped = evicted["evict"]["stopped"].as_str().unwrap().to_owned();
     assert!(
