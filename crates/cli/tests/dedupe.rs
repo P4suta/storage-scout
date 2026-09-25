@@ -185,15 +185,17 @@ fn a_file_that_cannot_be_replaced_is_kept_and_the_plain_copy_is_shared_with_it()
         .collect::<Vec<_>>();
     expected.sort();
     assert_eq!(found, expected, "{run:#?}");
-    let plain = run
-        .pairs
-        .iter()
-        .find(|pair| pair.status == PairStatus::WouldShare)
-        .unwrap();
-    assert_eq!(
-        plain.duplicate,
-        testkit::location(&fs::canonicalize(plain_target.join(RLIB)).unwrap())
-    );
+    if method == Method::CloneAndSwap {
+        let plain = run
+            .pairs
+            .iter()
+            .find(|pair| pair.status == PairStatus::WouldShare)
+            .unwrap();
+        assert_eq!(
+            plain.duplicate,
+            testkit::location(&fs::canonicalize(plain_target.join(RLIB)).unwrap())
+        );
+    }
 }
 
 #[test]

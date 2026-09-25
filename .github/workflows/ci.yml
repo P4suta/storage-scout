@@ -99,6 +99,7 @@ jobs:
             --git https://github.com/P4suta/njutest \
             --rev ${{ env.NJUTEST_REV }} \
             --locked rust-mutants-cli
+      - run: cargo fetch --locked
       - run: rust-mutants doctor
       - name: Measure this part of the catalog
         run: rust-mutants run --shard ${{ matrix.shard }}/4 --locked --offline

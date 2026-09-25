@@ -16,7 +16,7 @@ storage-scout-core = { path = "crates/core", version = "=0.4.0" }
 testkit = { path = "crates/testkit", version = "=0.0.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-inquire = "0.7"
+inquire = "0.9"
 insta = { version = "1", features = ["json", "filters"] }
 libc = "0.2"
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
