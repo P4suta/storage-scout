@@ -24,7 +24,7 @@ use testkit::{
 };
 
 fn scout() -> Scout {
-    Scout::with(testkit::open_protection())
+    Scout::with(testkit::open_protection()).confined(vec![testkit::ceiling()])
 }
 
 fn options(root: &Path) -> ScanOptions {
@@ -396,7 +396,8 @@ fn a_broad_root_is_refused_but_a_root_around_the_current_directory_only_protects
     let temp = tempdir("cwd-root");
     let standing = write_cargo_project(&temp.path().join("standing"), 100);
     let beside = write_cargo_project(&temp.path().join("beside"), 100);
-    let scout = Scout::with(testkit::protection_at(&standing.join("debug"), Vec::new()));
+    let scout = Scout::with(testkit::protection_at(&standing.join("debug"), Vec::new()))
+        .confined(vec![testkit::ceiling()]);
     let report = scout.discover(&options(temp.path())).unwrap();
     let paths = report
         .candidates
@@ -529,7 +530,8 @@ fn an_application_owned_area_admits_only_declared_caches() {
         "test area",
         area,
         Reach::Subtree,
-    )]));
+    )]))
+    .confined(vec![testkit::ceiling()]);
     let _inferred = write_cargo_project(&temp.path().join("proj"), 4096);
     write_declared_target(&temp.path().join("sbt"), "debug");
     write_sized(&temp.path().join("sbt/debug/app"), 4096);

@@ -15,7 +15,7 @@ use storage_scout::{Measure, Mode, ScanOptions, Scout};
 use testkit::{scratch_mount, tempdir, write_declared_target, write_sized};
 
 fn scout() -> Scout {
-    Scout::with(testkit::open_protection())
+    Scout::with(testkit::open_protection()).confined(vec![testkit::ceiling()])
 }
 
 fn options(root: &Path) -> ScanOptions {

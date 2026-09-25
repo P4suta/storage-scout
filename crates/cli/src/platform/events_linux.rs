@@ -194,9 +194,14 @@ mod tests {
     #[test]
     fn an_overflow_is_a_lost_stream_and_a_dropped_watch_is_forgotten() {
         let watches: Watches = Arc::new(Mutex::new(BTreeMap::from([(1, PathBuf::from("/w"))])));
+        let overflowed = [
+            event(-1, libc::IN_Q_OVERFLOW, b""),
+            event(1, libc::IN_CREATE, b"after"),
+        ]
+        .concat();
         assert_eq!(
-            collect(&event(-1, libc::IN_Q_OVERFLOW, b""), &watches),
-            vec![Change::Lost]
+            collect(&overflowed, &watches),
+            vec![Change::Lost, Change::Directory(PathBuf::from("/w"))]
         );
         let gone = [
             event(1, libc::IN_IGNORED, b""),

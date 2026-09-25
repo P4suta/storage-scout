@@ -16,7 +16,7 @@ use testkit::{link_dir, tempdir, write_cargo_project, write_sized};
 fn cli(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_storage-scout"))
         .args(args)
-        .env("GIT_CEILING_DIRECTORIES", env!("CARGO_MANIFEST_DIR"))
+        .env("GIT_CEILING_DIRECTORIES", testkit::ceiling())
         .env("STORAGE_SCOUT_STATE_DIR", env!("CARGO_TARGET_TMPDIR"))
         .output()
         .unwrap()
@@ -290,7 +290,7 @@ fn hooked(args: &[&str], state: &Path, input: &[u8]) -> Output {
     use std::io::Write as _;
     let mut child = Command::new(env!("CARGO_BIN_EXE_storage-scout"))
         .args(args)
-        .env("GIT_CEILING_DIRECTORIES", env!("CARGO_MANIFEST_DIR"))
+        .env("GIT_CEILING_DIRECTORIES", testkit::ceiling())
         .env("STORAGE_SCOUT_STATE_DIR", state)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

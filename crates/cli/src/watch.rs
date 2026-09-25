@@ -846,7 +846,14 @@ mod tests {
     fn a_new_project_and_a_directory_that_becomes_owned_are_both_noticed() {
         watched(
             "watch-unit-appear",
-            |_| {},
+            |root| {
+                testkit::write_owner_marker(
+                    &root.with_file_name("outside"),
+                    MarkerRole::Scratch,
+                    MarkerKeep::Released,
+                    None,
+                );
+            },
             |session, root, records| {
                 assert!(session.world.is_empty());
                 let debug = profile(root, "late");
@@ -864,6 +871,7 @@ mod tests {
                 testkit::assert_absent(&old);
 
                 let unannounced = build(&debug, "two");
+                session.turn(vec![changed(&root.join("late"))]).unwrap();
                 let quiet = profile(root, "quiet");
                 let state = session.hooks.state.clone();
                 session.turn(vec![changed(&state)]).unwrap();
@@ -879,11 +887,27 @@ mod tests {
                 assert!(!session.world.contains_key(&run));
                 assert_eq!(pruned_so_far(records), 1);
                 testkit::assert_present(&unannounced);
+                testkit::assert_present(root.with_file_name("outside"));
 
                 let deep = profile(root, "deep");
                 session.turn(vec![changed(deep.parent().unwrap())]).unwrap();
                 assert!(session.world.contains_key(&root.join("deep/target")));
                 drop(quiet);
+
+                write_sized(&root.join("aa/Cargo.toml"), 1);
+                session.turn(vec![changed(root)]).unwrap();
+                assert!(session.hosts.contains(&root.join("aa")));
+                let _aa = profile(root, "aa");
+                testkit::make_dir(&root.join("b"));
+                testkit::make_dir(&root.join("c"));
+                session
+                    .turn(vec![
+                        changed(&root.join("aa/target")),
+                        changed(&root.join("b")),
+                        changed(&root.join("c")),
+                    ])
+                    .unwrap();
+                assert!(session.world.contains_key(&root.join("aa/target")));
             },
         );
     }
@@ -894,18 +918,26 @@ mod tests {
             "watch-unit-owner",
             |root| {
                 let _debug = profile(root, "gone");
+                testkit::write_owner_marker(
+                    &root.join("done"),
+                    MarkerRole::Scratch,
+                    MarkerKeep::Released,
+                    None,
+                );
             },
             |session, root, records| {
+                assert_eq!(reaped(records), 1);
+                testkit::assert_absent(root.join("done"));
                 let run = root.join("run");
                 testkit::write_owner_marker(&run, MarkerRole::Scratch, MarkerKeep::Released, None);
                 let owner = testkit::claim(&run);
                 session.turn(vec![changed(root)]).unwrap();
                 assert!(session.waiting.contains_key(&run));
-                assert_eq!(reaped(records), 0);
+                assert_eq!(reaped(records), 1);
                 drop(owner);
                 session.waiting.remove(&run).unwrap().join().unwrap();
                 session.turn(vec![Signal::Released(run.clone())]).unwrap();
-                assert_eq!(reaped(records), 1);
+                assert_eq!(reaped(records), 2);
                 testkit::assert_absent(&run);
 
                 let held = root.join("held");
@@ -920,11 +952,11 @@ mod tests {
                 build.lock().unwrap();
                 session.turn(vec![changed(root)]).unwrap();
                 assert!(session.waiting.contains_key(&held));
-                assert_eq!(reaped(records), 1);
+                assert_eq!(reaped(records), 2);
                 drop(build);
                 session.waiting.remove(&held).unwrap().join().unwrap();
                 session.turn(vec![Signal::Released(held.clone())]).unwrap();
-                assert_eq!(reaped(records), 2);
+                assert_eq!(reaped(records), 3);
                 testkit::assert_absent(&held);
 
                 let target = root.join("gone/target");
@@ -957,19 +989,21 @@ mod tests {
                     MarkerKeep::Kept,
                     None,
                 );
-                let key_two = root.with_file_name("key-two");
-                testkit::make_dir(&key_two);
-                testkit::write_owner_marker(
-                    &root.join("second"),
-                    MarkerRole::Cache,
-                    MarkerKeep::Released,
-                    Some(&key_two),
-                );
+                for (name, keyed) in [("second", "key-two"), ("third", "key-three")] {
+                    let keyed = root.with_file_name(keyed);
+                    testkit::make_dir(&keyed);
+                    testkit::write_owner_marker(
+                        &root.join(name),
+                        MarkerRole::Cache,
+                        MarkerKeep::Released,
+                        Some(&keyed),
+                    );
+                }
                 let _app = profile(root, "app");
                 let _doomed = profile(root, "doomed");
             },
             |session, root, records| {
-                assert_eq!(session.world.len(), 5, "{:?}", session.world.keys());
+                assert_eq!(session.world.len(), 6, "{:?}", session.world.keys());
                 let recursive = session.watcher.recursive();
                 testkit::remove_tree(&root.with_file_name("key"));
                 session.turn(vec![]).unwrap();
@@ -1004,13 +1038,23 @@ mod tests {
 
                 let late = profile(root, "unseen");
                 let waste = build(&late, "one");
+                testkit::remove_tree(&root.with_file_name("key-three"));
+                let before = records.borrow().len();
                 session.turn(vec![Signal::Changed(Change::Lost)]).unwrap();
                 assert!(
                     session
                         .world
                         .contains_key(&late.parent().unwrap().to_path_buf())
                 );
-                assert_eq!(reaped(records), 2);
+                assert_eq!(reaped(records), 3);
+                assert!(
+                    records
+                        .borrow()
+                        .iter()
+                        .skip(before)
+                        .any(|record| record.cause == Cause::Hook && record.reap.is_some())
+                );
+                testkit::assert_absent(root.join("third"));
                 testkit::assert_absent(root.join("second"));
                 assert!(!session.world.contains_key(&root.join("second")));
                 assert!(!session.world.contains_key(&root.join("doomed/target")));

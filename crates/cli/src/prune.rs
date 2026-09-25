@@ -265,11 +265,9 @@ fn exactly(file: &mut File, at: u64, len: u64) -> Result<Vec<u8>, ImageError> {
     file.seek(SeekFrom::Start(at))?;
     let mut bytes = Vec::new();
     Read::take(&mut *file, len).read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()) == Ok(len) {
-        Ok(bytes)
-    } else {
-        Err(ImageError::Mach)
-    }
+    (u64::try_from(bytes.len()) == Ok(len))
+        .then_some(bytes)
+        .ok_or(ImageError::Mach)
 }
 
 fn debug_offsets(file: &mut File, symtab: &macho::Symtab) -> Result<Vec<u32>, ImageError> {

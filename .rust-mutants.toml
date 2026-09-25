@@ -353,6 +353,118 @@ original = "-1"
 reason = "a new descriptor is never 1, which standard output already holds"
 outcome = "survived"
 
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::lets_go"
+rule = "condition-to-false"
+original = "!let_go(found)"
+reason = "a survey can only add protection to what the sighting found, so skipping the shortcut surveys more and settles the same"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::written"
+rule = "return-true"
+original = "self.world\n            .get(root)\n            .is_some_and(|found| found.candidate().kind().protocol().is_some())"
+reason = "a cache with no writer protocol has nothing to prune or share, so processing it changes nothing"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::turn"
+rule = "remove-match-guard"
+original = "self.written(&root)"
+reason = "a cache with no writer protocol has nothing to prune or share, so processing it changes nothing"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::appear"
+rule = "condition-to-false"
+original = "!visited.insert(directory.clone())"
+reason = "sighting a directory twice finds the same candidates, which are adopted once"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::turn"
+rule = "condition-to-true"
+original = "!appeared.is_empty()"
+reason = "sighting no directories adopts and reaps nothing and records nothing"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::turn"
+rule = "condition-to-false"
+original = "directory.starts_with(&self.hooks.state)"
+reason = "the state directory lies outside every root, so a write there sights nothing"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::refresh"
+rule = "condition-to-false"
+original = "self.watcher.recursive()"
+reason = "where the watcher sees only the directories it names, refreshing sights every root either way; a recursive watcher is measured on the platforms that have one"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::follow"
+rule = "return-ok-default"
+original = "self.watcher.watch(&borrowed).map_err(WatchError::Events)"
+reason = "which directories are followed shows only in the events that arrive from them, which the watch integration tests wait on and measurement leaves out"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::remember_hosts"
+rule = "return-ok-default"
+original = "self.follow_hosts(&fresh)"
+reason = "which directories are followed shows only in the events that arrive from them, which the watch integration tests wait on and measurement leaves out"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/watch.rs"
+item = "Session::follow_hosts"
+rule = "return-ok-default"
+original = "self.watcher.watch(&borrowed).map_err(WatchError::Events)"
+reason = "which directories are followed shows only in the events that arrive from them, which the watch integration tests wait on and measurement leaves out"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/events_macos.rs"
+item = "strings"
+rule = "condition-to-false"
+original = "string.is_null()"
+reason = "CFStringCreateWithBytes fails only when memory runs out, which no test can stage"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/events_macos.rs"
+item = "Source::start"
+rule = "condition-to-false"
+original = "array.is_null()"
+reason = "CFArrayCreate fails only when memory runs out, which no test can stage"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/events_macos.rs"
+item = "Source::start"
+rule = "condition-to-false"
+original = "stream.is_null()"
+reason = "FSEvents refuses a stream only for paths it cannot watch, and every root is canonicalized before it is asked"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/events_macos.rs"
+item = "Source::start"
+rule = "condition-to-false"
+original = "unsafe { FSEventStreamStart(stream) } == 0"
+reason = "a stream scheduled on a queue starts, and no test can make FSEvents refuse it"
+outcome = "survived"
+
 [[mutation.skip]]
 path = "crates/cli/src/busy.rs"
 lines = "225-225"

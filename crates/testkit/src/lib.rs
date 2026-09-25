@@ -60,11 +60,42 @@ impl Drop for Scratch {
     }
 }
 
+const SCRATCH: &str = ".storage-scout-tests";
+const SCRATCH_OWNER: &str = r#"{"schema": "storage-scout-temp-owner-v1", "pid": 0, "started": "tests", "kept": true, "role": "scratch"}"#;
+
+static HELD: std::sync::OnceLock<File> = std::sync::OnceLock::new();
+
+#[must_use]
+pub fn ceiling() -> PathBuf {
+    let scratch = std::env::current_dir()
+        .expect("a current directory")
+        .join(SCRATCH);
+    let _held = HELD.get_or_init(|| {
+        fs::create_dir_all(&scratch).expect("the tests' scratch directory");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(scratch.join("owner.lock"))
+            .expect("the tests' owner lock");
+        lock.lock_shared()
+            .expect("a share of the tests' owner lock");
+        let marker = scratch.join("owner.json");
+        if fs::symlink_metadata(&marker).is_err() {
+            let staged = scratch.join(format!("owner.json.{}", std::process::id()));
+            fs::write(&staged, SCRATCH_OWNER).expect("the tests' owner marker");
+            fs::rename(&staged, &marker).expect("the tests' owner marker in place");
+        }
+        lock
+    });
+    scratch
+}
+
 pub fn tempdir(prefix: &str) -> Scratch {
     Scratch(Some(
         tempfile::Builder::new()
             .prefix(&format!(".storage-scout-{prefix}-"))
-            .tempdir_in(std::env::current_dir().expect("a current directory"))
+            .tempdir_in(ceiling())
             .expect("a temporary directory inside the repository"),
     ))
 }
