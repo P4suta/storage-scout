@@ -1,0 +1,24 @@
+[package]
+name = "storage-scout-core"
+description = "Pure decision core of storage-scout: every rule, no I/O, no clock."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords = ["cleanup", "storage", "policy"]
+categories = ["filesystem", "no-std"]
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

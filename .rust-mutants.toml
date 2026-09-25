@@ -1,0 +1,53 @@
+[project]
+include = [
+    "crates/core/src/**/*.rs",
+    "crates/cli/src/apply.rs",
+    "crates/cli/src/apply/*.rs",
+    "crates/cli/src/busy.rs",
+    "crates/cli/src/measure.rs",
+    "crates/cli/src/observe.rs",
+    "crates/cli/src/observe/*.rs",
+    "crates/cli/src/owners.rs",
+    "crates/cli/src/coalesce.rs",
+    "crates/cli/src/dedupe.rs",
+    "crates/cli/src/dedupe/*.rs",
+    "crates/cli/src/scan.rs",
+    "crates/cli/src/platform/*.rs",
+]
+
+[[mutation.expect]]
+path = "crates/cli/src/apply.rs"
+item = "check"
+rule = "ignore-question-statement"
+original = "?"
+reason = "clear() asks every gate again, so an ignored recheck only moves the same refusal after the measurement it exists to avoid"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/busy.rs"
+item = "Lease::keys"
+rule = "return-default"
+original = "self.held.iter().map(|(_, identity)| *identity).collect()"
+reason = "the kept lock files matter only to a build that starts during removal, a race no test can stage"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/measure.rs"
+item = "Tally::allocated"
+rule = "le-to-lt"
+original = "<="
+reason = "a file always has at least one link, and the linked table counts a single-link file exactly as the unlinked sum does"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/measure.rs"
+item = "Volumes::gained"
+rule = "return-some-default"
+original = "self.0\n            .iter()\n            .try_fold(Bytes::ZERO, |total, (volume, before)| {\n                let after = after.0.get(volume)?;\n                Some(total.saturating_add(Bytes::new(after.saturating_sub(*before))))\n            })"
+reason = "free space is measured on the whole volume while other tests write to it, so a test sees that it was measured but not by how much"
+outcome = "survived"
+
+[execution]
+locked = true
+
+skip_targets = ["storage-scout/test/mount_boundary"]

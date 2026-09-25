@@ -1,0 +1,9 @@
+---
+source: crates/cli/tests/rendering.rs
+expression: "render(|out| render_clean(&plan, &summary, Color::Never, out))"
+---
+storage-scout <VERSION> — dry-run (nothing deleted)
+     64.0 KiB [ routine ] [would delete] <PATH>
+     32.1 KiB [reinstall] [would delete] <PATH>
+
+Predicted reclaimable: <BYTES>

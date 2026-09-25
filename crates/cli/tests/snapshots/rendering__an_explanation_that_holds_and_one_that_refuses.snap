@@ -1,0 +1,40 @@
+---
+source: crates/cli/tests/rendering.rs
+expression: "render(|out|\n{ render_explain(&eligible, out)?; render_explain(&refused, out) })"
+---
+storage-scout <VERSION> — why this path is or is not a candidate
+
+<PATH>
+
+  ok       shape      directory, not a link
+  ok       mount      same device (<DEVICE>)
+  ok       area       open project space
+  ok       exclusion  outside every exclusion
+  ok       evidence   kind=rust-target, provenance=inferred
+  ok       tier       routine (accepted)
+  ok       ownership  unclaimed
+  --       protocol   not asked here
+  --       capability not asked here
+  ok       busy       no running tool holds it
+  --       identity   not asked here
+  --       freshness  not asked here
+
+=> eligible: every gate holds
+storage-scout <VERSION> — why this path is or is not a candidate
+
+<PATH>
+
+  ok       shape      directory, not a link
+  ok       mount      same device (<DEVICE>)
+  ok       area       open project space
+  ok       exclusion  outside every exclusion
+  ok       evidence   kind=tagged-cache, provenance=declared
+  REFUSED  tier       risk tier reinstallable is locked; pass --include-tier reinstallable
+           ownership  not reached
+           protocol   not reached
+           capability not reached
+           busy       not reached
+           identity   not reached
+           freshness  not reached
+
+=> not a candidate: risk tier reinstallable is locked; pass --include-tier reinstallable

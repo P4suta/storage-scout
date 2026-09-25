@@ -1,0 +1,70 @@
+[package]
+name = "storage-scout"
+description = "Disk-usage scanner and safety-first build-artifact cleaner. Decisions never depend on time."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+authors.workspace = true
+keywords = ["disk-usage", "storage", "cli", "du", "cleanup"]
+categories = ["command-line-utilities", "filesystem"]
+autotests = false
+
+[[test]]
+name = "cleanup"
+path = "tests/cleanup.rs"
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+
+[[test]]
+name = "ownership"
+path = "tests/ownership.rs"
+
+[[test]]
+name = "mount_boundary"
+path = "tests/mount_boundary.rs"
+
+[[test]]
+name = "schema_v2"
+path = "tests/schema_v2.rs"
+
+[[test]]
+name = "rendering"
+path = "tests/rendering.rs"
+
+[[test]]
+name = "dedupe"
+path = "tests/dedupe.rs"
+
+[dependencies]
+storage-scout-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+inquire.workspace = true
+rayon.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror = { workspace = true, features = ["std"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+testkit.workspace = true
+insta.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
