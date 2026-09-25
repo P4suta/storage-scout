@@ -539,6 +539,21 @@ mod tests {
     }
 
     #[test]
+    fn a_file_exactly_one_sample_long_is_read_once() {
+        let temp = testkit::tempdir("dedupe-one-sample");
+        let path = temp.path().join("one");
+        let bytes = [7u8; 4096];
+        testkit::write_bytes(&path, &bytes);
+        let mut expected = Sha256::new();
+        expected.update(SAMPLE.to_le_bytes());
+        expected.update(bytes);
+        assert_eq!(
+            sample(&path, platform::identity(&path).unwrap(), SAMPLE),
+            Some(Fingerprint(expected.finalize().into()))
+        );
+    }
+
+    #[test]
     fn a_short_file_is_sampled_whole() {
         let temp = testkit::tempdir("dedupe-short");
         let one = temp.path().join("one");

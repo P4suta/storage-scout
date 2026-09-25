@@ -112,7 +112,7 @@ const fn is_directory(stat: &libc::stat) -> bool {
 pub(super) fn open_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
     // SAFETY: `name` is NUL-terminated and `dir` is an open directory descriptor or `AT_FDCWD`.
     let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC) };
-    if fd < 0 {
+    if fd == -1 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `openat` just returned this descriptor and nothing else owns it.
