@@ -254,3 +254,24 @@ impl Volumes {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_measured_is_nothing_observed() {
+        let nothing = Volumes(BTreeMap::new());
+        assert_eq!(nothing.gained(&Volumes(BTreeMap::new())), None);
+        let before = Volumes(BTreeMap::from([(1, 10)]));
+        assert_eq!(before.gained(&Volumes(BTreeMap::new())), None);
+        assert_eq!(
+            before.gained(&Volumes(BTreeMap::from([(1, 15)]))),
+            Some(Bytes::new(5))
+        );
+        assert_eq!(
+            before.gained(&Volumes(BTreeMap::from([(1, 5)]))),
+            Some(Bytes::ZERO)
+        );
+    }
+}

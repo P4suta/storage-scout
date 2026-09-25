@@ -466,4 +466,52 @@ mod tests {
         assert!(!path.same(&other, Case::Insensitive));
         assert_eq!(path.file_name().unwrap().as_bytes(), b"\xff\xfe");
     }
+
+    #[test]
+    fn an_empty_name_is_not_a_name() {
+        assert_eq!(Name::new(b"", Syntax::Unix), Err(LocationError::Empty));
+    }
+
+    #[test]
+    fn drives_shares_and_syntaxes_are_different_places() {
+        assert!(!windows(r"C:\work").same(&windows(r"D:\work"), Case::Insensitive));
+        assert!(!unix("/work").same(&windows(r"C:\work"), Case::Insensitive));
+        assert_eq!(
+            windows(r"C:\").relative(&windows(r"D:\x"), Case::Insensitive),
+            None
+        );
+        assert_eq!(
+            unix("/").relative(&windows(r"C:\x"), Case::Insensitive),
+            None
+        );
+        assert!(
+            windows(r"C:\")
+                .relative(&windows(r"c:\x"), Case::Insensitive)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_key_separates_every_name_and_nothing_else() {
+        assert_ne!(
+            unix("/a/b").key(Case::Sensitive),
+            unix("/ab").key(Case::Sensitive)
+        );
+        assert_eq!(unix("/a/b").key(Case::Sensitive), b"/a\0b".to_vec());
+    }
+
+    #[test]
+    fn a_share_root_prints_without_a_trailing_separator() {
+        assert_eq!(windows(r"\\server\share").to_string(), r"\\server\share");
+        assert_eq!(
+            windows(r"\\server\share\x").to_string(),
+            r"\\server\share\x"
+        );
+    }
+
+    #[test]
+    fn a_drive_letter_is_a_letter() {
+        let _refused = Location::parse_str(Syntax::Windows, "1:").unwrap_err();
+        assert_eq!(windows("c:").to_string(), r"C:\");
+    }
 }

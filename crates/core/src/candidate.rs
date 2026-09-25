@@ -242,3 +242,20 @@ impl Candidate {
         self.location.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+
+    use super::*;
+
+    #[test]
+    fn an_id_is_exactly_sixty_four_hexadecimal_digits() {
+        let hex = "aB".repeat(32);
+        let id = hex.parse::<CandidateId>().unwrap();
+        assert_eq!(id.as_str(), hex.to_ascii_lowercase());
+        assert_eq!(id.to_string(), hex.to_ascii_lowercase());
+        assert_eq!("ab".repeat(31).parse::<CandidateId>(), Err(MalformedId));
+        assert_eq!("zz".repeat(32).parse::<CandidateId>(), Err(MalformedId));
+    }
+}

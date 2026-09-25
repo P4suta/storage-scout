@@ -727,6 +727,165 @@ fn a_cache_tag_without_the_signature_is_not_evidence() {
     );
 }
 
+fn with_roots(roots: Vec<PathBuf>) -> ScanOptions {
+    ScanOptions {
+        roots,
+        ..options(Path::new("."))
+    }
+}
+
+#[test]
+fn issues_are_counted_in_full_but_listed_only_up_to_the_limit() {
+    let temp = tempdir("scan-issues");
+    let missing = (0..51)
+        .map(|index| temp.path().join(format!("missing-{index}")))
+        .collect::<Vec<_>>();
+    let report = scout().scan(&with_roots(missing));
+    assert_eq!(report.stats.errors, 51);
+    assert_eq!(report.issues.len(), 50);
+}
+
+#[test]
+fn every_usable_root_is_scanned_once_whatever_comes_before_it() {
+    let temp = tempdir("scan-roots");
+    let root = temp.path();
+    let _target = write_cargo_project(&root.join("proj"), 4096);
+    write_sized(&root.join("file"), 1);
+    let Built::Yes(link) = link_dir(&root.join("link"), &root.join("proj")) else {
+        return;
+    };
+    for roots in [
+        vec![
+            root.join("missing"),
+            link,
+            root.join("file"),
+            root.to_path_buf(),
+        ],
+        vec![root.to_path_buf(), root.join("proj")],
+        vec![root.join("proj"), root.to_path_buf()],
+    ] {
+        let report = scout().scan(&with_roots(roots.clone()));
+        assert_eq!(report.candidates.len(), 1, "{roots:?}");
+        assert_eq!(report.roots, vec![testkit::location(root)], "{roots:?}");
+    }
+}
+
+#[test]
+fn an_excluded_root_or_directory_is_not_scanned() {
+    let temp = tempdir("scan-excluded");
+    let root = temp.path();
+    let _target = write_cargo_project(&root.join("proj"), 4096);
+    write_sized(&root.join("docs/manual"), 8192);
+    let excluded = ScanOptions {
+        excludes: vec![root.to_path_buf()],
+        ..options(root)
+    };
+    assert!(scout().scan(&excluded).candidates.is_empty());
+    let inner = ScanOptions {
+        excludes: vec![root.join("docs")],
+        max_depth: None,
+        ..options(root)
+    };
+    let report = scout().scan(&inner);
+    assert_eq!(report.usage.logical, Bytes::new(4096 + 1));
+    assert!(
+        report
+            .largest_directories
+            .iter()
+            .all(|directory| directory.location != testkit::location(&root.join("docs")))
+    );
+}
+
+#[test]
+fn an_artifact_inside_an_artifact_is_part_of_it() {
+    let temp = tempdir("scan-nested");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let _inner = write_cargo_project(&target.join("tmp/vendored"), 4096);
+    let report = discover(temp.path());
+    assert_eq!(only(&report).path(), fs::canonicalize(&target).unwrap());
+}
+
+#[test]
+fn the_size_floor_keeps_what_reaches_it_exactly() {
+    let temp = tempdir("scan-floor");
+    let _target = write_cargo_project(&temp.path().join("proj"), 4096);
+    write_sized(&temp.path().join("docs/manual"), 4096);
+    for (floor, expected) in [(4096, 1), (4097, 0)] {
+        let options = ScanOptions {
+            min_size: Bytes::new(floor),
+            max_depth: None,
+            top: 100,
+            ..options(temp.path())
+        };
+        let report = scout().scan(&options);
+        assert_eq!(report.candidates.len(), expected, "{floor}");
+        let docs = report
+            .largest_directories
+            .iter()
+            .filter(|directory| directory.location == testkit::location(&temp.path().join("docs")))
+            .count();
+        assert_eq!(docs, expected, "{floor}");
+        assert!(
+            report
+                .largest_directories
+                .iter()
+                .all(|directory| !directory.location.to_string().contains("target")),
+            "{floor}"
+        );
+    }
+}
+
+#[test]
+fn a_lock_name_inside_cargos_own_directories_is_not_a_lock() {
+    let temp = tempdir("busy-decoys");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    fs::create_dir_all(target.join("debug/.fingerprint")).unwrap();
+    let decoy = target.join("debug/deps/.cargo-lock");
+    write_sized(&decoy, 0);
+    let report = discover(temp.path());
+    let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    let decoy_holder = File::open(&decoy).unwrap();
+    decoy_holder.lock().unwrap();
+    let summary = apply(&plan, Mode::Execute);
+    assert_eq!(status(&summary), &Status::Deleted, "{summary:#?}");
+}
+
+#[test]
+fn a_marker_that_appears_after_discovery_is_heard_before_deletion() {
+    let temp = tempdir("owned-late");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let report = discover(temp.path());
+    let plan = Scout::plan(
+        &report.candidates,
+        &ids(&report.candidates),
+        Mandate {
+            tiers: TierGrant::ROUTINE,
+            settlements: storage_scout::core::ownership::Admits::Evictable,
+        },
+        &[],
+    )
+    .unwrap();
+    let kept = target.join("tmp/kept");
+    testkit::write_owner_marker(
+        &kept,
+        testkit::MarkerRole::Scratch,
+        testkit::MarkerKeep::Kept,
+        None,
+    );
+    fs::remove_file(kept.join("owner.lock")).unwrap();
+    let summary = apply(&plan, Mode::Execute);
+    assert!(
+        matches!(
+            status(&summary),
+            Status::Rejected {
+                rejection: Rejection::Owned { .. }
+            }
+        ),
+        "{summary:#?}"
+    );
+    testkit::assert_present(&target);
+}
+
 #[test]
 fn a_locked_tier_is_refused_by_the_gate() {
     let temp = tempdir("tier");

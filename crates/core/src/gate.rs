@@ -1164,6 +1164,62 @@ mod tests {
     }
 
     #[test]
+    fn what_its_owner_still_wants_is_refused_unless_the_caller_takes_it() {
+        let fixture = Fixture::target();
+        let candidate = discovered(&fixture, &measured(100));
+        let settled_only = Mandate {
+            tiers: TierGrant::ROUTINE,
+            settlements: Admits::Settled,
+        };
+        let ask = |mandate: &Mandate| {
+            recheck(
+                &fixture.site(),
+                &Recheck {
+                    mandate,
+                    recorded: &candidate,
+                    identity: IDENTITY,
+                    ownership: &Ownership::Nothing,
+                    liveness: &Liveness::Free,
+                },
+            )
+        };
+        assert!(matches!(
+            ask(&settled_only),
+            Err(Rejection::Owned {
+                settlement: Settlement::Unclaimed,
+                ..
+            })
+        ));
+        ask(&Mandate::default()).unwrap();
+    }
+
+    #[test]
+    fn a_target_that_stopped_declaring_itself_is_refused_on_recheck() {
+        let mut declared = Fixture::target();
+        let mut child = Entries::default();
+        child.file(b".rustc_info.json");
+        child.dir(b"debug");
+        let mut parent = Entries::default();
+        parent.file(b"Cargo.toml");
+        declared.listing = Listing::new(parent, child, Tags::cache(CacheTag::Absent));
+        let candidate = discovered(&declared, &measured(100));
+        assert_eq!(candidate.provenance(), Provenance::Declared);
+        let inferred = Fixture::target();
+        let mandate = Mandate::default();
+        let result = recheck(
+            &inferred.site(),
+            &Recheck {
+                mandate: &mandate,
+                recorded: &candidate,
+                identity: IDENTITY,
+                ownership: &Ownership::Nothing,
+                liveness: &Liveness::Free,
+            },
+        );
+        assert!(matches!(result, Err(Rejection::ProvenanceChanged { .. })));
+    }
+
+    #[test]
     fn a_changed_kind_is_refused_on_recheck() {
         let fixture = Fixture::target();
         let measurement = measured(100);

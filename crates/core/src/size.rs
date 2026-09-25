@@ -197,4 +197,10 @@ mod tests {
         assert_eq!(Bytes(1).saturating_sub(Bytes(2)), Bytes::ZERO);
         assert_eq!(Bytes::total([Bytes(1), Bytes(2), Bytes::MAX]), Bytes::MAX);
     }
+
+    #[test]
+    fn a_fraction_longer_than_any_scale_overflows() {
+        let long = alloc::format!("1.{}", "0".repeat(40));
+        assert_eq!(long.parse::<Bytes>(), Err(SizeError::Overflow));
+    }
 }

@@ -590,4 +590,66 @@ mod tests {
             assert_eq!(tier.as_str().parse::<Tier>(), Ok(*tier));
         }
     }
+
+    #[test]
+    fn an_owner_marker_declares_its_directory() {
+        let listing = Listing::new(
+            Entries::default(),
+            Entries::default(),
+            Tags {
+                cache: CacheTag::Absent,
+                owner: OwnerTag::Scratch,
+            },
+        );
+        let identified = listing
+            .identify(&Name::new(b"run", Syntax::Unix).unwrap())
+            .unwrap();
+        assert_eq!(identified.kind, Kind::OwnedScratch);
+        assert_eq!(identified.provenance, Provenance::Declared);
+    }
+
+    #[test]
+    fn a_unity_folder_needs_both_project_folders_and_its_own_name() {
+        let unity = entries(&[], &["Assets", "ProjectSettings"]);
+        for (parent, name, expected) in [
+            (unity.clone(), "Library", Some(Kind::UnityOutput)),
+            (entries(&[], &["Assets"]), "Library", None),
+            (entries(&[], &["ProjectSettings"]), "Library", None),
+            (unity, "Packages", None),
+        ] {
+            assert_eq!(
+                identify(name, parent, Entries::default(), CacheTag::Absent)
+                    .map(|found| found.kind),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_virtual_environment_needs_a_python_project_and_its_own_config() {
+        let config = entries(&["pyvenv.cfg"], &[]);
+        for (parent, child, expected) in [
+            (
+                entries(&["pyproject.toml"], &[]),
+                config.clone(),
+                Some(Kind::PythonVenv),
+            ),
+            (entries(&["pyproject.toml"], &[]), Entries::default(), None),
+            (Entries::default(), config, None),
+        ] {
+            assert_eq!(
+                identify(".venv", parent, child, CacheTag::Absent).map(|found| found.kind),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_listing_holds_only_the_files_it_was_given() {
+        let listing = entries(&["Cargo.toml"], &["src"]);
+        assert!(listing.has_file("cargo.toml"));
+        assert!(!listing.has_file("src"));
+        assert!(!listing.has_file("pom.xml"));
+    }
 }

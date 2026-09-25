@@ -31,6 +31,10 @@
 
 - Real deletion happens only under temporary directories inside the repository (`testkit::tempdir`).
 - OS differences go through `testkit` (`Built::Unavailable`), never `#[cfg]` on a test.
+- Every surviving mutant is either a missing test or a claim with a reason in `.rust-mutants.toml`.
+  `question-to-unwrap` is not measured: it turns a reported refusal into a panic, and both stop before anything changes.
+  `ignore-question-statement` and `return-ok-default` are, because they turn a failure into success.
+- CI measures mutants on btrfs so sharing runs; `STORAGE_SCOUT_REQUIRE_SHARING=1` makes the sharing tests fail instead of skipping.
 
 ```sh
 mise run check     # fmt, clippy, gates, pure, tests, doctests

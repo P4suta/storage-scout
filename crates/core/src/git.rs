@@ -28,18 +28,18 @@ pub fn status(output: &[u8]) -> Result<Status, Unparsable> {
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
     {
-        let Some(header) = record.strip_prefix(b"# ") else {
-            changes = Changes::Dirty;
-            continue;
-        };
-        let header = text(header)?;
-        let (key, value) = header.split_once(' ').ok_or(Unparsable)?;
-        match key {
-            "branch.oid" if value != "(initial)" => commit = Some(String::from(value)),
-            "branch.head" => name = Some(String::from(value)),
-            "branch.upstream" => upstream = Some(String::from(value)),
-            "branch.ab" => tracked = true,
-            _ => {},
+        match record.strip_prefix(b"# ") {
+            None => changes = Changes::Dirty,
+            Some(header) => {
+                let (key, value) = text(header)?.split_once(' ').ok_or(Unparsable)?;
+                match key {
+                    "branch.oid" if value != "(initial)" => commit = Some(String::from(value)),
+                    "branch.head" => name = Some(String::from(value)),
+                    "branch.upstream" => upstream = Some(String::from(value)),
+                    "branch.ab" => tracked = true,
+                    _ => {},
+                }
+            },
         }
     }
     let head = match name.ok_or(Unparsable)? {
@@ -100,7 +100,7 @@ pub fn commits(output: &[u8]) -> Result<Vec<String>, Unparsable> {
 #[cfg(test)]
 mod tests {
     use alloc::borrow::ToOwned;
-    use alloc::vec;
+    use alloc::{format, vec};
 
     use super::*;
 
@@ -170,5 +170,22 @@ mod tests {
             Ok(vec![sha.to_owned()])
         );
         assert_eq!(commits(b"not a sha\n"), Err(Unparsable));
+    }
+
+    #[test]
+    fn an_unborn_branch_has_no_commit() {
+        let output = b"# branch.oid (initial)\0# branch.head main\0";
+        assert_eq!(status(output).unwrap().commit, None);
+    }
+
+    #[test]
+    fn a_commit_is_forty_hexadecimal_digits_or_more() {
+        let hex = "1".repeat(40);
+        assert_eq!(commits(format!("{hex}\n").as_bytes()), Ok(vec![hex]));
+        assert_eq!(
+            commits(format!("{}\n", "g".repeat(40)).as_bytes()),
+            Err(Unparsable)
+        );
+        assert_eq!(commits(b"1111\n"), Err(Unparsable));
     }
 }

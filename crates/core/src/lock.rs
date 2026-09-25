@@ -55,3 +55,16 @@ pub enum Liveness {
     Held { lock: Location, protocol: Protocol },
     Unknown { lock: Location, protocol: Protocol },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_known_lock_names_are_locks() {
+        assert_eq!(Protocol::of(b".cargo-lock"), Some(Protocol::Cargo));
+        assert_eq!(Protocol::of(b"owner.lock"), Some(Protocol::TempOwner));
+        assert_eq!(Protocol::of(b"owner.json"), None);
+        assert_eq!(Protocol::of(b"Cargo.lock"), None);
+    }
+}

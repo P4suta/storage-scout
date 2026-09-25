@@ -241,6 +241,68 @@ pub fn symlink_file(link: &Path, target: &Path) -> Built {
     }
 }
 
+fn command_built(path: &Path, program: &str, args: &[&str]) -> Built {
+    match Command::new(program).args(args).arg(path).status() {
+        Ok(status) if status.success() => Built::Yes(path.to_path_buf()),
+        Ok(status) => Built::Unavailable(format!("{program} exited with {status}")),
+        Err(error) => Built::Unavailable(format!("{program}: {error}")),
+    }
+}
+
+#[must_use]
+pub fn set_xattr(path: &Path, name: &str, value: &str) -> Built {
+    if cfg!(target_os = "macos") {
+        command_built(path, "xattr", &["-w", name, value])
+    } else if cfg!(target_os = "linux") {
+        let name = format!("user.{name}");
+        command_built(path, "setfattr", &["-n", &name, "-v", value])
+    } else {
+        Built::Unavailable(String::from("no extended attribute tool on this platform"))
+    }
+}
+
+#[cfg(unix)]
+#[must_use]
+#[expect(clippy::unnecessary_wraps, reason = "only Unix files have a group")]
+pub fn group_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(
+        fs::metadata(path)
+            .expect("a file to read the group of")
+            .gid(),
+    )
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub const fn group_of(_path: &Path) -> Option<u32> {
+    None
+}
+
+#[must_use]
+pub fn other_group(path: &Path) -> Built {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = match fs::metadata(path) {
+            Ok(metadata) => metadata.gid().to_string(),
+            Err(error) => return Built::Unavailable(error.to_string()),
+        };
+        let groups = match Command::new("id").arg("-G").output() {
+            Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+            Err(error) => return Built::Unavailable(error.to_string()),
+        };
+        match groups.split_whitespace().find(|group| *group != current) {
+            Some(group) => command_built(path, "chgrp", &[group]),
+            None => Built::Unavailable(String::from("this user belongs to one group")),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Built::Unavailable(format!("{} has no group on this platform", path.display()))
+    }
+}
+
 #[must_use]
 pub fn hard_link(link: &Path, target: &Path) -> Built {
     if let Some(parent) = link.parent() {

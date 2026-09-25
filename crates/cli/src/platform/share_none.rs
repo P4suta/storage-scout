@@ -13,12 +13,8 @@ fn unsupported() -> io::Error {
     io::Error::from(io::ErrorKind::Unsupported)
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the signature is shared with platforms that can fail"
-)]
-pub(super) const fn filesystem(_path: &Path) -> io::Result<Filesystem> {
-    Ok(Filesystem::Other)
+pub(super) fn filesystem(path: &Path) -> io::Result<Filesystem> {
+    std::fs::symlink_metadata(path).map(|_| Filesystem::Other)
 }
 
 pub(super) fn facts(_path: &Path, _metadata: &Metadata) -> io::Result<FileFacts> {

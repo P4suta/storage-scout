@@ -257,6 +257,67 @@ fn a_target_with_a_directory_that_cannot_be_read_is_left_whole() {
 }
 
 #[test]
+fn only_a_regular_lock_file_holds_a_target() {
+    let temp = tempdir("dedupe-linked-lock");
+    let root = temp.path();
+    let a = project(root, "a");
+    let b = project(root, "b");
+    write_patterned(&a.join(RLIB), LEN, 16);
+    write_patterned(&b.join(RLIB), LEN, 16);
+    let elsewhere = root.join("elsewhere.lock");
+    write_sized(&elsewhere, 0);
+    let Built::Yes(_) = testkit::symlink_file(&b.join("debug/.cargo-build-lock"), &elsewhere)
+    else {
+        return;
+    };
+    if capable(root).is_none() {
+        return;
+    }
+    let holder = File::open(&elsewhere).unwrap();
+    holder.lock().unwrap();
+    let run = dedupe(root, Mode::DryRun);
+    assert_eq!(statuses(&run), vec![&PairStatus::WouldShare], "{run:#?}");
+}
+
+#[test]
+fn extended_attributes_decide_whether_a_replacement_would_be_faithful() {
+    let temp = tempdir("dedupe-xattr");
+    let root = temp.path();
+    let a = project(root, "a");
+    let b = project(root, "b");
+    let c = project(root, "c");
+    for target in [&a, &b, &c] {
+        write_patterned(&target.join(RLIB), LEN, 17);
+    }
+    if capable(root) != Some(Method::CloneAndSwap) {
+        return;
+    }
+    for (target, value) in [(&a, "one"), (&b, "one"), (&c, "two")] {
+        let Built::Yes(_) = testkit::set_xattr(&target.join(RLIB), "storage-scout.test", value)
+        else {
+            return;
+        };
+    }
+    let run = dedupe(root, Mode::DryRun);
+    let mut found = statuses(&run)
+        .into_iter()
+        .map(|status| format!("{status:?}"))
+        .collect::<Vec<_>>();
+    found.sort();
+    let mut expected = [
+        PairStatus::WouldShare,
+        PairStatus::Refused {
+            refusal: Refusal::AttributesDiffer,
+        },
+    ]
+    .iter()
+    .map(|status| format!("{status:?}"))
+    .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(found, expected, "{run:#?}");
+}
+
+#[test]
 fn a_cache_whose_writer_takes_no_lock_is_never_rewritten() {
     let temp = tempdir("dedupe-protocol");
     let root = temp.path();

@@ -214,3 +214,51 @@ impl Protection {
         self.contains(left, right) || self.contains(right, left)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+    use crate::location::Syntax;
+
+    fn at(syntax: Syntax, raw: &str) -> Location {
+        Location::parse_str(syntax, raw).unwrap()
+    }
+
+    #[test]
+    fn a_table_is_written_in_one_syntax() {
+        let unix = |raw| at(Syntax::Unix, raw);
+        let windows = |raw| at(Syntax::Windows, raw);
+        assert!(matches!(
+            Protection::new(
+                Syntax::Unix,
+                Case::Sensitive,
+                windows(r"C:\x"),
+                unix("/bin/x"),
+                vec![]
+            ),
+            Err(ProtectionError::CurrentDirectory(Syntax::Unix))
+        ));
+        assert!(matches!(
+            Protection::new(
+                Syntax::Unix,
+                Case::Sensitive,
+                unix("/x"),
+                windows(r"C:\x"),
+                vec![]
+            ),
+            Err(ProtectionError::Executable(Syntax::Unix))
+        ));
+        let rule = Rule::app_owned("~/Library", unix("/lib"), Reach::Subtree);
+        let protection = Protection::new(
+            Syntax::Unix,
+            Case::Sensitive,
+            unix("/x"),
+            unix("/bin/x"),
+            vec![rule],
+        )
+        .unwrap();
+        assert_eq!(protection.rules().len(), 1);
+    }
+}

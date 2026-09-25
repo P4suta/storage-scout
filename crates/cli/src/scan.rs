@@ -180,15 +180,12 @@ pub(crate) fn scan(options: &ScanOptions, protection: &Protection, owners: &Owne
             .map(|(path, _)| enter(path, &collector))
             .reduce(|| Tally::empty(options.measure), Tally::merge)
     };
-    let pool = options
-        .threads
-        .filter(|threads| *threads > 0)
-        .and_then(
-            |threads| match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-                Ok(pool) => Some(pool),
-                Err(_unbuildable) => None,
-            },
-        );
+    let pool = options.threads.and_then(|threads| {
+        match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+            Ok(pool) => Some(pool),
+            Err(_unbuildable) => None,
+        }
+    });
     let total = match pool {
         Some(pool) => pool.install(walk_all),
         None => walk_all(),
@@ -240,41 +237,46 @@ fn drain<T>(values: Mutex<Vec<T>>) -> Vec<T> {
     }
 }
 
+fn accepted(root: &Path, collector: &Collector<'_>) -> Option<(PathBuf, Location)> {
+    let observed = match observe::observe(root) {
+        Ok(observed) => observed,
+        Err(rejection) => {
+            collector.issue(rejection);
+            return None;
+        },
+    };
+    match observed.shape {
+        Shape::Directory => Some((observed.path, observed.location)),
+        Shape::Link => {
+            collector.issue(Rejection::Link {
+                location: observed.location,
+            });
+            None
+        },
+        Shape::File | Shape::Other => {
+            collector.issue(Rejection::NotADirectory {
+                location: observed.location,
+            });
+            None
+        },
+    }
+}
+
 fn roots(options: &ScanOptions, collector: &Collector<'_>) -> Vec<(PathBuf, Location)> {
     let mut roots: Vec<(PathBuf, Location)> = Vec::new();
-    for root in &options.roots {
-        let observed = match observe::observe(root) {
-            Ok(observed) => observed,
-            Err(rejection) => {
-                collector.issue(rejection);
-                continue;
-            },
-        };
-        match observed.shape {
-            Shape::Directory => {},
-            Shape::Link => {
-                collector.issue(Rejection::Link {
-                    location: observed.location,
-                });
-                continue;
-            },
-            Shape::File | Shape::Other => {
-                collector.issue(Rejection::NotADirectory {
-                    location: observed.location,
-                });
-                continue;
-            },
-        }
-        let location = observed.location;
-        if collector.excluded(&location)
+    for (path, location) in options
+        .roots
+        .iter()
+        .filter_map(|root| accepted(root, collector))
+    {
+        let covered = collector.excluded(&location)
             || roots
                 .iter()
-                .any(|(_, existing)| collector.protection.contains(existing, &location))
-        {
-            continue;
+                .any(|(_, existing)| collector.protection.contains(existing, &location));
+        if !covered {
+            roots.retain(|(_, existing)| !collector.protection.contains(&location, existing));
+            roots.push((path, location));
         }
-        roots.retain(|(_, existing)| !collector.protection.contains(&location, existing));
-        roots.push((observed.path, location));
     }
     roots
 }
@@ -436,47 +438,51 @@ fn read(directory: &Path, metadata: &Metadata, collector: &Collector<'_>) -> Opt
         names: Entries::default(),
     };
     for entry in reader {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                collector.issue(failure::io(directory, FsOp::ReadEntry, &error));
-                continue;
-            },
-        };
-        let path = entry.path();
-        let child = match fs::symlink_metadata(&path) {
-            Ok(child) => child,
-            Err(error) => {
-                collector.issue(failure::io(&path, FsOp::Metadata, &error));
-                continue;
-            },
-        };
-        let name = entry.file_name();
-        match platform::shape(&child) {
-            Shape::Link => {
-                collector.links_skipped.fetch_add(1, Ordering::Relaxed);
-            },
-            Shape::Directory => {
-                if let (Some(from), Some(to)) =
-                    (platform::device(metadata), platform::device(&child))
-                    && from != to
-                {
-                    collector
-                        .mount_boundaries_skipped
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                contents.names.dir(name.as_encoded_bytes());
-                contents.directories.push((path, child));
-            },
-            Shape::File => {
-                contents.names.file(name.as_encoded_bytes());
-                contents.files.push((path, child));
-            },
-            Shape::Other => {},
+        match entry {
+            Ok(entry) => admit_entry(&entry, metadata, &mut contents, collector),
+            Err(error) => collector.issue(failure::io(directory, FsOp::ReadEntry, &error)),
         }
     }
     Some(contents)
+}
+
+fn admit_entry(
+    entry: &fs::DirEntry,
+    metadata: &Metadata,
+    contents: &mut Contents,
+    collector: &Collector<'_>,
+) {
+    let path = entry.path();
+    let child = match fs::symlink_metadata(&path) {
+        Ok(child) => child,
+        Err(error) => {
+            collector.issue(failure::io(&path, FsOp::Metadata, &error));
+            return;
+        },
+    };
+    let name = entry.file_name();
+    match platform::shape(&child) {
+        Shape::Link => {
+            collector.links_skipped.fetch_add(1, Ordering::Relaxed);
+        },
+        Shape::Directory => {
+            if let (Some(from), Some(to)) = (platform::device(metadata), platform::device(&child))
+                && from != to
+            {
+                collector
+                    .mount_boundaries_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            contents.names.dir(name.as_encoded_bytes());
+            contents.directories.push((path, child));
+        },
+        Shape::File => {
+            contents.names.file(name.as_encoded_bytes());
+            contents.files.push((path, child));
+        },
+        Shape::Other => {},
+    }
 }
 
 fn files(files: &[(PathBuf, Metadata)], collector: &Collector<'_>) -> Tally {

@@ -141,13 +141,6 @@ fn failed(step: Step) -> impl Fn(io::Error) -> Failure {
     }
 }
 
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "const only where nothing is shared"
-    )
-)]
 pub(crate) fn filesystem(path: &Path) -> io::Result<Filesystem> {
     share::filesystem(path)
 }
@@ -180,5 +173,274 @@ impl Tree {
 
     pub(crate) fn share(&self, method: Method, request: &Request<'_>) -> Result<(), Failure> {
         share::share(&self.0, method, request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use storage_scout_core::share::{Capability, Failure, Method, Step};
+    use testkit::{Built, Scratch, write_patterned};
+
+    use super::*;
+
+    const LEN: u64 = 128 * 1024;
+
+    struct Fixture {
+        _temp: Scratch,
+        root: PathBuf,
+        keeper: PathBuf,
+        keeper_identity: Identity,
+        tree: Tree,
+        method: Method,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Option<Self> {
+            let temp = testkit::tempdir(name);
+            let root = temp.path().join("root");
+            let keeper = temp.path().join("keeper.bin");
+            write_patterned(&keeper, LEN, 1);
+            write_patterned(&root.join("sub/dup.bin"), LEN, 1);
+            match Capability::of(filesystem(&root).unwrap()) {
+                Capability::Shares { method, .. } => Some(Self {
+                    keeper_identity: identity(&keeper).unwrap(),
+                    tree: Tree::open(&root, identity(&root).unwrap()).unwrap(),
+                    _temp: temp,
+                    root,
+                    keeper,
+                    method,
+                }),
+                Capability::Unsupported { filesystem } => {
+                    let _skipped = Built::Unavailable(filesystem.to_string())
+                        .or_skip("a volume that shares blocks");
+                    None
+                },
+            }
+        }
+
+        fn identity_of(&self, duplicate: &Path) -> Identity {
+            identity(&self.root.join(duplicate)).unwrap()
+        }
+
+        fn share(&self, duplicate: &Path) -> Result<(), Failure> {
+            self.share_as(duplicate, self.identity_of(duplicate), LEN)
+        }
+
+        fn share_as(
+            &self,
+            duplicate: &Path,
+            identified: Identity,
+            len: u64,
+        ) -> Result<(), Failure> {
+            self.tree.share(
+                self.method,
+                &Request {
+                    keeper: &self.keeper,
+                    keeper_identity: self.keeper_identity,
+                    duplicate,
+                    duplicate_identity: identified,
+                    len,
+                },
+            )
+        }
+    }
+
+    fn dup() -> &'static Path {
+        Path::new("sub/dup.bin")
+    }
+
+    #[test]
+    fn what_is_missing_or_not_a_file_is_an_error_not_a_guess() {
+        let temp = testkit::tempdir("platform-missing");
+        let missing = temp.path().join("missing");
+        let _absent = open_regular(&missing).unwrap_err();
+        let _directory = open_regular(temp.path()).unwrap_err();
+        let _unmeasured = free_space(&missing).unwrap_err();
+        let _untyped = filesystem(&missing).unwrap_err();
+        assert!(matches!(
+            Tree::open(&missing, identity(temp.path()).unwrap()),
+            Err(WalkError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn a_tree_opens_only_as_the_directory_it_was_cleared_as() {
+        let temp = testkit::tempdir("platform-tree");
+        write_patterned(&temp.path().join("one/file"), 1, 1);
+        write_patterned(&temp.path().join("two/file"), 1, 1);
+        let other = identity(&temp.path().join("two")).unwrap();
+        assert!(matches!(
+            Tree::open(&temp.path().join("one"), other),
+            Err(WalkError::Moved { .. })
+        ));
+    }
+
+    #[test]
+    fn metadata_names_the_same_file_and_volume_as_a_handle() {
+        let temp = testkit::tempdir("platform-identity");
+        let path = temp.path().join("file");
+        write_patterned(&path, 16, 1);
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        if testkit::reports_devices() {
+            let expected = identity(&path).unwrap();
+            assert_eq!(identity_of_metadata(&metadata), Some(expected));
+            assert_eq!(device(&metadata), Some(expected.volume));
+            assert_eq!(file_measure(&path).unwrap().identity, expected);
+        }
+    }
+
+    #[test]
+    fn a_keeper_or_duplicate_that_is_not_the_planned_file_is_left_alone() {
+        let Some(fixture) = Fixture::new("platform-changed") else {
+            return;
+        };
+        let wrong = identity(&fixture.keeper).unwrap();
+        assert_eq!(
+            fixture.share_as(dup(), wrong, LEN),
+            Err(Failure::DuplicateChanged)
+        );
+        let right = identity(&fixture.root.join(dup())).unwrap();
+        assert_eq!(
+            fixture.share_as(dup(), right, LEN + 1),
+            Err(Failure::KeeperChanged)
+        );
+        assert_eq!(
+            fixture.share_as(Path::new("../keeper.bin"), right, LEN),
+            Err(Failure::DuplicateChanged)
+        );
+        assert_eq!(
+            fixture.share_as(Path::new("sub/missing.bin"), right, LEN),
+            Err(Failure::DuplicateChanged)
+        );
+        fixture.share(dup()).unwrap();
+    }
+
+    #[test]
+    fn a_duplicate_reached_through_a_link_is_left_alone() {
+        let Some(fixture) = Fixture::new("platform-link") else {
+            return;
+        };
+        let Built::Yes(_) =
+            testkit::link_dir(&fixture.root.join("linked"), &fixture.root.join("sub"))
+        else {
+            return;
+        };
+        let right = identity(&fixture.root.join(dup())).unwrap();
+        assert_eq!(
+            fixture.share_as(Path::new("linked/dup.bin"), right, LEN),
+            Err(Failure::DuplicateChanged)
+        );
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_opened_is_reported_not_skipped() {
+        let Some(fixture) = Fixture::new("platform-sealed") else {
+            return;
+        };
+        let right = identity(&fixture.root.join(dup())).unwrap();
+        let Some(restricted) = testkit::restrict(&fixture.root.join("sub"), 0o000) else {
+            return;
+        };
+        let result = fixture.share_as(dup(), right, LEN);
+        drop(restricted);
+        assert!(
+            matches!(
+                result,
+                Err(Failure::Io {
+                    step: Step::Open,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn bytes_that_differ_at_the_last_moment_are_not_shared() {
+        let Some(fixture) = Fixture::new("platform-differs") else {
+            return;
+        };
+        write_patterned(&fixture.root.join(dup()), LEN, 2);
+        assert_eq!(fixture.share(dup()), Err(Failure::ContentDiffers));
+        assert_ne!(
+            fs::read(&fixture.keeper).unwrap(),
+            fs::read(fixture.root.join(dup())).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_duplicate_a_replacement_would_change_is_refused_only_when_replacing() {
+        for (name, change) in [("linked", 0), ("executable", 1)] {
+            let Some(fixture) = Fixture::new(&format!("platform-{name}")) else {
+                return;
+            };
+            let path = fixture.root.join(dup());
+            let built = if change == 0 {
+                testkit::hard_link(&fixture.root.join("second.bin"), &path)
+            } else {
+                testkit::executable(&path)
+            };
+            let Built::Yes(_) = built else {
+                return;
+            };
+            let expected = match fixture.method {
+                Method::CloneAndSwap => Err(Failure::DuplicateChanged),
+                Method::DedupeRange => Ok(()),
+            };
+            assert_eq!(fixture.share(dup()), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn extended_attributes_that_differ_are_never_merged() {
+        let Some(fixture) = Fixture::new("platform-xattr") else {
+            return;
+        };
+        if fixture.method != Method::CloneAndSwap {
+            return;
+        }
+        let Built::Yes(_) = testkit::set_xattr(&fixture.keeper, "storage-scout.test", "one") else {
+            return;
+        };
+        let Built::Yes(_) =
+            testkit::set_xattr(&fixture.root.join(dup()), "storage-scout.test", "two")
+        else {
+            return;
+        };
+        assert_eq!(fixture.share(dup()), Err(Failure::DuplicateChanged));
+    }
+
+    #[test]
+    fn a_leftover_of_another_size_is_never_taken_for_the_original() {
+        let Some(fixture) = Fixture::new("platform-leftover") else {
+            return;
+        };
+        if fixture.method != Method::CloneAndSwap {
+            return;
+        }
+        let leftover = fixture.root.join(format!(
+            "sub/.dup.bin{}",
+            storage_scout_core::share::TEMPORARY_SUFFIX
+        ));
+        write_patterned(&leftover, LEN / 2, 1);
+        assert_eq!(fixture.share(dup()), Err(Failure::Leftover));
+        testkit::assert_present(&leftover);
+    }
+
+    #[test]
+    fn a_duplicate_in_another_group_keeps_its_group() {
+        let Some(fixture) = Fixture::new("platform-group") else {
+            return;
+        };
+        let path = fixture.root.join(dup());
+        let Built::Yes(_) = testkit::other_group(&path) else {
+            return;
+        };
+        let before = testkit::group_of(&path);
+        fixture.share(dup()).unwrap();
+        assert_eq!(testkit::group_of(&path), before);
     }
 }
