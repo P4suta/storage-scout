@@ -2,7 +2,16 @@
 
 Disk-usage scanner and safety-first build-artifact cleaner for Windows, macOS, and Linux.
 
-It deletes what its owner has let go of, and nothing is decided by time: no ages, no mtimes, no schedules.
+It removes waste the moment it is waste, and nothing else.
+Nothing is decided by time or by how full the disk is: no ages, no mtimes, no schedules, no thresholds.
+
+Waste is only what facts prove:
+
+- a cache whose owner let it go, or whose worktree's work has landed (reaped whole);
+- a file the tool that wrote it will never read again (pruned);
+- bytes that already exist elsewhere on the volume (shared, losslessly).
+
+Anything someone still owns is never deleted, however full the disk gets.
 
 ## Install
 
@@ -16,13 +25,15 @@ cargo install --locked --path crates/cli
 storage-scout scan ~/projects                     # usage report, with each artifact's owner
 storage-scout clean ~/projects                    # pick artifacts to delete (dry-run by default)
 storage-scout clean ~/projects --id <ID> --execute --yes
+storage-scout prune ~/projects                    # remove files rustc never reads again (dry-run by default)
 storage-scout dedupe ~/projects                   # share identical files between build outputs (dry-run by default)
-storage-scout auto --execute                      # reap, share, and evict per ~/.config/storage-scout/auto.toml
+storage-scout auto --execute                      # reap, prune, and share once, per ~/.config/storage-scout/auto.toml
+storage-scout watch                               # stay resident and do the same the moment something changes
 storage-scout explain <PATH> --phase reap         # why a directory is or is not deleted
 storage-scout doctor                              # what this host protects
 ```
 
-Add `--json` for machine-readable output (`schema_version: 2`).
+Add `--json` for machine-readable output (`schema_version: 3`).
 
 ## Who owns an artifact
 
@@ -34,19 +45,30 @@ Add `--json` for machine-readable output (`schema_version: 2`).
 | `kept` | a marker says a person kept it |
 | `unclaimed` | nothing claims it |
 
-`auto` always reaps `released` and `landed` artifacts.
-When a `[trigger]` is set and free space is below `min_free`, it first shares identical files, then evicts `active` and `unclaimed` artifacts that nothing holds, cheapest to regenerate and largest first, measuring free space after each one until `target_free`.
-`kept` is never deleted by `auto`.
+`auto` and `watch` reap `released` and `landed` artifacts; `active`, `unclaimed`, and `kept` ones are never deleted.
+A marker inside a directory protects it while its lock is held or it is kept, and never releases it.
+The policy only says where to look:
 
 ```toml
-[trigger]            # optional: without it, auto only reaps
-volume = "/"
-min_free = "40GiB"
-target_free = "80GiB"
-
 [select]
 roots = ["/Users/me/projects"]
+
+[report]
+log_file = "/Users/me/.local/state/storage-scout/auto.jsonl"
 ```
+
+## Pruning what rustc never reads again
+
+Inside a Cargo target that is still in use, these files are dead by rustc's own rules:
+
+| Rule | What |
+|---|---|
+| `stale-object` | a debug object in `deps/`, `examples/`, or `build/*/` from an earlier rustc run, that the unit's linked image no longer names (macOS keeps these for the debugger) |
+| `superseded-session` | an incremental session older than the one rustc loads next; rustc deletes it itself the next time it compiles that crate |
+| `abandoned-session` | an incremental session whose rustc ended before finishing it |
+
+Every cargo lock in the target is held while it is pruned, each session is taken under rustc's own session lock, and each file is re-identified by handle before it is removed.
+A unit whose image cannot be read keeps all its objects.
 
 ## Sharing identical files
 
@@ -66,8 +88,16 @@ Parallel worktrees build the same dependencies into separate `target/` directori
 
 ## Running on events
 
-`auto` is meant to be started by events, not a schedule.
-From git hooks:
+`watch` is the resident form: run it as a login agent (launchd, systemd `--user`).
+It keeps the candidates and their files in memory and reacts only to what changed:
+
+- a write inside a cache waits for the cache's writer to release its lock, then prunes and shares that cache's new files;
+- an owner releasing its lock reaps what it owned;
+- a new directory is looked at when it appears.
+
+Filesystem events come from FSEvents on macOS and inotify on Linux; Windows has no watcher yet.
+
+Ownership that only git knows changes through git, so hooks tell the watcher:
 
 ```sh
 storage-scout auto --execute --detach --event post-merge -- "$@"
@@ -75,7 +105,8 @@ storage-scout auto --execute --detach --event post-checkout -- "$@"
 storage-scout auto --execute --detach --event reference-transaction -- "$@"   # stdin forwarded
 ```
 
-Irrelevant events exit at once, and concurrent runs coalesce into one.
+Irrelevant events exit at once.
+When a watcher is running, a hook only raises its flag; otherwise it starts one full `auto` run, and concurrent runs coalesce into one.
 
 ## Safety
 

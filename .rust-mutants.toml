@@ -11,7 +11,10 @@ include = [
   "crates/cli/src/coalesce.rs",
   "crates/cli/src/dedupe.rs",
   "crates/cli/src/dedupe/*.rs",
+  "crates/cli/src/prune.rs",
+  "crates/cli/src/prune/*.rs",
   "crates/cli/src/scan.rs",
+  "crates/cli/src/watch.rs",
   "crates/cli/src/platform/*.rs",
 ]
 
