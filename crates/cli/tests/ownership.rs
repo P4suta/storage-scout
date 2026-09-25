@@ -293,8 +293,12 @@ fn a_repository_that_names_no_default_branch_keeps_its_work_and_says_why() {
         .find(|each| each.path() == canonical)
         .unwrap();
     assert_eq!(found.candidate().settlement(), Settlement::Active);
-    let basis = serde_json::to_string(found.candidate().ownership()).unwrap();
-    assert!(basis.contains("no-default-branch"), "{basis}");
+    let basis = serde_json::to_value(found.candidate().ownership()).unwrap();
+    assert_eq!(
+        basis.pointer("/worktree/landing/landing"),
+        Some(&serde_json::Value::from("no-default-branch")),
+        "{basis}"
+    );
 }
 
 #[test]
@@ -359,8 +363,9 @@ fn a_worktree_git_refuses_to_read_keeps_its_work_and_says_git_refused() {
         .find(|each| each.path() == canonical)
         .unwrap();
     assert_eq!(found.candidate().settlement(), Settlement::Active);
-    let basis = serde_json::to_string(found.candidate().ownership()).unwrap();
-    assert!(basis.contains("refused"), "{basis}");
+    let basis = serde_json::to_value(found.candidate().ownership()).unwrap();
+    assert_eq!(basis["worktree"]["failure"]["cause"], "refused", "{basis}");
+    assert_eq!(basis["worktree"]["failure"]["query"], "status", "{basis}");
 }
 
 #[test]
