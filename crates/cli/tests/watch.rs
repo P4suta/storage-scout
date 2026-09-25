@@ -220,3 +220,19 @@ fn a_cache_whose_key_is_gone_is_reaped_as_soon_as_a_hook_says_so() {
     }
     testkit::assert_absent(&cache);
 }
+
+#[test]
+fn writes_inside_a_cache_nobody_locks_change_nothing() {
+    let mut watching = Watching::start("watch-unlocked");
+    let cache = watching.root.join("cache");
+    testkit::write_cache_tag(&cache);
+    let started = watching.next();
+    assert!(started.starts_with("start: watching"), "{started}");
+    let debug = profile(&watching.root.clone(), "app");
+    write_sized(&cache.join("blob"), 4096);
+    let old = build(&debug, "one", "a");
+    let first = watching.next();
+    assert!(first.contains("pruned 1 entry"), "{first}");
+    testkit::assert_absent(&old);
+    testkit::assert_present(cache.join("blob"));
+}

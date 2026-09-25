@@ -171,6 +171,12 @@ impl Session<'_> {
             .map(Path::to_path_buf)
     }
 
+    fn written(&self, root: &Path) -> bool {
+        self.world
+            .get(root)
+            .is_some_and(|found| found.candidate().kind().protocol().is_some())
+    }
+
     fn record(&self, record: &WatchRecord) -> Result<(), WatchError> {
         if record.eventful() || record.cause == Cause::Start {
             self.hooks.record(record).map_err(WatchError::Record)?;
@@ -476,9 +482,10 @@ impl Session<'_> {
                         continue;
                     }
                     match self.owner(&directory) {
-                        Some(root) => {
+                        Some(root) if self.written(&root) => {
                             self.dirty.insert(root);
                         },
+                        Some(_) => {},
                         None => {
                             appeared.insert(directory);
                         },
