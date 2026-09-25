@@ -1,6 +1,6 @@
 mod capability;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -181,10 +181,7 @@ fn weight(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+        for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => pending.push(entry.path()),
                 Ok(kind) if kind.is_file() => {
@@ -213,27 +210,24 @@ fn sessions(root: &Path, profile: &Path, doomed: &mut Vec<Doomed>) {
         let names = listed(&directory, fs::FileType::is_dir);
         let parsed = names
             .iter()
-            .filter_map(|name| Session::parse(name.as_encoded_bytes()))
+            .filter_map(|name| name.to_str())
+            .filter_map(Session::parse)
             .collect::<Vec<Session<'_>>>();
         for (session, rule) in prune::doomed(&parsed) {
-            let lock_name = session.lock_name();
-            let (Some(name), Some(lock)) = (named(session.name), named(&lock_name)) else {
-                continue;
-            };
-            let path = directory.join(name);
-            let (Ok(identity), Some(relative)) = (platform::identity(&path), relative(root, &path))
-            else {
-                continue;
-            };
-            doomed.push(Doomed {
-                relative,
-                identity,
-                len: weight(&path),
-                rule,
-                doom: Doom::Session {
-                    lock: lock.to_os_string(),
-                },
-            });
+            let path = directory.join(session.name);
+            if let (Ok(identity), Some(relative)) =
+                (platform::identity(&path), relative(root, &path))
+            {
+                doomed.push(Doomed {
+                    relative,
+                    identity,
+                    len: weight(&path),
+                    rule,
+                    doom: Doom::Session {
+                        lock: OsString::from(session.lock_name()),
+                    },
+                });
+            }
         }
     }
 }
@@ -351,13 +345,13 @@ fn objects(root: &Path, profile: &Path, doomed: &mut Vec<Doomed>) -> u64 {
         let names = listed(&directory, fs::FileType::is_file);
         let parsed = names
             .iter()
-            .filter_map(|name| Object::parse(name.as_encoded_bytes()))
-            .collect::<Vec<Object<'_>>>();
-        let by_bytes = names
+            .filter_map(|name| Object::parse(name.as_encoded_bytes()).map(|object| (object, name)))
+            .collect::<Vec<_>>();
+        let objects = parsed
             .iter()
-            .map(|name| (name.as_encoded_bytes(), name.as_os_str()))
-            .collect::<BTreeMap<_, _>>();
-        for unit in prune::mixed(&parsed) {
+            .map(|(object, _)| *object)
+            .collect::<Vec<Object<'_>>>();
+        for unit in prune::mixed(&objects) {
             let references = match referenced(&directory, unit) {
                 None => continue,
                 Some(Err(_unreadable)) => {
@@ -366,26 +360,24 @@ fn objects(root: &Path, profile: &Path, doomed: &mut Vec<Doomed>) -> u64 {
                 },
                 Some(Ok(references)) => references,
             };
-            for stale in prune::stale(&parsed, unit, &references) {
-                let Some(name) = by_bytes.get(stale) else {
-                    continue;
-                };
+            for (_, name) in parsed
+                .iter()
+                .filter(|(object, _)| prune::stale(object, unit, &references))
+            {
                 let path = directory.join(name);
-                let (Ok(metadata), Some(relative)) =
-                    (fs::symlink_metadata(&path), relative(root, &path))
-                else {
-                    continue;
-                };
-                let Ok(identity) = platform::identity(&path) else {
-                    continue;
-                };
-                doomed.push(Doomed {
-                    relative,
-                    identity,
-                    len: metadata.len(),
-                    rule: Rule::StaleObject,
-                    doom: Doom::File,
-                });
+                if let (Ok(metadata), Some(relative), Ok(identity)) = (
+                    fs::symlink_metadata(&path),
+                    relative(root, &path),
+                    platform::identity(&path),
+                ) {
+                    doomed.push(Doomed {
+                        relative,
+                        identity,
+                        len: metadata.len(),
+                        rule: Rule::StaleObject,
+                        doom: Doom::File,
+                    });
+                }
             }
         }
     }

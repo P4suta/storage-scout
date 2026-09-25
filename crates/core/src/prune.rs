@@ -1,4 +1,5 @@
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use serde::Serialize;
@@ -6,7 +7,7 @@ use serde::Serialize;
 pub const OBJECT_SUFFIX: &[u8] = b".rcgu.o";
 pub const INCREMENTAL: &str = "incremental";
 pub const OBJECT_DIRECTORIES: [&str; 2] = ["deps", "examples"];
-pub const LOCK_SUFFIX: &[u8] = b".lock";
+pub const LOCK_SUFFIX: &str = ".lock";
 
 ordered! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -85,16 +86,8 @@ pub fn images(unit: &[u8]) -> [Vec<u8>; 2] {
 }
 
 #[must_use]
-pub fn stale<'a>(
-    objects: &[Object<'a>],
-    unit: &[u8],
-    referenced: &BTreeSet<Vec<u8>>,
-) -> Vec<&'a [u8]> {
-    objects
-        .iter()
-        .filter(|object| object.unit == unit && !referenced.contains(object.name))
-        .map(|object| object.name)
-        .collect()
+pub fn stale(object: &Object<'_>, unit: &[u8], referenced: &BTreeSet<Vec<u8>>) -> bool {
+    object.unit == unit && !referenced.contains(object.name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,8 +98,8 @@ pub enum Stage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Session<'a> {
-    pub name: &'a [u8],
-    pub lock: &'a [u8],
+    pub name: &'a str,
+    pub lock: &'a str,
     pub stage: Stage,
 }
 
@@ -126,22 +119,22 @@ fn base36(digits: &[u8]) -> Option<u128> {
 
 impl<'a> Session<'a> {
     #[must_use]
-    pub fn parse(name: &'a [u8]) -> Option<Self> {
-        let mut parts = name.split(|byte| *byte == b'-');
-        if parts.next()? != b"s" {
+    pub fn parse(name: &'a str) -> Option<Self> {
+        let mut parts = name.split('-');
+        if parts.next()? != "s" {
             return None;
         }
         let stamp = parts.next()?;
         let random = parts.next()?;
         let last = parts.next()?;
-        if parts.next().is_some() || base36(random).is_none() {
+        if parts.next().is_some() || base36(random.as_bytes()).is_none() {
             return None;
         }
-        let stamp = base36(stamp)?;
-        let stage = if last == b"working" {
+        let stamp = base36(stamp.as_bytes())?;
+        let stage = if last == "working" {
             Stage::Working
         } else {
-            base36(last)?;
+            base36(last.as_bytes())?;
             Stage::Finalized { stamp }
         };
         let lock = name.get(..name.len().checked_sub(last.len())?.checked_sub(1)?)?;
@@ -149,7 +142,7 @@ impl<'a> Session<'a> {
     }
 
     #[must_use]
-    pub fn lock_name(&self) -> Vec<u8> {
+    pub fn lock_name(&self) -> String {
         [self.lock, LOCK_SUFFIX].concat()
     }
 }
@@ -226,12 +219,16 @@ mod tests {
             b"c-3.x.one.rcgu.o",
         ]);
         let named = BTreeSet::from([b"b-2.x.two.rcgu.o".to_vec(), b"b-2.y.two.rcgu.o".to_vec()]);
+        let doomed = |referenced: &BTreeSet<Vec<u8>>| {
+            found
+                .iter()
+                .filter(|object| stale(object, b"b-2", referenced))
+                .map(|object| object.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(doomed(&named), vec![&b"b-2.x.one.rcgu.o"[..]]);
         assert_eq!(
-            stale(&found, b"b-2", &named),
-            vec![&b"b-2.x.one.rcgu.o"[..]]
-        );
-        assert_eq!(
-            stale(&found, b"b-2", &BTreeSet::new()),
+            doomed(&BTreeSet::new()),
             vec![
                 &b"b-2.x.one.rcgu.o"[..],
                 b"b-2.x.two.rcgu.o",
@@ -243,23 +240,23 @@ mod tests {
 
     #[test]
     fn a_session_name_carries_its_stage_and_lock() {
-        let finalized = Session::parse(b"s-hml9l00hya-1spx8v6-503beytbg5g2o7").unwrap();
-        assert_eq!(finalized.lock, b"s-hml9l00hya-1spx8v6");
-        assert_eq!(finalized.lock_name(), b"s-hml9l00hya-1spx8v6.lock");
+        let finalized = Session::parse("s-hml9l00hya-1spx8v6-503beytbg5g2o7").unwrap();
+        assert_eq!(finalized.lock, "s-hml9l00hya-1spx8v6");
+        assert_eq!(finalized.lock_name(), "s-hml9l00hya-1spx8v6.lock");
         assert!(matches!(finalized.stage, Stage::Finalized { .. }));
-        let working = Session::parse(b"s-hml9l00hya-1spx8v6-working").unwrap();
+        let working = Session::parse("s-hml9l00hya-1spx8v6-working").unwrap();
         assert_eq!(working.stage, Stage::Working);
-        assert_eq!(working.lock, b"s-hml9l00hya-1spx8v6");
+        assert_eq!(working.lock, "s-hml9l00hya-1spx8v6");
         for name in [
-            &b"s-hml9l00hya-1spx8v6.lock"[..],
-            b"s-hml9l00hya-1spx8v6",
-            b"s-hml9l00hya-1spx8v6-abc-def",
-            b"x-hml9l00hya-1spx8v6-abc",
-            b"s-HML9-1spx8v6-abc",
-            b"s--1spx8v6-abc",
-            b"s-a-b-",
-            b"s-a--c",
-            b"s-a-b-c!",
+            "s-hml9l00hya-1spx8v6.lock",
+            "s-hml9l00hya-1spx8v6",
+            "s-hml9l00hya-1spx8v6-abc-def",
+            "x-hml9l00hya-1spx8v6-abc",
+            "s-HML9-1spx8v6-abc",
+            "s--1spx8v6-abc",
+            "s-a-b-",
+            "s-a--c",
+            "s-a-b-c!",
         ] {
             assert_eq!(Session::parse(name), None, "{name:?}");
         }
@@ -277,16 +274,16 @@ mod tests {
         assert_eq!(base36(b"a{"), None);
     }
 
-    fn session(name: &'static [u8]) -> Session<'static> {
+    fn session(name: &'static str) -> Session<'static> {
         Session::parse(name).unwrap()
     }
 
     #[test]
     fn rustc_keeps_its_newest_session_and_drops_the_rest() {
-        let old = session(b"s-a1-x-aaa");
-        let new = session(b"s-b1-y-bbb");
-        let tied = session(b"s-b1-z-ccc");
-        let working = session(b"s-c1-w-working");
+        let old = session("s-a1-x-aaa");
+        let new = session("s-b1-y-bbb");
+        let tied = session("s-b1-z-ccc");
+        let working = session("s-c1-w-working");
         assert_eq!(
             doomed(&[new, working, old, tied]),
             vec![

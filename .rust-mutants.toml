@@ -433,38 +433,6 @@ original = "self.watcher.watch(&borrowed).map_err(WatchError::Events)"
 reason = "which directories are followed shows only in the events that arrive from them, which the watch integration tests wait on and measurement leaves out"
 outcome = "survived"
 
-[[mutation.expect]]
-path = "crates/cli/src/platform/events_macos.rs"
-item = "strings"
-rule = "condition-to-false"
-original = "string.is_null()"
-reason = "CFStringCreateWithBytes fails only when memory runs out, which no test can stage"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/platform/events_macos.rs"
-item = "Source::start"
-rule = "condition-to-false"
-original = "array.is_null()"
-reason = "CFArrayCreate fails only when memory runs out, which no test can stage"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/platform/events_macos.rs"
-item = "Source::start"
-rule = "condition-to-false"
-original = "stream.is_null()"
-reason = "FSEvents refuses a stream only for paths it cannot watch, and every root is canonicalized before it is asked"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/platform/events_macos.rs"
-item = "Source::start"
-rule = "condition-to-false"
-original = "unsafe { FSEventStreamStart(stream) } == 0"
-reason = "a stream scheduled on a queue starts, and no test can make FSEvents refuse it"
-outcome = "survived"
-
 [[mutation.skip]]
 path = "crates/cli/src/busy.rs"
 lines = "225-225"
@@ -487,23 +455,53 @@ reason = "the kernel reports progress for every range it accepts, so a zero neve
 
 [[mutation.skip]]
 path = "crates/cli/src/platform/unix.rs"
-lines = "237-237"
+lines = "232-232"
 reason = "fchmod by the owner of an open directory does not fail"
 
 [[mutation.skip]]
 path = "crates/cli/src/platform/unix.rs"
-lines = "265-269"
+lines = "260-264"
 reason = "only a mount point inside a tree differs in device, and the mount tests are left out of measurement"
 
 [[mutation.skip]]
 path = "crates/cli/src/platform/unix.rs"
-lines = "273-273"
+lines = "268-268"
 reason = "a directory replaced between listing and opening is a race no test can stage"
 
 [[mutation.skip]]
 path = "crates/cli/src/platform/unix.rs"
-lines = "451-451"
+lines = "446-446"
 reason = "a root replaced between emptying and removal is a race no test can stage"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/unix.rs"
+lines = "561-561"
+reason = "a session that vanishes between being emptied and being removed is a race no test can stage"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/unix.rs"
+lines = "568-568"
+reason = "a lock that vanishes between its session's removal and its own is a race no test can stage"
+
+[[mutation.skip]]
+path = "crates/cli/src/dedupe.rs"
+lines = "369-369"
+reason = "a file that changes between planning and sharing is a race no test can stage; the core decides what overtaken means and is tested there"
+
+[[mutation.skip]]
+path = "crates/cli/src/platform/events_linux.rs"
+lines = "130-130"
+reason = "inotify_add_watch fails otherwise only when the user's watches run out, which no test can stage"
+
+[[mutation.skip]]
+path = "crates/cli/src/watch.rs"
+item = "Session::reown"
+reason = "only a watcher that sees every directory calls it, and measurement runs on inotify"
+
+[[mutation.skip]]
+path = "crates/cli/src/watch.rs"
+lines = "344-344"
+reason = "only a watcher that sees every directory takes this branch, and measurement runs on inotify"
 
 [[mutation.skip]]
 path = "crates/cli/src/scan.rs"

@@ -908,6 +908,21 @@ mod tests {
                     ])
                     .unwrap();
                 assert!(session.world.contains_key(&root.join("aa/target")));
+
+                write_sized(&root.join("ab/Cargo.toml"), 1);
+                write_sized(&root.join("ac/Cargo.toml"), 1);
+                session.turn(vec![changed(root)]).unwrap();
+                let _ab = profile(root, "ab");
+                let _ac = profile(root, "ac");
+                session
+                    .turn(vec![
+                        changed(&root.join("ab")),
+                        changed(&root.join("ac")),
+                        changed(&root.join("zz-gone")),
+                    ])
+                    .unwrap();
+                assert!(session.world.contains_key(&root.join("ab/target")));
+                assert!(session.world.contains_key(&root.join("ac/target")));
             },
         );
     }
@@ -958,6 +973,20 @@ mod tests {
                 session.turn(vec![Signal::Released(held.clone())]).unwrap();
                 assert_eq!(reaped(records), 3);
                 testkit::assert_absent(&held);
+
+                let sealed = root.join("sealed");
+                testkit::write_owner_marker(
+                    &sealed,
+                    MarkerRole::Scratch,
+                    MarkerKeep::Released,
+                    None,
+                );
+                testkit::make_dir(&sealed.join("private"));
+                if let Some(_restricted) = testkit::restrict(&sealed.join("private"), 0o000) {
+                    session.turn(vec![changed(root)]).unwrap();
+                    assert_eq!(reaped(records), 3);
+                    assert!(!session.world.contains_key(&sealed));
+                }
 
                 let target = root.join("gone/target");
                 assert!(session.world.contains_key(&target));
