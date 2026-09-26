@@ -483,6 +483,11 @@ fn present(root: &Path, path: &Path, event: Event) -> Vec<(Box<Path>, FileFacts)
 }
 
 impl Pool {
+    #[cfg(test)]
+    pub(crate) fn file_count(&self, root: &Path) -> usize {
+        self.stocks.get(root).map_or(0, |stock| stock.files.len())
+    }
+
     fn index(&mut self, root: &Path, files: &BTreeMap<Box<Path>, FileFacts>) {
         for (relative, facts) in files {
             self.lengths

@@ -213,6 +213,26 @@ fn refs(directory: &Path) -> Vec<PathBuf> {
     found
 }
 
+fn directory_tree(root: &Path) -> Vec<PathBuf> {
+    if !is_directory(root) {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        pending.extend(
+            fs::read_dir(&next)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| matches!(entry.file_type(), Ok(kind) if kind.is_dir()))
+                .map(|entry| entry.path()),
+        );
+        found.push(next);
+    }
+    found
+}
+
 fn is_directory(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Ok(metadata) if metadata.is_dir())
 }
@@ -746,6 +766,7 @@ impl Session<'_> {
         let mut lost = false;
         let mut appeared = BTreeSet::new();
         let mut rescanned = BTreeSet::new();
+        let mut follow = Vec::new();
         for signal in signals {
             match signal {
                 Signal::Changed(Change::Lost) => lost = true,
@@ -764,6 +785,9 @@ impl Session<'_> {
                     match (self.owner(&path), event) {
                         (Some(root), Event::Vanished) if root == path => self.forget(&root),
                         (Some(root), _) if self.written(&root) => {
+                            if event == Event::Appeared && !self.watcher.recursive() {
+                                follow.extend(directory_tree(&path));
+                            }
                             self.changed_within(root, path, event);
                         },
                         (Some(_), _) => {},
@@ -787,6 +811,7 @@ impl Session<'_> {
                 },
             }
         }
+        self.follow(&follow)?;
         tracing::debug!(
             lost,
             hooked = ?hooked,
@@ -1028,6 +1053,17 @@ mod tests {
         testkit::make_dir(&root.join(".git/refs/heads/nested"));
         testkit::make_dir(&root.join(".git/worktrees/one"));
         assert_eq!(
+            directory_tree(&root.join(".git/refs"))
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                root.join(".git/refs"),
+                root.join(".git/refs/heads"),
+                root.join(".git/refs/heads/nested"),
+            ])
+        );
+        assert!(directory_tree(&file).is_empty());
+        assert_eq!(
             refs(&root).into_iter().collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 root.join(".git"),
@@ -1102,15 +1138,6 @@ mod tests {
             .iter()
             .filter_map(|record| record.reap.as_ref())
             .map(|summary| summary.outcomes.len())
-            .sum()
-    }
-
-    fn shared_so_far(records: &Records) -> u64 {
-        records
-            .borrow()
-            .iter()
-            .filter_map(|record| record.dedupe.as_ref())
-            .map(|run| run.totals.shared.files)
             .sum()
     }
 
@@ -1555,7 +1582,7 @@ mod tests {
                 let _one = profile(root, "one");
                 let _two = profile(root, "two");
             },
-            |session, root, records| {
+            |session, root, _records| {
                 let one = root.join("one/target");
                 let two = root.join("two/target");
                 let first = one.join("debug/deps/libsame.rlib");
@@ -1569,10 +1596,11 @@ mod tests {
                 session.world.get_mut(&one).unwrap().whole = true;
                 session.dirty.insert(one.clone());
                 session.process(&one).unwrap();
-                assert_eq!(shared_so_far(records), 0);
+                assert_eq!(session.pool.file_count(&one), 2);
+                assert_eq!(session.pool.file_count(&two), 0);
 
                 session.turn(vec![written(&second)]).unwrap();
-                assert_eq!(shared_so_far(records), 1);
+                assert_eq!(session.pool.file_count(&two), 1);
             },
         );
     }
