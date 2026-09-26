@@ -1145,16 +1145,18 @@ mod tests {
         testkit::write_patterned(&small, MINIMUM - 1, 3);
         testkit::write_patterned(&temporary, MINIMUM, 4);
 
-        let shallow = present(&root, &directory, Event::Unsure);
-        if shallow.is_empty() {
+        let facts =
+            fs::metadata(&direct).and_then(|metadata| platform::file_facts(&direct, &metadata));
+        if facts.is_err() {
             assert!(
                 std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_none(),
                 "this volume must share blocks"
             );
-            let _skipped = testkit::Built::Unavailable(String::from("sharing is refused here"))
-                .or_decline("a volume that shares blocks");
+            let _skipped = testkit::Built::Unavailable(String::from("file facts are unavailable"))
+                .or_decline("a platform that inventories shareable files");
             return;
         }
+        let shallow = present(&root, &directory, Event::Unsure);
         assert_eq!(
             shallow
                 .iter()

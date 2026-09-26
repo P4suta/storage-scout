@@ -5,7 +5,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::{Change, Coverage, Event};
+use super::{Change, Coverage, Event, WatchDepth};
 
 type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 
@@ -257,8 +257,8 @@ impl Source {
         clippy::unused_self,
         reason = "a stream always reports every directory below its roots"
     )]
-    pub(super) const fn recursive(&self) -> bool {
-        true
+    pub(super) const fn depth(&self) -> WatchDepth {
+        WatchDepth::Recursive
     }
 
     #[expect(

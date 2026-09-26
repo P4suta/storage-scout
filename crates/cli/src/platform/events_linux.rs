@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::{Change, Coverage, Event};
+use super::{Change, Coverage, Event, WatchDepth};
 
 type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 type Watches = Arc<Mutex<BTreeMap<i32, PathBuf>>>;
@@ -105,8 +105,8 @@ impl Source {
         clippy::unused_self,
         reason = "each directory is watched on its own here"
     )]
-    pub(super) const fn recursive(&self) -> bool {
-        false
+    pub(super) const fn depth(&self) -> WatchDepth {
+        WatchDepth::Named
     }
 
     pub(super) fn start(paths: &[PathBuf], deliver: Deliver) -> io::Result<Self> {

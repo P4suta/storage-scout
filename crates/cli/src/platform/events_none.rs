@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{Change, Coverage};
+use super::{Change, Coverage, WatchDepth};
 
 type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 
@@ -12,8 +12,8 @@ impl Source {
         clippy::unused_self,
         reason = "each directory is watched on its own here"
     )]
-    pub(super) const fn recursive(&self) -> bool {
-        false
+    pub(super) const fn depth(&self) -> WatchDepth {
+        WatchDepth::Named
     }
 
     pub(super) fn start(_paths: &[PathBuf], _deliver: Deliver) -> io::Result<Self> {

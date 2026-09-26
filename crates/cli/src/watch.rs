@@ -15,7 +15,7 @@ use storage_scout_core::reject::Rejection;
 use crate::apply::{Mode, Summary};
 use crate::auto::{self, AutoPolicy};
 use crate::dedupe::{DedupeRun, Focus, Pool};
-use crate::platform::{self, Change, Coverage, Event, Watcher};
+use crate::platform::{self, Change, Coverage, Event, WatchDepth, Watcher};
 use crate::prune::{self, PruneRun, Scope};
 use crate::scan::{self, Found, Reach, ScanOptions};
 use crate::store::{self, Station};
@@ -257,12 +257,6 @@ fn watched(root: &Path, survey: Option<&busy::Survey>) -> Vec<PathBuf> {
     directories
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WatchDepth {
-    Recursive,
-    Named,
-}
-
 fn additional_watches(depth: WatchDepth, walked: &[PathBuf]) -> Vec<PathBuf> {
     match depth {
         WatchDepth::Recursive => Vec::new(),
@@ -270,6 +264,16 @@ fn additional_watches(depth: WatchDepth, walked: &[PathBuf]) -> Vec<PathBuf> {
             let mut directories = walked.to_vec();
             directories.extend(walked.iter().flat_map(|directory| refs(directory)));
             directories
+        },
+    }
+}
+
+fn event_watches(depth: WatchDepth, event: Event, path: &Path) -> Vec<PathBuf> {
+    match depth {
+        WatchDepth::Recursive => Vec::new(),
+        WatchDepth::Named => match event {
+            Event::Appeared => directory_tree(path),
+            Event::Vanished | Event::Written | Event::Unsure => Vec::new(),
         },
     }
 }
@@ -327,12 +331,7 @@ impl Session<'_> {
     }
 
     fn saw(&mut self, walked: &[PathBuf]) -> Result<(), WatchError> {
-        let depth = if self.watcher.recursive() {
-            WatchDepth::Recursive
-        } else {
-            WatchDepth::Named
-        };
-        self.saw_with(walked, depth)
+        self.saw_with(walked, self.watcher.depth())
     }
 
     fn saw_with(&mut self, walked: &[PathBuf], depth: WatchDepth) -> Result<(), WatchError> {
@@ -785,9 +784,7 @@ impl Session<'_> {
                     match (self.owner(&path), event) {
                         (Some(root), Event::Vanished) if root == path => self.forget(&root),
                         (Some(root), _) if self.written(&root) => {
-                            if event == Event::Appeared && !self.watcher.recursive() {
-                                follow.extend(directory_tree(&path));
-                            }
+                            follow.extend(event_watches(self.watcher.depth(), event, &path));
                             self.changed_within(root, path, event);
                         },
                         (Some(_), _) => {},
@@ -947,6 +944,7 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
 
+    use storage_scout_core::share::Capability;
     use storage_scout_core::size::Bytes;
     use testkit::{MarkerKeep, MarkerRole, write_sized};
 
@@ -1091,6 +1089,15 @@ mod tests {
         );
         assert!(complete(Coverage::Complete));
         assert!(!complete(Coverage::Partial));
+
+        assert!(event_watches(WatchDepth::Recursive, Event::Appeared, &root).is_empty());
+        assert!(event_watches(WatchDepth::Named, Event::Written, &root).is_empty());
+        assert_eq!(
+            event_watches(WatchDepth::Named, Event::Appeared, &root)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            directory_tree(&root).into_iter().collect::<BTreeSet<_>>()
+        );
 
         assert!(bookkeeping(Path::new("owner.json")));
         assert!(bookkeeping(Path::new("debug/.cargo-lock")));
@@ -1585,6 +1592,19 @@ mod tests {
             |session, root, _records| {
                 let one = root.join("one/target");
                 let two = root.join("two/target");
+                if !matches!(
+                    platform::filesystem(&one).map(Capability::of),
+                    Ok(Capability::Shares { .. })
+                ) {
+                    assert!(
+                        std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_none(),
+                        "this volume must share blocks"
+                    );
+                    let _skipped =
+                        testkit::Built::Unavailable(String::from("sharing is refused here"))
+                            .or_decline("a volume that shares blocks");
+                    return;
+                }
                 let first = one.join("debug/deps/libsame.rlib");
                 let second = two.join("debug/deps/libsame.rlib");
                 let first_hidden = one.join("debug/deps/libhidden.rlib");
@@ -1596,18 +1616,7 @@ mod tests {
                 session.world.get_mut(&one).unwrap().whole = true;
                 session.dirty.insert(one.clone());
                 session.process(&one).unwrap();
-                let inventoried = session.pool.file_count(&one);
-                if inventoried == 0 {
-                    assert!(
-                        std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_none(),
-                        "this volume must share blocks"
-                    );
-                    let _skipped =
-                        testkit::Built::Unavailable(String::from("sharing is refused here"))
-                            .or_decline("a volume that shares blocks");
-                    return;
-                }
-                assert_eq!(inventoried, 2);
+                assert_eq!(session.pool.file_count(&one), 2);
                 assert_eq!(session.pool.file_count(&two), 0);
 
                 session.turn(vec![written(&second)]).unwrap();

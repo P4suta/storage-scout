@@ -49,6 +49,16 @@ pub(crate) enum Coverage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a platform's watcher has exactly one depth")
+)]
+pub(crate) enum WatchDepth {
+    Recursive,
+    Named,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
     not(any(test, target_os = "linux", windows)),
     expect(
         dead_code,
@@ -87,8 +97,8 @@ impl Watcher {
         self.0.watch(directories)
     }
 
-    pub(crate) const fn recursive(&self) -> bool {
-        self.0.recursive()
+    pub(crate) const fn depth(&self) -> WatchDepth {
+        self.0.depth()
     }
 }
 

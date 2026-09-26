@@ -130,14 +130,6 @@ outcome = "survived"
 
 [[mutation.expect]]
 path = "crates/cli/src/owners.rs"
-item = "dot_git"
-rule = "remove-match-guard"
-original = "error.kind() == io::ErrorKind::NotFound"
-reason = "a .git that cannot be looked at means its directory cannot be searched, and then nothing below it is a candidate"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/owners.rs"
 item = "gitdir"
 rule = "condition-to-false"
 original = "target.is_absolute()"
@@ -419,34 +411,10 @@ outcome = "survived"
 
 [[mutation.expect]]
 path = "crates/cli/src/watch.rs"
-item = "Session::saw"
-rule = "negate-condition"
-original = "self.watcher.recursive()"
-reason = "choosing recursive or named registration shows only in later filesystem events, and watcher integration targets are left out of measurement"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/watch.rs"
-item = "Session::saw"
-rule = "condition-to-true"
-original = "self.watcher.recursive()"
-reason = "choosing recursive or named registration shows only in later filesystem events, and watcher integration targets are left out of measurement"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/watch.rs"
-item = "Session::saw"
-rule = "condition-to-false"
-original = "self.watcher.recursive()"
-reason = "choosing recursive or named registration shows only in later filesystem events, and watcher integration targets are left out of measurement"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/cli/src/watch.rs"
 item = "Session::process"
 rule = "negate-condition"
 original = "fresh_survey"
-line = 622
+line = 641
 reason = "re-registering the same directories changes only watcher syscall cost, while missing a new directory shows only in later filesystem events left out of measurement"
 outcome = "survived"
 
@@ -455,7 +423,7 @@ path = "crates/cli/src/watch.rs"
 item = "Session::process"
 rule = "condition-to-true"
 original = "fresh_survey"
-line = 622
+line = 641
 reason = "re-registering the same directories changes only watcher syscall cost, while missing a new directory shows only in later filesystem events left out of measurement"
 outcome = "survived"
 
@@ -464,7 +432,7 @@ path = "crates/cli/src/watch.rs"
 item = "Session::process"
 rule = "condition-to-false"
 original = "fresh_survey"
-line = 622
+line = 641
 reason = "re-registering the same directories changes only watcher syscall cost, while missing a new directory shows only in later filesystem events left out of measurement"
 outcome = "survived"
 
