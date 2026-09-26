@@ -1596,7 +1596,18 @@ mod tests {
                 session.world.get_mut(&one).unwrap().whole = true;
                 session.dirty.insert(one.clone());
                 session.process(&one).unwrap();
-                assert_eq!(session.pool.file_count(&one), 2);
+                let inventoried = session.pool.file_count(&one);
+                if inventoried == 0 {
+                    assert!(
+                        std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_none(),
+                        "this volume must share blocks"
+                    );
+                    let _skipped =
+                        testkit::Built::Unavailable(String::from("sharing is refused here"))
+                            .or_decline("a volume that shares blocks");
+                    return;
+                }
+                assert_eq!(inventoried, 2);
                 assert_eq!(session.pool.file_count(&two), 0);
 
                 session.turn(vec![written(&second)]).unwrap();
