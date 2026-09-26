@@ -1,8 +1,8 @@
 # Handoff: the resident watcher's CPU cost
 
 Written 2026-09-26 when work stopped on branch `perf/work-follows-change`.
-Updated 2026-09-27 after PR #11 merged and macOS restart state was implemented on `perf/persistent-watch-state`.
-The completion update below supersedes the original remaining-work list, while the investigation is retained as history.
+Updated 2026-09-27 after PR #12 merged, the validated build was deployed on all three machines, and production measurements were completed.
+The completion and rollout updates below supersede the earlier production-state table and remaining-work list, while the investigation is retained as history.
 
 ## Why this branch exists
 
@@ -83,9 +83,10 @@ Status of checks for the final code:
 - Linux: the suite passed on an earlier revision of this branch, not yet on the final code.
 - Windows: an earlier revision hung in the watch integration test `a_cache_whose_key_is_gone_is_reaped_as_soon_as_a_hook_says_so`, and the final code has not been run there.
 
-## Last known production state
+## Production state before the final rollout
 
-Everything was stopped when this work began and was not reverified or changed during the repository work.
+This table is historical.
+Everything was stopped when the repository work began and had not yet been reverified.
 
 | Machine | Watcher | Policy | Installed binary |
 |---|---|---|---|
@@ -93,15 +94,16 @@ Everything was stopped when this work began and was not reverified or changed du
 | Linux | `systemctl --user disable --now storage-scout.service` | `~/.config/storage-scout/auto.toml.paused` | main at `136abb1` |
 | Windows | `Disable-ScheduledTask -TaskName storage-scout` | unchanged (Windows runs no storage-scout git hooks) | main at `136abb1` |
 
-To resume, once a validated build is installed:
+The final installation-and-resume phase used this sequence:
+
+- Install: `cargo install --locked --force --path crates/cli` on each machine.
+  On Windows, stop the task and `storage-scout.exe` first, because the running exe is locked.
 - Mac:
-  1. `mv ~/.config/storage-scout/auto.toml.paused ~/.config/storage-scout/auto.toml`
+  1. `mv ~/.config/storage-scout/auto.toml.deploy-paused ~/.config/storage-scout/auto.toml`
   2. `launchctl enable gui/$(id -u)/dev.dotfiles.storage-scout`
   3. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.dotfiles.storage-scout.plist`
-- Linux: move the policy back, then `systemctl --user enable --now storage-scout.service`.
+- Linux: move `auto.toml.deploy-paused` back to `auto.toml`, then `systemctl --user enable --now storage-scout.service`.
 - Windows: `Enable-ScheduledTask -TaskName storage-scout; Start-ScheduledTask -TaskName storage-scout`.
-- Install: `cargo install --locked --path crates/cli` on each machine.
-  On Windows, stop the task and `storage-scout.exe` first, because the running exe is locked.
 
 ## Completion update
 
@@ -113,6 +115,7 @@ The macOS restart work on `perf/persistent-watch-state` adds a durable redb inve
 A warm restart restores only candidates whose current root identity still matches, replays historical events before normal processing, and inventories only new or replaced candidates.
 `MustScanSubDirs`, dropped events, wrapped IDs, and changed roots discard the cache and establish a fresh pre-scan event boundary, while malformed or damaged state is rebuilt automatically.
 Restored paths and file facts are decoded strictly, and every later sharing operation still re-identifies and compares the files at the moment of replacement.
+PR #12 merged that work as `4d3af23`.
 
 The final local checks on the Mac passed:
 
@@ -121,23 +124,74 @@ The final local checks on the Mac passed:
 - `cargo deny --offline check`: advisories, bans, licenses, and sources.
 - CI-pinned `rust-mutants`: 298 changed-file mutants, 284 killed, 14 reasoned expectations, zero unexplained survivors, zero waits, and zero unreached mutants.
 
-## Remaining external work
+## Production rollout completed
 
-The required `domyjob` and `multi-machine` skills were unavailable in the working environment, so no direct SSH substitute was used and production remained untouched.
-Once those skills are available:
+The external work was completed from merged `main` at `4d3af23` on 2026-09-27.
+The completed `domyjob` build was installed on the Mac first because the older local client treated the completed audit entry's `epoch` field as malformed.
+The compatible build read both peer logs without changing or rewitnessing them, and `domyjob doctor` then reported matching healthy Linux and Windows peers.
 
-1. Reverify that all three production watchers and policies are still stopped as recorded above.
-2. After the persistence branch is merged, install the merged build on all three machines, restore each policy, and resume each watcher together.
-3. Measure steady-state CPU on all three machines and Defender CPU on Windows with the merged build.
-4. Profile any remaining bursts: new-duplicate hashing, shallow listing of large `deps` directories, and ordinary walks through rust-mutants scratch targets are the likely sources.
-5. If Windows restart cost remains material, implement USN-journal-backed inventory persistence as a separately tested Windows change; Linux has no equivalent history.
+The preflight found that Windows and the Mac watcher were stopped, but Linux had unexpectedly been active for 3 hours 20 minutes and had already consumed 9 hours 30 minutes of CPU.
+Linux was disabled and stopped, and the Mac and Linux policies were moved to `auto.toml.deploy-paused` so hooks could not start work during validation.
+The active and older `.paused` copies were byte-for-byte identical on each machine, and the active copy was restored after installation.
 
-## Related, outside this repository
+The same working tree passed the OS-specific code checks before installation:
 
-- rust-mutants (in njutest):
-  - ADR 0043 "a test may decline to measure" (njutest #207, in batch #209): once it is in a revision CI pins, bump `NJUTEST_REV` and make testkit write `<thread name>\t<stable why>` to `$RUST_MUTANTS_DECLINE_NOTICE`.
-    Write only when a skip ends the whole test, and never with paths in the words.
-  - Claims on files not compiled for the target become inapplicable automatically.
-  - njutest #204 made repeat runs compile nothing.
-- The local bare hub `~/git/njutest.git` lags GitHub and lacks the CI pin.
-  Build rust-mutants from the njutest checkout at `NJUTEST_REV`.
+- Linux: formatting, Clippy, structural gates, the bare-metal core build, 298 of 298 tests, and documentation tests.
+- Windows: formatting, Clippy, structural gates, the bare-metal core build, 297 of 297 tests, and documentation tests.
+- The full Linux wrapper's only failure was `actionlint` looking for a Git worktree inside domyjob's source snapshot.
+- The full Windows wrapper's only failure was the machine's Scoop `typos` shim failing to start; the platform-independent repository lint had already passed on the Mac and in CI.
+
+`cargo install --locked --force --path crates/cli` replaced the binary on all three machines while every watcher remained stopped.
+The installed hashes changed from `00b36020…` to `8d4e5527…` on the Mac, `d40f8f78…` to `9958a3ff…` on Linux, and `907da006…` to `6d14b549…` on Windows.
+The policies and watchers were then resumed in one parallel phase.
+
+The final production state is:
+
+| Machine | Watcher | Policy | Installed binary |
+|---|---|---|---|
+| Mac | LaunchAgent enabled and running | `~/.config/storage-scout/auto.toml` active | merged `4d3af23` build |
+| Linux | user service enabled and active | `~/.config/storage-scout/auto.toml` active | merged `4d3af23` build |
+| Windows | scheduled task enabled and running, with one watcher process | policy active | merged `4d3af23` build |
+
+A final health check reconfirmed those states, active policies, the absence of `auto.toml.deploy-paused`, version `0.4.0`, and the installed hashes above.
+The audited remote checks succeeded as `linux:50SP7K9NS9WRCS6W` and `win:EENC1M3C6AS99R8X`.
+
+## Production measurements
+
+Linux used no measurable CPU in a 30-second steady-state window.
+Its first start completed in about 4 seconds and used about 12 CPU seconds, after which its cumulative CPU advanced only with real changes.
+
+Windows used no measurable watcher CPU in a 30-second steady-state window, and Defender used no measurable CPU in the same window.
+A controlled Windows restart reached CPU quiescence in 36.6 seconds, used 41.625 watcher CPU seconds, and added 0 Defender CPU seconds.
+The latest start watched 154 candidates and changed nothing.
+That one-time login or reboot cost did not reproduce the former continuous load or Defender amplification, so USN-journal persistence is not justified by the production measurement.
+It remains a separate future change only if a user-visible restart cost is later demonstrated.
+
+The Mac's first production start created the persistent inventory while several unrelated builds were active.
+It reached `start` in 7 minutes 44 seconds after using 6 minutes 53 seconds of CPU, watched 738 candidates, and changed nothing.
+The redb state later occupied 209,027,072 bytes, about 199 MiB, for about 740 candidates.
+
+Other agents continuously started rust-mutants campaigns and ordinary Cargo builds throughout the Mac observation, so a whole 30-second production window with no external writes was not available.
+The watcher nevertheless reached exact 0% intervals between turns.
+During sustained mutation churn, representative 30-second windows used 20.1% and 24.9% of one core, rather than the pre-fix continuous load of about 80% of one core.
+Startup and accumulated-event windows were higher and are not steady-state measurements.
+
+A 10-second sample during a Mac burst put the main thread in directory discovery: 5,337 samples in `fstatat`, 962 in `getdirentries64`, and 371 in `getattrlist`.
+Open handles named rust-mutants scratch targets, njutest pre-push targets, and ordinary project targets rather than a whole-pool hashing loop.
+This confirms that remaining bursts are the expected walks that discover newly created build trees, while idle work is absent.
+
+A Mac restart in the middle of an active turn exercised the durable checkpoint and FSEvents history path under three simultaneous build and mutation workloads.
+The new process opened the existing redb state, replayed the interrupted changes, pruned 8,774 entries totaling 776.1 MiB, shared 257 files totaling 93.6 MiB, and reached `start` after 361 seconds without losing the service or policy.
+That is an extreme-load recovery measurement, not an idle warm-start benchmark.
+
+## Related work completed outside this repository
+
+njutest batch #209 landed ADR 0043, "a test may decline to measure", and storage-scout PR #11 pinned `NJUTEST_REV` to that batch at `937da69`.
+The testkit writes `<thread name>\t<stable why>` to `$RUST_MUTANTS_DECLINE_NOTICE` only when an unavailable capability ends the whole test, and its tests enforce that paths do not enter the stable reason.
+The pinned njutest also makes claims on files not compiled for a target inapplicable automatically, while njutest #204 prevents repeat runs from recompiling unchanged code.
+The final mutation campaign above used that CI-pinned revision.
+
+The local bare hub `~/git/njutest.git` was fast-forwarded from `58e0a68` to GitHub `main` at `f0084f1`.
+The pinned `937da69` commit is present and is an ancestor of that hub's `main`.
+
+No actionable work remains from this handoff.
