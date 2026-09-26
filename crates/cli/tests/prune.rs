@@ -42,7 +42,7 @@ fn pruned(root: &Path) -> Option<PruneRun> {
     let run = prune(root, Mode::Execute);
     if unsupported(&run) {
         let _skipped = Built::Unavailable(String::from("pruning in place is not supported"))
-            .or_skip("a platform that prunes in place");
+            .or_decline("a platform that prunes in place");
         return None;
     }
     Some(run)
@@ -123,6 +123,7 @@ fn a_session_its_rustc_still_holds_is_left_alone() {
     let old = session(&debug, "app-1", "s-a1-x-aaa");
     let _new = session(&debug, "app-1", "s-b1-y-bbb");
     let Some(holder) = testkit::hold_session_lock(&lock_of(&old)) else {
+        testkit::decline("a process that holds a rustc session lock");
         return;
     };
     let Some(run) = pruned(root) else {
@@ -151,7 +152,9 @@ fn a_directory_is_a_profile_only_with_cargos_own_lock_and_fingerprints() {
     let elsewhere = root.join("elsewhere.lock");
     write_sized(&elsewhere, 0);
     fs::remove_file(linked.join(".cargo-lock")).unwrap();
-    let Built::Yes(_) = testkit::symlink_file(&linked.join(".cargo-lock"), &elsewhere) else {
+    let Some(_) =
+        testkit::symlink_file(&linked.join(".cargo-lock"), &elsewhere).or_decline("a file link")
+    else {
         return;
     };
     let olds = [&loose, &linked].map(|debug| {
@@ -264,6 +267,7 @@ fn an_image_that_cannot_be_read_keeps_every_object_of_its_unit() {
     let sealed = deps.join("app-1");
     image(&sealed, &named(&deps, &["app-1.a.new.rcgu.o"]));
     let Some(_restricted) = testkit::restrict(&sealed, 0o000) else {
+        testkit::decline("a restricted path");
         return;
     };
     let run = prune(root, Mode::Execute);

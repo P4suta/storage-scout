@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use std::ffi::OsStr;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -7,21 +8,37 @@ use std::thread::JoinHandle;
 
 use serde::Serialize;
 use storage_scout_core::location::Location;
+use storage_scout_core::lock::Protocol;
 use storage_scout_core::ownership::Admits;
 use storage_scout_core::reject::Rejection;
 
 use crate::apply::{Mode, Summary};
 use crate::auto::{self, AutoPolicy};
 use crate::dedupe::{DedupeRun, Focus, Pool};
-use crate::platform::{Change, Watcher};
-use crate::prune::{self, PruneRun};
+use crate::platform::{self, Change, Coverage, Event, WatchDepth, Watcher};
+use crate::prune::{self, PruneRun, Scope};
 use crate::scan::{self, Found, Reach, ScanOptions};
 use crate::store::{self, Station};
-use crate::{SCHEMA_VERSION, Scout, busy};
+use crate::{SCHEMA_VERSION, Scout, busy, owners};
 
 const PROFILE_PARTS: [&str; 4] = ["deps", "incremental", "build", "examples"];
 const GIT_DIRECTORY: &str = ".git";
-const REFS: &str = "refs";
+const EVIDENCE: [&str; 13] = [
+    "Cargo.toml",
+    "CACHEDIR.TAG",
+    "owner.json",
+    ".rustc_info.json",
+    "pom.xml",
+    "package.json",
+    "pyproject.toml",
+    "pyvenv.cfg",
+    "CMakeCache.txt",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+];
+const REFS: [&str; 4] = ["refs", "packed-refs", "HEAD", "worktrees"];
 
 #[derive(Debug)]
 enum Signal {
@@ -93,13 +110,14 @@ pub enum WatchError {
 struct Hooks<'a> {
     station: Station,
     state: PathBuf,
+    signal: PathBuf,
     log: Option<PathBuf>,
     render: &'a dyn Fn(&WatchRecord) -> io::Result<()>,
 }
 
 impl Hooks<'_> {
-    fn raised(&self) -> io::Result<bool> {
-        self.station.lower()
+    fn taken(&self) -> io::Result<Option<BTreeSet<PathBuf>>> {
+        self.station.take()
     }
 
     fn record(&self, record: &WatchRecord) -> io::Result<()> {
@@ -111,45 +129,119 @@ impl Hooks<'_> {
     }
 }
 
+struct Watched {
+    found: Found,
+    repository: Option<PathBuf>,
+    survey: Option<busy::Survey>,
+    changed: BTreeMap<PathBuf, Event>,
+    whole: bool,
+    resurvey: bool,
+}
+
 struct Session<'a> {
     scout: Scout,
     roots: Vec<PathBuf>,
     policy: &'a AutoPolicy,
     excludes: Vec<Location>,
     hooks: &'a Hooks<'a>,
-    world: BTreeMap<PathBuf, Found>,
-    hosts: BTreeSet<PathBuf>,
+    world: BTreeMap<PathBuf, Watched>,
     dirty: BTreeSet<PathBuf>,
     waiting: BTreeMap<PathBuf, JoinHandle<()>>,
     pool: Pool,
     sender: Sender<Signal>,
     watcher: Watcher,
+    covered: bool,
+    walked: BTreeSet<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum GitArea {
-    Refs,
+    Refs(PathBuf),
     Other,
     Outside,
 }
 
-fn git_area(directory: &Path) -> GitArea {
-    let mut components = directory
-        .components()
-        .skip_while(|component| component.as_os_str() != std::ffi::OsStr::new(GIT_DIRECTORY));
-    match (components.next(), components.next()) {
-        (None, _) => GitArea::Outside,
-        (Some(_), Some(next)) if next.as_os_str() == std::ffi::OsStr::new(REFS) => GitArea::Refs,
-        (Some(_), _) => GitArea::Other,
+fn git_area(path: &Path) -> GitArea {
+    let Some(repository) = path
+        .ancestors()
+        .find(|ancestor| ancestor.file_name() == Some(OsStr::new(GIT_DIRECTORY)))
+    else {
+        return GitArea::Outside;
+    };
+    match path
+        .strip_prefix(repository)
+        .map(|inside| inside.components().next())
+    {
+        Ok(Some(first)) if REFS.contains(&first.as_os_str().to_str().unwrap_or_default()) => {
+            GitArea::Refs(repository.to_path_buf())
+        },
+        Ok(_) | Err(_) => GitArea::Other,
     }
 }
 
-fn appeared_already(appeared: &[Found], path: &Path) -> bool {
-    appeared.iter().any(|found| found.path() == path)
+fn evidence(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            EVIDENCE
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+        })
 }
 
-const fn let_go(found: &Found) -> bool {
-    Admits::Settled.admits(found.candidate().settlement())
+fn refs(directory: &Path) -> Vec<PathBuf> {
+    let git = directory.join(GIT_DIRECTORY);
+    if !is_directory(&git) {
+        return Vec::new();
+    }
+    let mut found = vec![git.clone()];
+    let mut pending = REFS
+        .iter()
+        .map(|part| git.join(part))
+        .filter(|path| is_directory(path))
+        .collect::<Vec<_>>();
+    while let Some(next) = pending.pop() {
+        pending.extend(
+            fs::read_dir(&next)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| matches!(entry.file_type(), Ok(kind) if kind.is_dir()))
+                .map(|entry| entry.path()),
+        );
+        found.push(next);
+    }
+    found
+}
+
+fn directory_tree(root: &Path) -> Vec<PathBuf> {
+    if !is_directory(root) {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        pending.extend(
+            fs::read_dir(&next)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| matches!(entry.file_type(), Ok(kind) if kind.is_dir()))
+                .map(|entry| entry.path()),
+        );
+        found.push(next);
+    }
+    found
+}
+
+fn is_directory(path: &Path) -> bool {
+    matches!(fs::symlink_metadata(path), Ok(metadata) if metadata.is_dir())
+}
+
+fn bookkeeping(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name == owners::MARKER_NAME || Protocol::of(name.as_encoded_bytes()).is_some()
+    })
 }
 
 fn watched(root: &Path, survey: Option<&busy::Survey>) -> Vec<PathBuf> {
@@ -164,6 +256,34 @@ fn watched(root: &Path, survey: Option<&busy::Survey>) -> Vec<PathBuf> {
         }
     }
     directories
+}
+
+fn additional_watches(depth: WatchDepth, walked: &[PathBuf]) -> Vec<PathBuf> {
+    match depth {
+        WatchDepth::Recursive => Vec::new(),
+        WatchDepth::Named => {
+            let mut directories = walked.to_vec();
+            directories.extend(walked.iter().flat_map(|directory| refs(directory)));
+            directories
+        },
+    }
+}
+
+fn event_watches(depth: WatchDepth, event: Event, path: &Path) -> Vec<PathBuf> {
+    match depth {
+        WatchDepth::Recursive => Vec::new(),
+        WatchDepth::Named => match event {
+            Event::Appeared => directory_tree(path),
+            Event::Vanished | Event::Written | Event::Unsure => Vec::new(),
+        },
+    }
+}
+
+const fn complete(coverage: Coverage) -> bool {
+    match coverage {
+        Coverage::Complete => true,
+        Coverage::Partial => false,
+    }
 }
 
 fn surveyed(root: &Path) -> Option<busy::Survey> {
@@ -185,25 +305,8 @@ fn wait_for(lock: PathBuf, root: PathBuf, sender: Sender<Signal>) -> io::Result<
 }
 
 impl Session<'_> {
-    fn lets_go(&self, found: &Found) -> bool {
-        if !let_go(found) {
-            return false;
-        }
-        let Some(survey) = surveyed(found.path()) else {
-            return false;
-        };
-        matches!(busy::held(&survey.locks), busy::Holding::Free)
-            && Admits::Settled.admits(
-                self.scout
-                    .owners()
-                    .of(found.path(), &survey.markers)
-                    .settlement(),
-            )
-    }
-
-    fn owner(&self, directory: &Path) -> Option<PathBuf> {
-        directory
-            .ancestors()
+    fn owner(&self, path: &Path) -> Option<PathBuf> {
+        path.ancestors()
             .find(|ancestor| self.world.contains_key(*ancestor))
             .map(Path::to_path_buf)
     }
@@ -211,7 +314,7 @@ impl Session<'_> {
     fn written(&self, root: &Path) -> bool {
         self.world
             .get(root)
-            .is_some_and(|found| found.candidate().kind().protocol().is_some())
+            .is_some_and(|watched| watched.found.candidate().kind().protocol().is_some())
     }
 
     fn record(&self, record: &WatchRecord) -> Result<(), WatchError> {
@@ -221,23 +324,21 @@ impl Session<'_> {
         Ok(())
     }
 
-    fn follow(&self, root: &Path, survey: Option<&busy::Survey>) -> Result<(), WatchError> {
-        let directories = watched(root, survey);
+    fn follow(&mut self, directories: &[PathBuf]) -> Result<(), WatchError> {
         let borrowed = directories.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-        self.watcher.watch(&borrowed).map_err(WatchError::Events)
+        let coverage = self.watcher.watch(&borrowed).map_err(WatchError::Events)?;
+        self.covered &= complete(coverage);
+        Ok(())
     }
 
-    fn remember_hosts(&mut self, hosts: Vec<PathBuf>) -> Result<(), WatchError> {
-        let fresh = hosts
-            .into_iter()
-            .filter(|host| self.hosts.insert(host.clone()))
-            .collect::<Vec<_>>();
-        self.follow_hosts(&fresh)
+    fn saw(&mut self, walked: &[PathBuf]) -> Result<(), WatchError> {
+        self.saw_with(walked, self.watcher.depth())
     }
 
-    fn follow_hosts(&self, hosts: &[PathBuf]) -> Result<(), WatchError> {
-        let borrowed = hosts.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-        self.watcher.watch(&borrowed).map_err(WatchError::Events)
+    fn saw_with(&mut self, walked: &[PathBuf], depth: WatchDepth) -> Result<(), WatchError> {
+        self.walked.extend(walked.iter().cloned());
+        let directories = additional_watches(depth, walked);
+        self.follow(&directories)
     }
 
     fn reap(&mut self, settled: &[&Found]) -> Option<Summary> {
@@ -254,13 +355,35 @@ impl Session<'_> {
         self.pool.forget(root);
     }
 
-    fn adopt(&mut self, found: Found) -> Result<(), WatchError> {
+    fn adopt(&mut self, found: Found, state: Adopted) -> Result<(), WatchError> {
         let root = found.path().to_path_buf();
         let survey = surveyed(&root);
-        self.follow(&root, survey.as_ref())?;
-        self.dirty.insert(root.clone());
-        self.world.insert(root, found);
+        self.follow(&watched(&root, survey.as_ref()))?;
+        let whole = state == Adopted::Unprocessed;
+        if whole {
+            self.dirty.insert(root.clone());
+        }
+        self.world.insert(
+            root.clone(),
+            Watched {
+                found,
+                repository: self.scout.owners().repository(&root),
+                survey,
+                changed: BTreeMap::new(),
+                whole,
+                resurvey: false,
+            },
+        );
         Ok(())
+    }
+
+    fn admitted(&self, sighting: scan::Sighting) -> Vec<Found> {
+        sighting
+            .report
+            .candidates
+            .into_iter()
+            .filter(|found| self.policy.selection.admits(found.candidate()))
+            .collect()
     }
 
     fn start(&mut self) -> Result<(), WatchError> {
@@ -268,15 +391,11 @@ impl Session<'_> {
             .scout
             .sighting(&self.policy.selection.options(), Reach::Everything)
             .map_err(WatchError::Sight)?;
-        self.remember_hosts(sighting.hosts)?;
-        let sighted = sighting
-            .report
-            .candidates
-            .into_iter()
-            .filter(|found| self.policy.selection.admits(found.candidate()))
-            .collect::<Vec<_>>();
-        let (settled, remaining): (Vec<&Found>, Vec<&Found>) =
-            sighted.iter().partition(|found| self.lets_go(found));
+        self.saw(&sighting.walked)?;
+        let sighted = self.admitted(sighting);
+        let (settled, remaining): (Vec<&Found>, Vec<&Found>) = sighted
+            .iter()
+            .partition(|found| auto::lets_go(&self.scout, found));
         let reap = auto::reap(&self.scout, &self.policy.selection, &settled, Mode::Execute);
         let remaining = remaining.into_iter().cloned().collect::<Vec<_>>();
         let pruned = prune::run(
@@ -286,14 +405,11 @@ impl Session<'_> {
             self.scout.owners(),
             Mode::Execute,
         );
-        for found in &remaining {
+        for found in remaining {
             let _fresh = self
                 .pool
-                .stock(found, &self.excludes, self.scout.protection());
-            let root = found.path().to_path_buf();
-            let survey = surveyed(&root);
-            self.follow(&root, survey.as_ref())?;
-            self.world.insert(root, found.clone());
+                .stock(&found, &self.excludes, self.scout.protection());
+            self.adopt(found, Adopted::Processed)?;
         }
         let shared = self.pool.share(
             &Focus::Everything,
@@ -312,20 +428,33 @@ impl Session<'_> {
         })
     }
 
-    fn reown(&mut self) -> Result<(), WatchError> {
+    fn reown(&mut self, scope: Option<&BTreeSet<PathBuf>>) -> Result<(), WatchError> {
+        self.scout.owners().forget(scope);
         let settled = self
             .world
-            .iter()
-            .filter(|(root, found)| {
-                let markers = match found.candidate().kind().protocol() {
-                    Some(_) => surveyed(root)
-                        .map(|survey| survey.markers)
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                Admits::Settled.admits(self.scout.owners().of(root, &markers).settlement())
+            .values()
+            .filter(|watched| {
+                scope.is_none_or(|repositories| {
+                    watched
+                        .repository
+                        .as_ref()
+                        .is_some_and(|repository| repositories.contains(repository))
+                })
             })
-            .map(|(_, found)| found.clone())
+            .filter(|watched| {
+                let markers = watched
+                    .survey
+                    .as_ref()
+                    .map_or(&[][..], |survey| survey.markers.as_slice());
+                Admits::Settled.admits(
+                    self.scout
+                        .owners()
+                        .of(watched.found.path(), markers)
+                        .settlement(),
+                )
+            })
+            .map(|watched| watched.found.clone())
+            .filter(|found| auto::confirmed(&self.scout, found.path()))
             .collect::<Vec<_>>();
         let reap = self.reap(&settled.iter().collect::<Vec<_>>());
         self.record(&WatchRecord {
@@ -339,25 +468,16 @@ impl Session<'_> {
         })
     }
 
-    fn refresh(&mut self) -> Result<(), WatchError> {
-        if self.watcher.recursive() {
-            self.reown()
-        } else {
-            self.resight()
-        }
-    }
-
-    fn resight(&mut self) -> Result<(), WatchError> {
+    fn resight(&mut self, loss: Loss) -> Result<(), WatchError> {
+        self.scout.owners().forget(None);
         let sighting = self
             .scout
             .sighting(&self.policy.selection.options(), Reach::Everything)
             .map_err(WatchError::Sight)?;
-        self.remember_hosts(sighting.hosts)?;
-        let sighted = sighting
-            .report
-            .candidates
+        self.saw(&sighting.walked)?;
+        let sighted = self
+            .admitted(sighting)
             .into_iter()
-            .filter(|found| self.policy.selection.admits(found.candidate()))
             .map(|found| (found.path().to_path_buf(), found))
             .collect::<BTreeMap<_, _>>();
         let vanished = self
@@ -369,14 +489,19 @@ impl Session<'_> {
         for root in vanished {
             self.forget(&root);
         }
-        let (settled, remaining): (Vec<&Found>, Vec<&Found>) =
-            sighted.values().partition(|found| self.lets_go(found));
+        let (settled, remaining): (Vec<&Found>, Vec<&Found>) = sighted
+            .values()
+            .partition(|found| auto::lets_go(&self.scout, found));
         let reap = self.reap(&settled);
         for found in remaining {
-            if self.world.contains_key(found.path()) {
-                self.world.insert(found.path().to_path_buf(), found.clone());
-            } else {
-                self.adopt(found.clone())?;
+            match self.world.get_mut(found.path()) {
+                Some(watched) => {
+                    watched.found = found.clone();
+                    if loss == Loss::Lost {
+                        self.lost_track(found.path());
+                    }
+                },
+                None => self.adopt(found.clone(), Adopted::Unprocessed)?,
             }
         }
         self.record(&WatchRecord {
@@ -390,69 +515,104 @@ impl Session<'_> {
         })
     }
 
-    fn appear(&mut self, directories: &BTreeSet<PathBuf>) -> Result<(), WatchError> {
-        let mut pending = directories
-            .iter()
-            .flat_map(|directory| {
-                directory
-                    .parent()
-                    .filter(|parent| self.roots.iter().any(|root| parent.starts_with(root)))
-                    .map(Path::to_path_buf)
-                    .into_iter()
-                    .chain([directory.clone()])
-            })
-            .collect::<Vec<_>>();
-        let mut visited = BTreeSet::new();
-        let mut appeared = Vec::new();
-        while let Some(directory) = pending.pop() {
-            if !visited.insert(directory.clone()) {
+    fn outside(&self, directory: &Path) -> bool {
+        self.owner(directory).is_none() && self.roots.iter().any(|root| directory.starts_with(root))
+    }
+
+    fn targets(
+        &self,
+        appeared: &BTreeSet<PathBuf>,
+        rescanned: &BTreeSet<PathBuf>,
+    ) -> BTreeMap<PathBuf, Reach> {
+        let mut targets = BTreeMap::new();
+        for path in appeared {
+            if evidence(path) {
+                if let Some(directory) = path.parent() {
+                    targets
+                        .entry(directory.to_path_buf())
+                        .or_insert(Reach::Children);
+                }
+            } else if is_directory(path) {
+                targets.insert(path.clone(), Reach::Everything);
+            }
+        }
+        for directory in rescanned {
+            if !self.walked.contains(directory) {
+                if is_directory(directory) {
+                    targets.insert(directory.clone(), Reach::Everything);
+                }
                 continue;
             }
-            let options = ScanOptions::sighting(
-                std::slice::from_ref(&directory),
-                &self.policy.selection.excludes,
-            );
-            let Ok(sighting) = self.scout.sighting(&options, Reach::Children) else {
-                continue;
-            };
-            let hosts = sighting
-                .hosts
-                .into_iter()
-                .filter(|host| self.hosts.insert(host.clone()))
-                .collect::<Vec<_>>();
-            self.follow_hosts(&hosts)?;
-            pending.extend(hosts);
-            let seen = sighting
-                .report
-                .candidates
-                .into_iter()
-                .filter(|found| self.policy.selection.admits(found.candidate()))
-                .map(|found| (found.path().to_path_buf(), found))
-                .collect::<BTreeMap<_, _>>();
-            let gone = self
-                .world
-                .keys()
-                .filter(|root| {
-                    root.parent() == Some(directory.as_path()) && !seen.contains_key(*root)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            for root in gone {
-                self.forget(&root);
-            }
-            for found in seen.into_values() {
-                if !self.world.contains_key(found.path())
-                    && !appeared_already(&appeared, found.path())
-                {
-                    appeared.push(found);
+            for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if matches!(entry.file_type(), Ok(kind) if kind.is_dir()) {
+                    if !self.walked.contains(&path) && !self.world.contains_key(&path) {
+                        targets.insert(path, Reach::Everything);
+                    }
+                } else if evidence(&path) {
+                    targets.entry(directory.clone()).or_insert(Reach::Children);
                 }
             }
         }
-        let (settled, remaining): (Vec<&Found>, Vec<&Found>) =
-            appeared.iter().partition(|found| self.lets_go(found));
+        targets.retain(|directory, _| self.outside(directory));
+        let everything = targets
+            .iter()
+            .filter(|(_, reach)| **reach == Reach::Everything)
+            .map(|(directory, _)| directory.clone())
+            .collect::<BTreeSet<_>>();
+        targets.retain(|directory, _| {
+            !directory
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| everything.contains(ancestor))
+        });
+        targets
+    }
+
+    fn sight(&self, directory: &Path, reach: Reach) -> Option<scan::Sighting> {
+        let excludes = &self.policy.selection.excludes;
+        let sighting = match (
+            self.roots.iter().any(|root| root == directory),
+            directory.parent(),
+            directory.file_name(),
+        ) {
+            (false, Some(parent), Some(name)) => {
+                self.scout.sighting_into(parent, (name, reach), excludes)
+            },
+            (true, _, _) | (false, None, _) | (false, _, None) => self.scout.sighting(
+                &ScanOptions::sighting(&[directory.to_path_buf()], excludes),
+                reach,
+            ),
+        };
+        match sighting {
+            Ok(sighting) => Some(sighting),
+            Err(_gone) => None,
+        }
+    }
+
+    fn examine(&mut self, targets: BTreeMap<PathBuf, Reach>) -> Result<(), WatchError> {
+        for (directory, reach) in &targets {
+            tracing::debug!(directory = %directory.display(), ?reach, "examine");
+        }
+        let mut appeared = BTreeMap::new();
+        let mut walked = Vec::new();
+        for (directory, reach) in targets {
+            if let Some(sighting) = self.sight(&directory, reach) {
+                walked.extend(sighting.walked.iter().cloned());
+                for found in self.admitted(sighting) {
+                    if !self.world.contains_key(found.path()) {
+                        appeared.insert(found.path().to_path_buf(), found);
+                    }
+                }
+            }
+        }
+        self.saw(&walked)?;
+        let (settled, remaining): (Vec<&Found>, Vec<&Found>) = appeared
+            .values()
+            .partition(|found| auto::lets_go(&self.scout, found));
         let reap = self.reap(&settled);
         for found in remaining {
-            self.adopt(found.clone())?;
+            self.adopt(found.clone(), Adopted::Unprocessed)?;
         }
         self.record(&WatchRecord {
             schema_version: SCHEMA_VERSION,
@@ -466,15 +626,22 @@ impl Session<'_> {
     }
 
     fn process(&mut self, root: &Path) -> Result<(), WatchError> {
-        let Some(found) = self.world.get(root).cloned() else {
-            self.dirty.remove(root);
+        self.dirty.remove(root);
+        let Some(entry) = self.world.get_mut(root) else {
             return Ok(());
         };
-        let Ok(survey) = busy::survey(root) else {
+        let fresh_survey = entry.whole || entry.resurvey || entry.survey.is_none();
+        if fresh_survey {
+            entry.survey = surveyed(root);
+            entry.resurvey = false;
+        }
+        let Some(survey) = entry.survey.clone() else {
             self.forget(root);
             return Ok(());
         };
-        self.dirty.remove(root);
+        if fresh_survey {
+            self.follow(&watched(root, Some(&survey)))?;
+        }
         match busy::held(&survey.locks) {
             busy::Holding::Free => {},
             busy::Holding::Unknown => return Ok(()),
@@ -485,6 +652,19 @@ impl Session<'_> {
                 return Ok(());
             },
         }
+        let Some(current) = self.world.get_mut(root) else {
+            return Ok(());
+        };
+        let found = current.found.clone();
+        let changed = std::mem::take(&mut current.changed);
+        let whole = std::mem::replace(&mut current.whole, false);
+        tracing::debug!(
+            root = %root.display(),
+            whole,
+            changed = changed.len(),
+            fresh_survey,
+            "process"
+        );
         let ownership = self.scout.owners().of(root, &survey.markers);
         if Admits::Settled.admits(ownership.settlement()) {
             let reap = self.reap(&[&found]);
@@ -498,21 +678,29 @@ impl Session<'_> {
                 dedupe: None,
             });
         }
-        let pruned = prune::run(
-            std::slice::from_ref(&found),
-            &self.excludes,
-            self.scout.protection(),
-            self.scout.owners(),
-            Mode::Execute,
+        let paths = changed.keys().cloned().collect::<BTreeSet<_>>();
+        let scope = if whole {
+            Scope::Everything
+        } else {
+            Scope::Changed(&paths)
+        };
+        let pruned = prune::run_changed(
+            &found,
+            &survey,
+            scope,
+            (&self.excludes, self.scout.protection(), self.scout.owners()),
         );
-        let identities = self
-            .pool
-            .stock(&found, &self.excludes, self.scout.protection());
+        let fresh = if whole {
+            self.pool
+                .stock(&found, &self.excludes, self.scout.protection())
+        } else {
+            self.pool.note(root, &changed)
+        };
         let roots = BTreeSet::from([root.to_path_buf()]);
         let shared = self.pool.share(
             &Focus::Fresh {
                 roots: &roots,
-                identities: &identities,
+                fresh: &fresh,
             },
             &self.excludes,
             self.scout.protection(),
@@ -542,36 +730,75 @@ impl Session<'_> {
         Ok(())
     }
 
+    fn lost_track(&mut self, root: &Path) {
+        if !self.written(root) {
+            return;
+        }
+        if let Some(watched) = self.world.get_mut(root) {
+            let parts = watched
+                .survey
+                .iter()
+                .flat_map(|survey| &survey.locks)
+                .filter_map(|lock| lock.path().parent())
+                .flat_map(|profile| PROFILE_PARTS.iter().map(|part| profile.join(part)))
+                .collect::<Vec<_>>();
+            for part in parts {
+                watched.changed.insert(part, Event::Unsure);
+            }
+            watched.resurvey = true;
+        }
+        self.dirty.insert(root.to_path_buf());
+    }
+
+    fn changed_within(&mut self, root: PathBuf, path: PathBuf, event: Event) {
+        let direct =
+            (path == root || path.parent() == Some(root.as_path())) && event != Event::Written;
+        if let Some(watched) = self.world.get_mut(&root) {
+            watched.resurvey |= direct || bookkeeping(&path);
+            watched.changed.insert(path, event);
+        }
+        self.dirty.insert(root);
+    }
+
     fn turn(&mut self, signals: Vec<Signal>) -> Result<(), WatchError> {
-        self.scout = self.scout.refreshed();
-        let mut hooked = self.hooks.raised().map_err(WatchError::Station)?;
+        let hooked = self.hooks.taken().map_err(WatchError::Station)?;
+        let mut refs = BTreeSet::new();
         let mut lost = false;
         let mut appeared = BTreeSet::new();
+        let mut rescanned = BTreeSet::new();
+        let mut follow = Vec::new();
         for signal in signals {
             match signal {
-                Signal::Changed(Change::Lost) => {
-                    lost = true;
-                    self.dirty.extend(self.world.keys().cloned());
-                },
-                Signal::Changed(Change::Directory(directory)) => {
-                    if directory.starts_with(&self.hooks.state) {
+                Signal::Changed(Change::Lost) => lost = true,
+                Signal::Changed(Change::Wake) => {},
+                Signal::Changed(Change::Entry { path, event }) => {
+                    if path.starts_with(&self.hooks.state) {
                         continue;
                     }
-                    match git_area(&directory) {
-                        GitArea::Refs => {
-                            hooked |= self.watcher.recursive();
+                    match git_area(&path) {
+                        GitArea::Refs(repository) => {
+                            refs.insert(repository);
                             continue;
                         },
                         GitArea::Other => continue,
                         GitArea::Outside => {},
                     }
-                    match self.owner(&directory) {
-                        Some(root) if self.written(&root) => {
-                            self.dirty.insert(root);
+                    match (self.owner(&path), event) {
+                        (Some(root), Event::Vanished) if root == path => self.forget(&root),
+                        (Some(root), _) if self.written(&root) => {
+                            follow.extend(event_watches(self.watcher.depth(), event, &path));
+                            self.changed_within(root, path, event);
                         },
-                        Some(_) => {},
-                        None => {
-                            appeared.insert(directory);
+                        (Some(_), _) => {},
+                        (None, Event::Vanished) => {
+                            self.walked.remove(&path);
+                        },
+                        (None, Event::Written) if !evidence(&path) => {},
+                        (None, Event::Unsure) => {
+                            rescanned.insert(path);
+                        },
+                        (None, Event::Appeared | Event::Written) => {
+                            appeared.insert(path);
                         },
                     }
                 },
@@ -583,15 +810,48 @@ impl Session<'_> {
                 },
             }
         }
+        self.follow(&follow)?;
+        tracing::debug!(
+            lost,
+            hooked = ?hooked,
+            refs = refs.len(),
+            appeared = appeared.len(),
+            rescanned = rescanned.len(),
+            dirty = self.dirty.len(),
+            "turn"
+        );
         if lost {
-            self.resight()?;
-        } else if hooked {
-            self.refresh()?;
-        } else if !appeared.is_empty() {
-            self.appear(&appeared)?;
+            self.resight(Loss::Lost)?;
+        } else {
+            match (hooked, self.covered) {
+                (Some(_), false) => self.resight(Loss::Kept)?,
+                (Some(repositories), true) if repositories.is_empty() => self.reown(None)?,
+                (Some(repositories), true) => {
+                    refs.extend(repositories);
+                    self.reown(Some(&refs))?;
+                },
+                (None, _) if !refs.is_empty() => self.reown(Some(&refs))?,
+                (None, _) => {},
+            }
+            let targets = self.targets(&appeared, &rescanned);
+            if !targets.is_empty() {
+                self.examine(targets)?;
+            }
         }
         self.settle()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Adopted {
+    Processed,
+    Unprocessed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Loss {
+    Lost,
+    Kept,
 }
 
 pub(crate) fn watch(
@@ -612,34 +872,36 @@ fn open<'a>(
     hooks: &'a Hooks<'a>,
 ) -> Result<(Session<'a>, Receiver<Signal>), WatchError> {
     let (sender, receiver): (Sender<Signal>, Receiver<Signal>) = mpsc::channel();
-    let mut paths = policy
+    let roots = policy
         .selection
         .roots
         .iter()
-        .filter_map(|root| match std::fs::canonicalize(root) {
+        .filter_map(|root| match fs::canonicalize(root) {
             Ok(canonical) => Some(canonical),
             Err(_absent) => None,
         })
         .collect::<Vec<_>>();
-    paths.push(hooks.state.clone());
+    let mut paths = roots.clone();
+    paths.push(hooks.signal.clone());
     let deliver = sender.clone();
-    let watcher = Watcher::start(&paths, move |change| {
+    let watcher = Watcher::start(&paths, hooks.station.notification(), move |change| {
         let _closed = deliver.send(Signal::Changed(change));
     })
     .map_err(WatchError::Events)?;
     let session = Session {
         scout: scout.refreshed(),
-        roots: paths,
+        roots,
         policy,
         excludes: scan::excludes(&policy.selection.excludes),
         hooks,
         world: BTreeMap::new(),
-        hosts: BTreeSet::new(),
         dirty: BTreeSet::new(),
         waiting: BTreeMap::new(),
         pool: Pool::default(),
         sender,
         watcher,
+        covered: true,
+        walked: BTreeSet::new(),
     };
     Ok((session, receiver))
 }
@@ -651,18 +913,27 @@ fn watching(
     render: &dyn Fn(&WatchRecord) -> io::Result<()>,
 ) -> Result<std::convert::Infallible, WatchError> {
     let state = store::state_dir()
-        .and_then(std::fs::canonicalize)
+        .and_then(fs::canonicalize)
         .map_err(WatchError::Station)?;
     let station = Station::for_policy(&state, config);
+    let signal = station.signal().map_err(WatchError::Station)?;
     let _held = station.wait().map_err(WatchError::Station)?;
     let hooks = Hooks {
         station,
         state,
+        signal,
         log: policy.log_file.clone(),
         render,
     };
     let (mut session, receiver) = open(scout, policy, &hooks)?;
-    let _raised = hooks.raised().map_err(WatchError::Station)?;
+    platform::background();
+    match rayon::ThreadPoolBuilder::new()
+        .start_handler(|_| platform::background())
+        .build_global()
+    {
+        Ok(()) | Err(_) => {},
+    }
+    let _raised = hooks.taken().map_err(WatchError::Station)?;
     session.start()?;
     loop {
         let first = receiver.recv().map_err(|_closed| WatchError::Ended)?;
@@ -677,6 +948,7 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
 
+    use storage_scout_core::share::Capability;
     use storage_scout_core::size::Bytes;
     use testkit::{MarkerKeep, MarkerRole, write_sized};
 
@@ -708,20 +980,35 @@ mod tests {
             records.borrow_mut().push(record.clone());
             Ok(())
         };
+        let station = Station::for_policy(&state, &base.join("auto.toml"));
+        let signal = station.signal().unwrap();
         let hooks = Hooks {
-            station: Station::for_policy(&state, &base.join("auto.toml")),
+            station,
             state,
+            signal,
             log: None,
             render: &render,
         };
         let scout = Scout::with(testkit::open_protection()).confined(vec![base]);
         let (mut session, _receiver) = open(&scout, &policy, &hooks).unwrap();
         session.start().unwrap();
+        assert!(session.dirty.is_empty());
         check(&mut session, &root, &records);
     }
 
-    fn changed(directory: &Path) -> Signal {
-        Signal::Changed(Change::Directory(directory.to_path_buf()))
+    fn entry(path: &Path, event: Event) -> Signal {
+        Signal::Changed(Change::Entry {
+            path: path.to_path_buf(),
+            event,
+        })
+    }
+
+    fn appeared(path: &Path) -> Signal {
+        entry(path, Event::Appeared)
+    }
+
+    fn written(path: &Path) -> Signal {
+        entry(path, Event::Written)
     }
 
     fn profile(root: &Path, name: &str) -> PathBuf {
@@ -755,6 +1042,90 @@ mod tests {
             }
         }
         old
+    }
+
+    #[test]
+    fn watcher_helpers_distinguish_repositories_bookkeeping_and_writer_profiles() {
+        let temp = testkit::tempdir("watch-unit-helpers");
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let file = root.join("file");
+        write_sized(&file, 1);
+        assert!(!is_directory(&file));
+        assert!(!is_directory(&root.join("missing")));
+        assert!(is_directory(&root));
+        assert!(refs(&root).is_empty());
+
+        testkit::make_dir(&root.join(".git/refs/heads/nested"));
+        testkit::make_dir(&root.join(".git/worktrees/one"));
+        assert_eq!(
+            directory_tree(&root.join(".git/refs"))
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                root.join(".git/refs"),
+                root.join(".git/refs/heads"),
+                root.join(".git/refs/heads/nested"),
+            ])
+        );
+        assert!(directory_tree(&file).is_empty());
+        assert_eq!(
+            refs(&root).into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                root.join(".git"),
+                root.join(".git/refs"),
+                root.join(".git/refs/heads"),
+                root.join(".git/refs/heads/nested"),
+                root.join(".git/worktrees"),
+                root.join(".git/worktrees/one"),
+            ])
+        );
+        assert!(additional_watches(WatchDepth::Recursive, std::slice::from_ref(&root)).is_empty());
+        assert_eq!(
+            additional_watches(WatchDepth::Named, std::slice::from_ref(&root))
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                root.clone(),
+                root.join(".git"),
+                root.join(".git/refs"),
+                root.join(".git/refs/heads"),
+                root.join(".git/refs/heads/nested"),
+                root.join(".git/worktrees"),
+                root.join(".git/worktrees/one"),
+            ])
+        );
+        assert!(complete(Coverage::Complete));
+        assert!(!complete(Coverage::Partial));
+
+        assert!(event_watches(WatchDepth::Recursive, Event::Appeared, &root).is_empty());
+        assert!(event_watches(WatchDepth::Named, Event::Written, &root).is_empty());
+        assert_eq!(
+            event_watches(WatchDepth::Named, Event::Appeared, &root)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            directory_tree(&root).into_iter().collect::<BTreeSet<_>>()
+        );
+
+        assert!(bookkeeping(Path::new("owner.json")));
+        assert!(bookkeeping(Path::new("debug/.cargo-lock")));
+        assert!(!bookkeeping(Path::new("notes.txt")));
+        assert!(!bookkeeping(Path::new("")));
+
+        let debug = profile(&root, "app");
+        let target = debug.parent().unwrap();
+        let survey = surveyed(target).unwrap();
+        assert_eq!(
+            super::watched(target, Some(&survey)),
+            [
+                target.to_path_buf(),
+                target.parent().unwrap().to_path_buf(),
+                debug.clone(),
+                debug.join("deps"),
+                debug.join("incremental"),
+                debug.join("build"),
+                debug.join("examples"),
+            ]
+        );
     }
 
     fn last_cause(state: &Path) -> Option<String> {
@@ -800,34 +1171,40 @@ mod tests {
                 let debug = target.join("debug");
                 let old = build(&debug, "one");
                 session
-                    .turn(vec![changed(&debug.join("incremental/one"))])
+                    .turn(vec![appeared(&debug.join("incremental/one"))])
                     .unwrap();
                 assert_eq!(pruned_so_far(records), 1);
                 testkit::assert_absent(&old);
                 assert!(session.dirty.is_empty());
                 let quiet = records.borrow().len();
-                session.turn(vec![changed(&debug.join("deps"))]).unwrap();
+                session
+                    .turn(vec![written(&debug.join("deps/libx.rlib"))])
+                    .unwrap();
                 assert_eq!(records.borrow().len(), quiet);
 
                 let batched = build(&debug, "three");
                 let state = session.hooks.state.clone();
                 session
                     .turn(vec![
-                        changed(&state),
-                        changed(&root.join("repo/.git/refs/heads")),
-                        changed(&root.join("repo/.git/objects/ab")),
-                        changed(&debug.join("incremental/three")),
+                        appeared(&state.join("flag")),
+                        appeared(&root.join("repo/.git/objects/ab")),
+                        appeared(&debug.join("incremental/three")),
                     ])
                     .unwrap();
                 assert_eq!(pruned_so_far(records), 2);
                 testkit::assert_absent(&batched);
 
+                let untouched = build(&debug, "four");
                 let holder = File::open(debug.join(".cargo-lock")).unwrap();
                 holder.lock().unwrap();
                 let busy = build(&debug, "two");
-                session.turn(vec![changed(&debug.join("deps"))]).unwrap();
+                session
+                    .turn(vec![appeared(&debug.join("incremental/two"))])
+                    .unwrap();
                 assert!(session.waiting.contains_key(&target));
-                session.turn(vec![changed(&debug.join("deps"))]).unwrap();
+                session
+                    .turn(vec![written(&debug.join("deps/libx.rlib"))])
+                    .unwrap();
                 assert_eq!(pruned_so_far(records), 2);
                 testkit::assert_present(&busy);
                 drop(holder);
@@ -837,7 +1214,31 @@ mod tests {
                     .unwrap();
                 assert_eq!(pruned_so_far(records), 3);
                 testkit::assert_absent(&busy);
+                testkit::assert_present(&untouched);
                 assert!(!session.waiting.contains_key(&target));
+            },
+        );
+    }
+
+    #[test]
+    fn named_watchers_follow_walked_directories_and_recursive_watchers_do_not_add_them() {
+        watched(
+            "watch-unit-follow-walked",
+            |_| {},
+            |session, root, _records| {
+                let named = root.join("named");
+                let recursive = root.join("recursive");
+                testkit::make_dir(&named.join(".git/refs/heads"));
+                testkit::make_dir(&recursive);
+                session
+                    .saw_with(std::slice::from_ref(&named), WatchDepth::Named)
+                    .unwrap();
+                session
+                    .saw_with(std::slice::from_ref(&recursive), WatchDepth::Recursive)
+                    .unwrap();
+                assert!(session.covered);
+                assert!(session.walked.contains(&named));
+                assert!(session.walked.contains(&recursive));
             },
         );
     }
@@ -857,72 +1258,146 @@ mod tests {
             |session, root, records| {
                 assert!(session.world.is_empty());
                 let debug = profile(root, "late");
-                session.turn(vec![changed(root)]).unwrap();
+                session.turn(vec![appeared(&root.join("late"))]).unwrap();
                 let target = root.join("late/target");
                 assert!(
                     session.world.contains_key(&target),
                     "{:?}",
                     session.world.keys()
                 );
-                assert!(session.hosts.contains(&root.join("late")));
                 let old = build(&debug, "one");
-                session.turn(vec![changed(&debug.join("deps"))]).unwrap();
+                session
+                    .turn(vec![appeared(&debug.join("incremental/one"))])
+                    .unwrap();
                 assert_eq!(pruned_so_far(records), 1);
                 testkit::assert_absent(&old);
 
                 let unannounced = build(&debug, "two");
-                session.turn(vec![changed(&root.join("late"))]).unwrap();
+                session
+                    .turn(vec![written(&root.join("late/Cargo.toml"))])
+                    .unwrap();
                 let quiet = profile(root, "quiet");
                 let state = session.hooks.state.clone();
-                session.turn(vec![changed(&state)]).unwrap();
+                session.turn(vec![appeared(&state.join("flag"))]).unwrap();
+                session
+                    .turn(vec![written(&root.join("notes.txt"))])
+                    .unwrap();
                 assert!(!session.world.contains_key(&root.join("quiet/target")));
                 let run = root.join("run");
                 testkit::write_owner_lock(&run);
                 write_sized(&run.join("scratch.bin"), 64);
-                session.turn(vec![changed(root)]).unwrap();
+                session.turn(vec![appeared(&run)]).unwrap();
+                assert!(!session.world.contains_key(&run));
                 testkit::write_owner_json(&run, MarkerRole::Scratch, MarkerKeep::Released, None);
-                session.turn(vec![changed(&run)]).unwrap();
+                session
+                    .turn(vec![appeared(&run.join("owner.json"))])
+                    .unwrap();
                 assert_eq!(reaped(records), 1);
                 testkit::assert_absent(&run);
                 assert!(!session.world.contains_key(&run));
                 assert_eq!(pruned_so_far(records), 1);
                 testkit::assert_present(&unannounced);
+                session
+                    .turn(vec![appeared(
+                        &root.with_file_name("outside").join("owner.json"),
+                    )])
+                    .unwrap();
                 testkit::assert_present(root.with_file_name("outside"));
 
                 let deep = profile(root, "deep");
-                session.turn(vec![changed(deep.parent().unwrap())]).unwrap();
+                session
+                    .turn(vec![appeared(deep.parent().unwrap())])
+                    .unwrap();
                 assert!(session.world.contains_key(&root.join("deep/target")));
                 drop(quiet);
 
-                write_sized(&root.join("aa/Cargo.toml"), 1);
-                session.turn(vec![changed(root)]).unwrap();
-                assert!(session.hosts.contains(&root.join("aa")));
-                let _aa = profile(root, "aa");
-                testkit::make_dir(&root.join("b"));
-                testkit::make_dir(&root.join("c"));
-                session
-                    .turn(vec![
-                        changed(&root.join("aa/target")),
-                        changed(&root.join("b")),
-                        changed(&root.join("c")),
-                    ])
-                    .unwrap();
-                assert!(session.world.contains_key(&root.join("aa/target")));
-
-                write_sized(&root.join("ab/Cargo.toml"), 1);
-                write_sized(&root.join("ac/Cargo.toml"), 1);
-                session.turn(vec![changed(root)]).unwrap();
                 let _ab = profile(root, "ab");
                 let _ac = profile(root, "ac");
                 session
                     .turn(vec![
-                        changed(&root.join("ab")),
-                        changed(&root.join("ac")),
-                        changed(&root.join("zz-gone")),
+                        appeared(&root.join("ab")),
+                        appeared(&root.join("ac")),
+                        appeared(&root.join("zz-gone")),
                     ])
                     .unwrap();
                 assert!(session.world.contains_key(&root.join("ab/target")));
                 assert!(session.world.contains_key(&root.join("ac/target")));
+            },
+        );
+    }
+
+    #[test]
+    fn an_unsure_directory_only_examines_new_children_and_new_evidence() {
+        watched(
+            "watch-unit-unsure",
+            |root| {
+                testkit::make_dir(&root.join("known"));
+            },
+            |session, root, _records| {
+                let known = root.join("known");
+                assert!(session.walked.contains(&known));
+                write_sized(&known.join("notes.txt"), 1);
+                assert!(
+                    session
+                        .targets(&BTreeSet::new(), &BTreeSet::from([known.clone()]))
+                        .is_empty()
+                );
+
+                let first = root.join("first");
+                let second = root.join("second");
+                let missing = root.join("missing");
+                testkit::make_dir(&first);
+                testkit::make_dir(&second);
+                assert_eq!(
+                    session.targets(
+                        &BTreeSet::new(),
+                        &BTreeSet::from([first.clone(), missing, second.clone()])
+                    ),
+                    BTreeMap::from([
+                        (first.clone(), Reach::Everything),
+                        (second.clone(), Reach::Everything)
+                    ])
+                );
+
+                let plain = root.join("plain.txt");
+                write_sized(&plain, 1);
+                assert!(
+                    session
+                        .targets(&BTreeSet::from([plain]), &BTreeSet::new())
+                        .is_empty()
+                );
+                let new = root.join("new");
+                let _debug = profile(root, "new");
+                assert_eq!(
+                    session.targets(&BTreeSet::new(), &BTreeSet::from([root.to_path_buf()])),
+                    BTreeMap::from([
+                        (first, Reach::Everything),
+                        (new.clone(), Reach::Everything),
+                        (second, Reach::Everything)
+                    ])
+                );
+                session.turn(vec![entry(root, Event::Unsure)]).unwrap();
+                assert!(session.world.contains_key(&new.join("target")));
+                assert!(session.walked.contains(&new));
+                assert!(
+                    session
+                        .targets(&BTreeSet::new(), &BTreeSet::from([root.to_path_buf()]))
+                        .is_empty()
+                );
+
+                write_sized(&known.join("Cargo.toml"), 1);
+                assert_eq!(
+                    session.targets(&BTreeSet::new(), &BTreeSet::from([known.clone()])),
+                    BTreeMap::from([(known, Reach::Children)])
+                );
+
+                let parent = root.join("parent");
+                let child = parent.join("child");
+                testkit::make_dir(&child);
+                assert_eq!(
+                    session.targets(&BTreeSet::from([parent.clone(), child]), &BTreeSet::new()),
+                    BTreeMap::from([(parent, Reach::Everything)])
+                );
             },
         );
     }
@@ -946,7 +1421,7 @@ mod tests {
                 let run = root.join("run");
                 testkit::write_owner_marker(&run, MarkerRole::Scratch, MarkerKeep::Released, None);
                 let owner = testkit::claim(&run);
-                session.turn(vec![changed(root)]).unwrap();
+                session.turn(vec![appeared(&run)]).unwrap();
                 assert!(session.waiting.contains_key(&run));
                 assert_eq!(reaped(records), 1);
                 drop(owner);
@@ -965,7 +1440,7 @@ mod tests {
                 write_sized(&held.join("debug/.cargo-lock"), 0);
                 let build = File::open(held.join("debug/.cargo-lock")).unwrap();
                 build.lock().unwrap();
-                session.turn(vec![changed(root)]).unwrap();
+                session.turn(vec![appeared(&held)]).unwrap();
                 assert!(session.waiting.contains_key(&held));
                 assert_eq!(reaped(records), 2);
                 drop(build);
@@ -983,7 +1458,7 @@ mod tests {
                 );
                 testkit::make_dir(&sealed.join("private"));
                 if let Some(_restricted) = testkit::restrict(&sealed.join("private"), 0o000) {
-                    session.turn(vec![changed(root)]).unwrap();
+                    session.turn(vec![appeared(&sealed)]).unwrap();
                     assert_eq!(reaped(records), 3);
                     assert!(!session.world.contains_key(&sealed));
                 }
@@ -991,8 +1466,189 @@ mod tests {
                 let target = root.join("gone/target");
                 assert!(session.world.contains_key(&target));
                 testkit::remove_tree(&target);
-                session.turn(vec![changed(&root.join("gone"))]).unwrap();
+                session.turn(vec![entry(&target, Event::Vanished)]).unwrap();
                 assert!(!session.world.contains_key(&target));
+            },
+        );
+    }
+
+    #[test]
+    fn lost_and_direct_changes_refresh_only_writer_candidates() {
+        watched(
+            "watch-unit-change-scope",
+            |root| {
+                let _debug = profile(root, "app");
+                write_sized(&root.join("tool/tool.py"), 1);
+                write_sized(&root.join("tool/__pycache__/tool.cpython-312.pyc"), 64);
+            },
+            |session, root, _records| {
+                let target = root.join("app/target");
+                let cache = root.join("tool/__pycache__");
+                assert!(session.written(&target));
+                assert!(!session.written(&cache));
+
+                session
+                    .waiting
+                    .insert(cache.clone(), std::thread::spawn(|| {}));
+                session
+                    .turn(vec![written(&cache.join("tool.cpython-312.pyc"))])
+                    .unwrap();
+                assert!(session.dirty.is_empty());
+                assert!(session.world.get(&cache).unwrap().changed.is_empty());
+                session.waiting.remove(&cache).unwrap().join().unwrap();
+
+                session.lost_track(&cache);
+                assert!(session.dirty.is_empty());
+                assert!(!session.world.get(&cache).unwrap().resurvey);
+
+                session.lost_track(&target);
+                assert_eq!(session.dirty, BTreeSet::from([target.clone()]));
+                let lost_watched = session.world.get(&target).unwrap();
+                assert!(lost_watched.resurvey);
+                assert_eq!(
+                    lost_watched
+                        .changed
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                    PROFILE_PARTS
+                        .iter()
+                        .map(|part| target.join("debug").join(part))
+                        .collect::<BTreeSet<_>>()
+                );
+
+                let cases = [
+                    (target.clone(), Event::Appeared, true),
+                    (target.join("direct"), Event::Appeared, true),
+                    (target.clone(), Event::Written, false),
+                    (target.join("deep/file"), Event::Appeared, false),
+                    (target.join("deep/owner.json"), Event::Written, true),
+                ];
+                for (path, event, expected) in cases {
+                    session.dirty.clear();
+                    let pending = session.world.get_mut(&target).unwrap();
+                    pending.changed.clear();
+                    pending.resurvey = false;
+                    session.changed_within(target.clone(), path.clone(), event);
+                    let changed = session.world.get(&target).unwrap();
+                    assert_eq!(changed.resurvey, expected, "{}", path.display());
+                    assert_eq!(changed.changed.get(&path), Some(&event));
+                    assert_eq!(session.dirty, BTreeSet::from([target.clone()]));
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn processing_refreshes_a_survey_only_when_the_change_requires_it() {
+        watched(
+            "watch-unit-survey-refresh",
+            |root| {
+                let _debug = profile(root, "app");
+            },
+            |session, root, _records| {
+                let target = root.join("app/target");
+                assert_eq!(
+                    session.world[&target].survey.as_ref().unwrap().locks.len(),
+                    1
+                );
+                let release = target.join("release");
+                write_sized(&release.join(".cargo-lock"), 0);
+                testkit::make_dir(&release.join(".fingerprint"));
+                write_sized(&target.join("debug/deps/changed.rlib"), 64);
+                session
+                    .turn(vec![written(&target.join("debug/deps/changed.rlib"))])
+                    .unwrap();
+                assert_eq!(
+                    session.world[&target].survey.as_ref().unwrap().locks.len(),
+                    1
+                );
+
+                session
+                    .turn(vec![appeared(&target.join("release"))])
+                    .unwrap();
+                assert_eq!(
+                    session.world[&target].survey.as_ref().unwrap().locks.len(),
+                    2
+                );
+                assert!(!session.world[&target].resurvey);
+
+                let custom = target.join("custom");
+                write_sized(&custom.join(".cargo-lock"), 0);
+                testkit::make_dir(&custom.join(".fingerprint"));
+                session.world.get_mut(&target).unwrap().whole = true;
+                session.dirty.insert(target.clone());
+                session.process(&target).unwrap();
+                assert_eq!(
+                    session.world[&target].survey.as_ref().unwrap().locks.len(),
+                    3
+                );
+                assert!(!session.world[&target].whole);
+            },
+        );
+    }
+
+    #[test]
+    fn whole_processing_inventories_files_beyond_the_named_changes() {
+        watched(
+            "watch-unit-whole-stock",
+            |root| {
+                let _one = profile(root, "one");
+                let _two = profile(root, "two");
+            },
+            |session, root, _records| {
+                let one = root.join("one/target");
+                let two = root.join("two/target");
+                if !matches!(
+                    platform::filesystem(&one).map(Capability::of),
+                    Ok(Capability::Shares { .. })
+                ) {
+                    assert!(
+                        std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_none(),
+                        "this volume must share blocks"
+                    );
+                    let _skipped =
+                        testkit::Built::Unavailable(String::from("sharing is refused here"))
+                            .or_decline("a volume that shares blocks");
+                    return;
+                }
+                let first = one.join("debug/deps/libsame.rlib");
+                let second = two.join("debug/deps/libsame.rlib");
+                let first_hidden = one.join("debug/deps/libhidden.rlib");
+                let second_hidden = two.join("debug/deps/libhidden.rlib");
+                testkit::write_patterned(&first, 256 * 1024, 7);
+                testkit::write_patterned(&second, 256 * 1024, 7);
+                testkit::write_patterned(&first_hidden, 256 * 1024, 8);
+                testkit::write_patterned(&second_hidden, 256 * 1024, 8);
+                session.world.get_mut(&one).unwrap().whole = true;
+                session.dirty.insert(one.clone());
+                session.process(&one).unwrap();
+                assert_eq!(session.pool.file_count(&one), 2);
+                assert_eq!(session.pool.file_count(&two), 0);
+
+                session.turn(vec![written(&second)]).unwrap();
+                assert_eq!(session.pool.file_count(&two), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn a_partial_coverage_hook_resights_without_treating_kept_events_as_lost() {
+        watched(
+            "watch-unit-hook-resight",
+            |root| {
+                let _debug = profile(root, "app");
+            },
+            |session, root, records| {
+                let target = root.join("app/target");
+                let old = build(&target.join("debug"), "one");
+                session.covered = false;
+                session.hooks.station.raise_for(None).unwrap();
+                session.turn(Vec::new()).unwrap();
+                assert!(session.dirty.is_empty());
+                assert!(!session.world.get(&target).unwrap().resurvey);
+                assert_eq!(pruned_so_far(records), 0);
+                testkit::assert_present(old);
             },
         );
     }
@@ -1018,7 +1674,8 @@ mod tests {
                     MarkerKeep::Kept,
                     None,
                 );
-                for (name, keyed) in [("second", "key-two"), ("third", "key-three")] {
+                testkit::make_dir(&root.join("repo/.git/refs"));
+                for (name, keyed) in [("repo/second", "key-two"), ("third", "key-three")] {
                     let keyed = root.with_file_name(keyed);
                     testkit::make_dir(&keyed);
                     testkit::write_owner_marker(
@@ -1033,41 +1690,35 @@ mod tests {
             },
             |session, root, records| {
                 assert_eq!(session.world.len(), 6, "{:?}", session.world.keys());
-                let recursive = session.watcher.recursive();
                 testkit::remove_tree(&root.with_file_name("key"));
                 session.turn(vec![]).unwrap();
                 assert_eq!(reaped(records), 0);
                 let unannounced = build(&root.join("app/target/debug"), "one");
                 let fresh = profile(root, "fresh");
-                testkit::remove_tree(&root.join("doomed/target"));
-                session.hooks.station.raise().unwrap();
+                session.hooks.station.raise_for(None).unwrap();
                 session.turn(vec![]).unwrap();
                 assert_eq!(reaped(records), 1);
                 assert_eq!(records.borrow().last().unwrap().cause, Cause::Hook);
                 testkit::assert_absent(root.join("cache"));
                 assert!(session.world.contains_key(&root.join("guarded")));
-                assert_eq!(
-                    session
+                assert!(
+                    !session
                         .world
-                        .contains_key(&fresh.parent().unwrap().to_path_buf()),
-                    !recursive
-                );
-                assert_eq!(
-                    session.world.contains_key(&root.join("doomed/target")),
-                    recursive
+                        .contains_key(&fresh.parent().unwrap().to_path_buf())
                 );
                 assert_eq!(pruned_so_far(records), 0);
                 testkit::assert_present(&unannounced);
 
                 testkit::remove_tree(&root.with_file_name("key-two"));
-                let refs = root.join("repo/.git/refs/remotes/origin");
-                session.turn(vec![changed(&refs)]).unwrap();
-                let expected = usize::from(recursive);
-                assert_eq!(reaped(records), 1 + expected);
+                let refs = root.join("repo/.git/refs/remotes/origin/main");
+                session.turn(vec![written(&refs)]).unwrap();
+                assert_eq!(reaped(records), 2);
+                testkit::assert_absent(root.join("repo/second"));
 
                 let late = profile(root, "unseen");
                 let waste = build(&late, "one");
                 testkit::remove_tree(&root.with_file_name("key-three"));
+                testkit::remove_tree(&root.join("doomed/target"));
                 let before = records.borrow().len();
                 session.turn(vec![Signal::Changed(Change::Lost)]).unwrap();
                 assert!(
@@ -1084,13 +1735,92 @@ mod tests {
                         .any(|record| record.cause == Cause::Hook && record.reap.is_some())
                 );
                 testkit::assert_absent(root.join("third"));
-                testkit::assert_absent(root.join("second"));
-                assert!(!session.world.contains_key(&root.join("second")));
+                assert!(!session.world.contains_key(&root.join("repo/second")));
                 assert!(!session.world.contains_key(&root.join("doomed/target")));
                 assert!(session.world.contains_key(&root.join("guarded")));
                 assert_eq!(pruned_so_far(records), 2);
                 testkit::assert_absent(&unannounced);
                 testkit::assert_absent(&waste);
+            },
+        );
+    }
+
+    #[test]
+    fn a_hook_only_rechecks_its_repository_unless_its_origin_is_unknown() {
+        watched(
+            "watch-unit-hook-scope",
+            |root| {
+                for name in ["one", "two"] {
+                    testkit::make_dir(&root.join(name).join(".git"));
+                    let key = root.join(format!("key-{name}"));
+                    testkit::make_dir(&key);
+                    testkit::write_owner_marker(
+                        &root.join(name).join("cache"),
+                        MarkerRole::Cache,
+                        MarkerKeep::Released,
+                        Some(&key),
+                    );
+                }
+            },
+            |session, root, records| {
+                assert!(session.world.contains_key(&root.join("one/cache")));
+                assert!(session.world.contains_key(&root.join("two/cache")));
+                testkit::remove_tree(&root.join("key-one"));
+                testkit::remove_tree(&root.join("key-two"));
+
+                session
+                    .hooks
+                    .station
+                    .raise_for(Some(&root.join("one/.git")))
+                    .unwrap();
+                session.turn(Vec::new()).unwrap();
+                assert_eq!(reaped(records), 1);
+                testkit::assert_absent(root.join("one/cache"));
+                testkit::assert_present(root.join("two/cache"));
+
+                session.hooks.station.raise_for(None).unwrap();
+                session.turn(Vec::new()).unwrap();
+                assert_eq!(reaped(records), 2);
+                testkit::assert_absent(root.join("two/cache"));
+            },
+        );
+    }
+
+    #[test]
+    fn batched_ref_candidate_and_evidence_events_keep_their_own_scopes() {
+        watched(
+            "watch-unit-event-scope",
+            |root| {
+                let _debug = profile(root, "app");
+                testkit::make_dir(&root.join("repo/.git/refs"));
+            },
+            |session, root, records| {
+                let target = root.join("app/target");
+                let nested = target.join("debug/deps/gone.rlib");
+                write_sized(&nested, 64);
+                testkit::remove_file(&nested);
+                session.turn(vec![entry(&nested, Event::Vanished)]).unwrap();
+                assert!(session.world.contains_key(&target));
+
+                let old = build(&target.join("debug"), "ref-batch");
+                session
+                    .turn(vec![
+                        written(&root.join("repo/.git/refs/heads/main")),
+                        appeared(&target.join("debug/incremental/ref-batch")),
+                    ])
+                    .unwrap();
+                assert_eq!(pruned_so_far(records), 1);
+                testkit::assert_absent(old);
+
+                let late = profile(root, "late");
+                session
+                    .turn(vec![written(&root.join("late/Cargo.toml"))])
+                    .unwrap();
+                assert!(
+                    session
+                        .world
+                        .contains_key(&late.parent().unwrap().to_path_buf())
+                );
             },
         );
     }
@@ -1106,14 +1836,16 @@ mod tests {
             |session, root, records| {
                 assert_eq!(session.world.len(), 1, "{:?}", session.world.keys());
                 let state = session.hooks.state.clone();
-                session.turn(vec![changed(&state)]).unwrap();
+                session.turn(vec![appeared(&state.join("flag"))]).unwrap();
                 session
-                    .turn(vec![changed(&root.join("tool/__pycache__"))])
+                    .turn(vec![written(
+                        &root.join("tool/__pycache__/tool.cpython-312.pyc"),
+                    )])
                     .unwrap();
                 assert!(session.dirty.is_empty());
                 assert_eq!(records.borrow().len(), 1);
                 session
-                    .turn(vec![changed(&root.join("repo/.git/objects/ab"))])
+                    .turn(vec![appeared(&root.join("repo/.git/objects/ab"))])
                     .unwrap();
                 assert!(session.dirty.is_empty());
                 assert_eq!(records.borrow().len(), 1);
@@ -1176,12 +1908,22 @@ mod tests {
 
     #[test]
     fn a_ref_update_is_told_apart_from_other_git_writes() {
-        assert_eq!(
-            git_area(Path::new("/w/app/.git/refs/remotes/origin")),
-            GitArea::Refs
-        );
-        assert_eq!(git_area(Path::new("/w/app/.git/refs")), GitArea::Refs);
+        let repository = PathBuf::from("/w/app/.git");
+        for refs in [
+            "/w/app/.git/refs/remotes/origin",
+            "/w/app/.git/refs",
+            "/w/app/.git/packed-refs",
+            "/w/app/.git/HEAD",
+            "/w/app/.git/worktrees/lies/HEAD",
+        ] {
+            assert_eq!(
+                git_area(Path::new(refs)),
+                GitArea::Refs(repository.clone()),
+                "{refs}"
+            );
+        }
         assert_eq!(git_area(Path::new("/w/app/.git")), GitArea::Other);
+        assert_eq!(git_area(Path::new("/w/app/.git/index")), GitArea::Other);
         assert_eq!(
             git_area(Path::new("/w/app/.git/objects/ab")),
             GitArea::Other

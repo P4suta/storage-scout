@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -79,11 +79,18 @@ enum Dot {
     Unreadable,
 }
 
+fn dot_failure(kind: io::ErrorKind) -> Dot {
+    if kind == io::ErrorKind::NotFound {
+        Dot::Absent
+    } else {
+        Dot::Unreadable
+    }
+}
+
 fn dot_git(directory: &Path) -> Dot {
     let path = directory.join(".git");
     match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Dot::Absent,
-        Err(_unreadable) => Dot::Unreadable,
+        Err(error) => dot_failure(error.kind()),
         Ok(metadata) if metadata.file_type().is_dir() => Dot::Directory,
         Ok(metadata) if metadata.file_type().is_file() => Dot::File(path),
         Ok(_other) => Dot::Unreadable,
@@ -106,6 +113,21 @@ fn gitdir(file: &Path) -> Option<PathBuf> {
 }
 
 impl Owners {
+    pub(crate) fn forget(&self, repositories: Option<&BTreeSet<PathBuf>>) {
+        let mut worktrees = match self.worktrees.lock() {
+            Ok(worktrees) => worktrees,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match repositories {
+            None => worktrees.clear(),
+            Some(repositories) => worktrees.retain(|root, _| {
+                !self
+                    .repository(root)
+                    .is_some_and(|found| repositories.contains(&found))
+            }),
+        }
+    }
+
     pub(crate) fn new(ceilings: Vec<PathBuf>) -> Self {
         Self {
             ceilings: ceilings
@@ -134,6 +156,28 @@ impl Owners {
 
     fn ceiling(&self, directory: &Path) -> bool {
         self.ceilings.iter().any(|ceiling| ceiling == directory)
+    }
+
+    pub(crate) fn repository(&self, path: &Path) -> Option<PathBuf> {
+        let path = match fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(_unresolvable) => path.to_path_buf(),
+        };
+        path.ancestors()
+            .take_while(|directory| !self.ceiling(directory))
+            .find_map(|directory| match dot_git(directory) {
+                Dot::Directory => Some(directory.join(".git")),
+                Dot::File(file) => gitdir(&file)
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf),
+                Dot::Absent | Dot::Unreadable => None,
+            })
+            .map(|repository| match fs::canonicalize(&repository) {
+                Ok(canonical) => canonical,
+                Err(_unresolvable) => repository,
+            })
     }
 
     fn worktree(&self, root: &Path, dot: Dot) -> Option<Worktree> {
@@ -222,5 +266,83 @@ mod tests {
         let empty = OsString::new();
         assert!(Owners::from_ceilings(Some(&empty)).ceilings.is_empty());
         assert_eq!(owners.clone().ceilings, owners.ceilings);
+    }
+
+    #[test]
+    fn forgetting_one_repository_keeps_the_other_repositories_answers() {
+        let temp = testkit::tempdir("owners-forget");
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let one = base.join("one");
+        let two = base.join("two");
+        testkit::make_dir(&one.join(".git"));
+        testkit::make_dir(&two.join(".git"));
+        let owners = Owners::default();
+        let _one = owners.of(&one, &[]);
+        let _two = owners.of(&two, &[]);
+        assert_eq!(owners.worktrees.lock().unwrap().len(), 2);
+
+        owners.forget(Some(&BTreeSet::from([one.join(".git")])));
+        let cached = owners.worktrees.lock().unwrap();
+        assert!(!cached.contains_key(&one));
+        assert!(cached.contains_key(&two));
+        drop(cached);
+
+        owners.forget(None);
+        assert!(owners.worktrees.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_git_file_has_to_name_a_git_directory() {
+        let temp = testkit::tempdir("owners-git-file");
+        let file = temp.path().join(".git");
+        assert_eq!(gitdir(&file), None);
+        testkit::write_bytes(&file, b"not a git directory\n");
+        assert_eq!(gitdir(&file), None);
+        testkit::write_bytes(&file, b"gitdir: ../repository/.git/worktrees/linked\n");
+        assert_eq!(
+            gitdir(&file),
+            Some(temp.path().join("../repository/.git/worktrees/linked"))
+        );
+    }
+
+    #[test]
+    fn only_a_missing_dot_git_is_absent() {
+        assert!(matches!(dot_failure(io::ErrorKind::NotFound), Dot::Absent));
+        assert!(matches!(
+            dot_failure(io::ErrorKind::PermissionDenied),
+            Dot::Unreadable
+        ));
+    }
+
+    #[test]
+    fn a_repository_has_one_canonical_name() {
+        let temp = testkit::tempdir("owners-repository-name");
+        let primary = temp.path().join("repository");
+        let common = primary.join(".git");
+        testkit::make_dir(&common.join("worktrees/linked"));
+        let linked = temp.path().join("linked");
+        testkit::write_bytes(
+            &linked.join(".git"),
+            b"gitdir: ../repository/.git/worktrees/linked\n",
+        );
+        let expected = fs::canonicalize(&common).unwrap();
+        let owners = Owners::default();
+        assert_eq!(
+            owners.repository(&primary.join("target")),
+            Some(expected.clone())
+        );
+        assert_eq!(owners.repository(&linked.join("target")), Some(expected));
+    }
+
+    #[test]
+    fn a_repository_above_a_ceiling_is_not_an_owner_scope() {
+        let temp = testkit::tempdir("owners-repository-ceiling");
+        let outer = temp.path().join("outer");
+        testkit::make_dir(&outer.join(".git"));
+        let ceiling = outer.join("ceiling");
+        let work = ceiling.join("work");
+        testkit::make_dir(&work);
+        assert!(Owners::default().repository(&work).is_some());
+        assert_eq!(Owners::new(vec![ceiling]).repository(&work), None);
     }
 }

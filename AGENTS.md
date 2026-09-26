@@ -28,6 +28,9 @@
   Ordering rustc's sessions by the stamp in their names is rustc's own rule, not an age.
 - Untrusted input (`auto.toml`, `owner.json`) is decoded only in `ingress`; files storage-scout writes are opened only in `store`; processes start only in `observe::git` and `platform::spawn`.
 - Runs are started by events (`--event`, `--detach`, filesystem events, a released lock) and coalesce on a lock and a flag; nothing waits on a clock.
+- Windows and Linux events name entries, while macOS FSEvents names changed directories and coalesces delivery for one second with `NoDefer`; this operating-system transport batching is not a cleanup clock, wait, threshold, or decision input.
+- The resident watcher keeps surveys and sharing stocks, updates only changed paths, and runs work at background priority while event intake remains responsive.
+- A git ref event invalidates only its repository, and a hook writes its repository into the station flag; an empty flag deliberately re-checks every candidate.
 - Refusals are `Rejection` values; tests match them with `matches!`.
 - JSON is `schema_version: 3`; fields are only added within a version (`tests/schema/v3.json`).
 

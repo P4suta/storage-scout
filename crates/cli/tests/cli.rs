@@ -26,6 +26,31 @@ fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn pending(state: &Path) -> Option<std::path::PathBuf> {
+    fs::read_dir(state).unwrap().flatten().find_map(|entry| {
+        fs::read_dir(entry.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|child| child.file_name() == "pending")
+            .map(|child| child.path())
+    })
+}
+
+fn run_lock(state: &Path) -> std::path::PathBuf {
+    fs::read_dir(state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "lock")
+                && path
+                    .file_stem()
+                    .is_some_and(|stem| !stem.to_string_lossy().ends_with(".requests"))
+        })
+        .unwrap()
+}
+
 fn open_space(root: &Path) -> bool {
     let scout = Scout::detect().unwrap();
     let open = scout.protection().area_of(&testkit::location(root)) == Area::Open;
@@ -397,28 +422,15 @@ fn a_run_while_another_holds_the_station_is_handed_over() {
     assert_eq!(first.status.code(), Some(0), "{first:#?}");
     drop(owner);
     testkit::assert_present(&released);
-    let lock = fs::read_dir(&state)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "lock")
-        })
-        .unwrap();
+    let lock = run_lock(&state);
     let holder = File::open(&lock).unwrap();
     holder.lock().unwrap();
     let handed = hooked(&["auto", "--config", config, "--execute"], &state, b"");
     assert_eq!(handed.status.code(), Some(0), "{handed:#?}");
     assert!(String::from_utf8_lossy(&handed.stderr).contains("in progress"));
     testkit::assert_present(&released);
-    let pending = fs::read_dir(&state).unwrap().any(|entry| {
-        entry
-            .unwrap()
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "pending")
-    });
-    assert!(pending, "the request must wait for the holder");
+    let request = pending(&state).expect("the request must wait for the holder");
+    assert_eq!(fs::read(request).unwrap(), b"\0\n");
     drop(holder);
     let served = hooked(&["auto", "--config", config, "--execute"], &state, b"");
     assert_eq!(served.status.code(), Some(0), "{served:#?}");
@@ -450,24 +462,10 @@ fn a_detached_run_finishes_in_the_background() {
         answer["pid"].as_u64().is_some_and(|pid| pid > 0),
         "{answer}"
     );
-    let flag = |path: &Path| {
-        path.extension()
-            .is_some_and(|extension| extension == "pending")
-    };
-    while fs::read_dir(&state)
-        .unwrap()
-        .any(|entry| flag(&entry.unwrap().path()))
-    {
+    while pending(&state).is_some() {
         std::thread::yield_now();
     }
-    let lock = fs::read_dir(&state)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "lock")
-        })
-        .unwrap();
+    let lock = run_lock(&state);
     File::open(&lock).unwrap().lock().unwrap();
     testkit::assert_absent(&released);
     let recorded = fs::read_dir(&state).unwrap().any(|entry| {

@@ -13,7 +13,7 @@ use std::sync::{Arc, mpsc};
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
     FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
@@ -21,8 +21,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     ReadDirectoryChangesW,
 };
 use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, EVENT_MODIFY_STATE, GetCurrentThread, INFINITE, OpenEventW, SetEvent,
+    SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, WaitForSingleObject,
+};
 
-use super::Change;
+use super::{Change, Coverage, Event, WatchDepth};
 
 type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 
@@ -35,12 +39,12 @@ const FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
 
 struct Directory(OwnedHandle);
 
+fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
+    text.encode_wide().chain(std::iter::once(0)).collect()
+}
+
 fn open(path: &Path) -> io::Result<Directory> {
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
+    let wide = wide(path.as_os_str());
     // SAFETY: the UTF-16 path is NUL-terminated and every pointer argument is valid for the call.
     let handle = unsafe {
         CreateFileW(
@@ -59,6 +63,30 @@ fn open(path: &Path) -> io::Result<Directory> {
         // SAFETY: `CreateFileW` just returned this handle and nothing else owns it.
         Ok(Directory(unsafe { OwnedHandle::from_raw_handle(handle) }))
     }
+}
+
+fn listen(notification: &str, deliver: Arc<Deliver>) -> io::Result<()> {
+    let name = wide(std::ffi::OsStr::new(notification));
+    // SAFETY: the name is NUL-terminated, and a null security descriptor requests the default.
+    let handle = unsafe { CreateEventW(null(), 0, 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `CreateEventW` returned this handle and nothing else owns it.
+    let event = unsafe { OwnedHandle::from_raw_handle(handle) };
+    std::thread::Builder::new()
+        .name("storage-scout-wake".to_owned())
+        .spawn(move || {
+            loop {
+                // SAFETY: the event handle remains owned by this thread for the duration of the call.
+                let outcome = unsafe { WaitForSingleObject(event.as_raw_handle(), INFINITE) };
+                if outcome != WAIT_OBJECT_0 {
+                    return;
+                }
+                deliver(Change::Wake);
+            }
+        })?;
+    Ok(())
 }
 
 fn word(bytes: &[u8], at: usize) -> Option<u32> {
@@ -87,11 +115,15 @@ fn changed(bytes: &[u8], root: &Path, deliver: &Deliver) {
             .iter()
             .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
-        let path = root.join(OsString::from_wide(&units));
-        deliver(Change::Directory(match path.parent() {
-            Some(parent) => parent.to_path_buf(),
-            None => path,
-        }));
+        deliver(Change::Entry {
+            path: root.join(OsString::from_wide(&units)),
+            event: match word(bytes, at.saturating_add(4)) {
+                Some(1 | 5) => Event::Appeared,
+                Some(2 | 4) => Event::Vanished,
+                Some(3) => Event::Written,
+                Some(_) | None => Event::Unsure,
+            },
+        });
         let Ok(next) = usize::try_from(next) else {
             return;
         };
@@ -179,8 +211,13 @@ fn follow(
 pub(super) struct Source;
 
 impl Source {
-    pub(super) fn start(paths: &[PathBuf], deliver: Deliver) -> io::Result<Self> {
+    pub(super) fn start(
+        paths: &[PathBuf],
+        notification: &str,
+        deliver: Deliver,
+    ) -> io::Result<Self> {
         let deliver = Arc::new(deliver);
+        listen(notification, Arc::clone(&deliver))?;
         for path in paths {
             let directory = open(path)?;
             let root = path.clone();
@@ -201,8 +238,8 @@ impl Source {
         clippy::unused_self,
         reason = "a subtree watch reports every directory below its root"
     )]
-    pub(super) const fn recursive(&self) -> bool {
-        true
+    pub(super) const fn depth(&self) -> WatchDepth {
+        WatchDepth::Recursive
     }
 
     #[expect(
@@ -210,9 +247,37 @@ impl Source {
         clippy::unnecessary_wraps,
         reason = "ReadDirectoryChangesW already reports every directory below the roots"
     )]
-    pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<()> {
+    pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<Coverage> {
+        Ok(Coverage::Complete)
+    }
+}
+
+fn signaled(result: i32) -> io::Result<()> {
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
         Ok(())
     }
+}
+
+pub(super) fn wake(notification: &str) -> io::Result<()> {
+    let name = wide(std::ffi::OsStr::new(notification));
+    // SAFETY: the name is NUL-terminated and the requested access can only signal the event.
+    let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Ok(());
+    }
+    // SAFETY: `OpenEventW` returned this handle and nothing else owns it.
+    let event = unsafe { OwnedHandle::from_raw_handle(handle) };
+    // SAFETY: the handle names an event opened with permission to signal it.
+    signaled(unsafe { SetEvent(event.as_raw_handle()) })
+}
+
+pub(super) fn background() {
+    // SAFETY: GetCurrentThread takes no arguments and returns this thread's pseudo-handle.
+    let thread = unsafe { GetCurrentThread() };
+    // SAFETY: the pseudo-handle names the calling thread, which may lower its own priority.
+    let _lowered = unsafe { SetThreadPriority(thread, THREAD_MODE_BACKGROUND_BEGIN) };
 }
 
 #[cfg(test)]
@@ -228,12 +293,41 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let _source = Source::start(
             std::slice::from_ref(&root),
+            &format!("Local\\storage-scout-test-{}-files", std::process::id()),
             Box::new(move |change| {
                 let _sent = sender.send(change);
             }),
         )
         .unwrap();
         testkit::write_sized(&root.join("file"), 1);
-        assert_eq!(receiver.recv().unwrap(), Change::Directory(root));
+        assert_eq!(
+            receiver.recv().unwrap(),
+            Change::Entry {
+                path: root.join("file"),
+                event: Event::Appeared,
+            }
+        );
+    }
+
+    #[test]
+    fn a_named_event_wakes_the_source() {
+        let name = format!("Local\\storage-scout-test-{}-wake", std::process::id());
+        let (sender, receiver) = mpsc::channel();
+        let _source = Source::start(
+            &[],
+            &name,
+            Box::new(move |change| {
+                let _sent = sender.send(change);
+            }),
+        )
+        .unwrap();
+        wake(&name).unwrap();
+        assert_eq!(receiver.recv().unwrap(), Change::Wake);
+    }
+
+    #[test]
+    fn only_a_signaled_event_is_successful() {
+        let _failed = signaled(0).unwrap_err();
+        signaled(1).unwrap();
     }
 }

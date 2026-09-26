@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use storage_scout_core::artifact::Kind;
@@ -12,7 +12,7 @@ use crate::dedupe::{self, DedupeRun};
 pub use crate::ingress::PolicyError;
 use crate::prune::{self, PruneRun};
 use crate::scan::{Found, ScanOptions};
-use crate::{SCHEMA_VERSION, Scout, ingress, scan};
+use crate::{SCHEMA_VERSION, Scout, busy, ingress, scan};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Selection {
@@ -86,6 +86,18 @@ fn sight(scout: &Scout, selection: &Selection) -> Result<Vec<Found>, Rejection> 
         .collect())
 }
 
+pub(crate) fn lets_go(scout: &Scout, found: &Found) -> bool {
+    Admits::Settled.admits(found.candidate().settlement()) && confirmed(scout, found.path())
+}
+
+pub(crate) fn confirmed(scout: &Scout, root: &Path) -> bool {
+    let Ok(survey) = busy::survey(root) else {
+        return false;
+    };
+    matches!(busy::held(&survey.locks), busy::Holding::Free)
+        && Admits::Settled.admits(scout.owners().of(root, &survey.markers).settlement())
+}
+
 pub(crate) fn reap(
     scout: &Scout,
     selection: &Selection,
@@ -143,9 +155,8 @@ pub(crate) fn reap(
 pub(crate) fn run(scout: &Scout, policy: &AutoPolicy, mode: Mode) -> Result<AutoRun, Rejection> {
     let selection = &policy.selection;
     let sighted = sight(scout, selection)?;
-    let (settled, remaining): (Vec<&Found>, Vec<&Found>) = sighted
-        .iter()
-        .partition(|found| Admits::Settled.admits(found.candidate().settlement()));
+    let (settled, remaining): (Vec<&Found>, Vec<&Found>) =
+        sighted.iter().partition(|found| lets_go(scout, found));
     let summary = reap(scout, selection, &settled, mode);
     let remaining = remaining.into_iter().cloned().collect::<Vec<_>>();
     let excludes = scan::excludes(&selection.excludes);

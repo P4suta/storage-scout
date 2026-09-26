@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -23,7 +24,6 @@ pub const DEFAULT_TOP: usize = 20;
 pub const DEFAULT_MIN_SIZE: Bytes = Bytes::new(10 * 1024 * 1024);
 pub(crate) const MAX_ISSUES: usize = 50;
 const GIT_DIRECTORY: &str = ".git";
-const CARGO_MANIFEST: &str = "Cargo.toml";
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -131,13 +131,14 @@ pub(crate) enum Reach {
 #[derive(Debug, Clone)]
 pub(crate) struct Sighting {
     pub report: ScanReport,
-    pub hosts: Vec<PathBuf>,
+    pub walked: Vec<PathBuf>,
 }
 
 struct Collector<'a> {
     options: &'a ScanOptions,
     descent: Descent,
-    hosts: &'a Mutex<Vec<PathBuf>>,
+    only: Option<&'a OsStr>,
+    walked: Mutex<Vec<PathBuf>>,
     protection: &'a Protection,
     owners: &'a Owners,
     excludes: Vec<Location>,
@@ -194,13 +195,7 @@ pub(crate) fn excludes(paths: &[PathBuf]) -> Vec<Location> {
 }
 
 pub(crate) fn scan(options: &ScanOptions, protection: &Protection, owners: &Owners) -> ScanReport {
-    collect(
-        options,
-        protection,
-        owners,
-        Descent::Measure,
-        &Mutex::new(Vec::new()),
-    )
+    collect(options, protection, owners, (Descent::Measure, None)).0
 }
 
 pub(crate) fn sight(
@@ -209,17 +204,34 @@ pub(crate) fn sight(
     owners: &Owners,
     reach: Reach,
 ) -> Sighting {
+    sighting(options, protection, owners, reach, None)
+}
+
+pub(crate) fn sight_into(
+    options: &ScanOptions,
+    protection: &Protection,
+    owners: &Owners,
+    (child, reach): (&OsStr, Reach),
+) -> Sighting {
+    sighting(options, protection, owners, reach, Some(child))
+}
+
+fn sighting(
+    options: &ScanOptions,
+    protection: &Protection,
+    owners: &Owners,
+    reach: Reach,
+    only: Option<&OsStr>,
+) -> Sighting {
     let sighting = ScanOptions {
         measure: Measure::Logical,
         min_size: Bytes::ZERO,
         ..options.clone()
     };
-    let hosts = Mutex::new(Vec::new());
-    let report = collect(&sighting, protection, owners, Descent::Sight(reach), &hosts);
-    let mut hosts = drain(hosts);
-    hosts.sort();
-    hosts.dedup();
-    Sighting { report, hosts }
+    let (report, mut walked) =
+        collect(&sighting, protection, owners, (Descent::Sight(reach), only));
+    walked.sort();
+    Sighting { report, walked }
 }
 
 pub(crate) fn measured(found: &Found, protection: &Protection) -> Result<Found, Rejection> {
@@ -234,13 +246,13 @@ fn collect(
     options: &ScanOptions,
     protection: &Protection,
     owners: &Owners,
-    descent: Descent,
-    hosts: &Mutex<Vec<PathBuf>>,
-) -> ScanReport {
+    (descent, only): (Descent, Option<&OsStr>),
+) -> (ScanReport, Vec<PathBuf>) {
     let collector = Collector {
         options,
         descent,
-        hosts,
+        only,
+        walked: Mutex::new(Vec::new()),
         protection,
         owners,
         excludes: excludes(&options.excludes),
@@ -292,7 +304,7 @@ fn collect(
     let mut seen = BTreeSet::new();
     candidates.retain(|found| seen.insert(found.candidate.location().key(protection.case())));
 
-    ScanReport {
+    let report = ScanReport {
         schema_version: SCHEMA_VERSION,
         roots: roots.into_iter().map(|(_, location)| location).collect(),
         listing_limit: options.top,
@@ -307,7 +319,8 @@ fn collect(
         largest_directories: largest,
         candidates,
         issues: drain(collector.issues),
-    }
+    };
+    (report, drain(collector.walked))
 }
 
 fn drain<T>(values: Mutex<Vec<T>>) -> Vec<T> {
@@ -470,7 +483,7 @@ fn walk(
     };
     if collector.excluded(&location)
         || (collector.descent != Descent::Measure
-            && directory.file_name() == Some(std::ffi::OsStr::new(GIT_DIRECTORY)))
+            && directory.file_name() == Some(OsStr::new(GIT_DIRECTORY)))
     {
         return Tally::empty(collector.options.measure);
     }
@@ -493,12 +506,10 @@ fn walk(
             return Tally::empty(collector.options.measure);
         },
         (Descent::Sight(reach), None) => {
-            if contents.names.has_file(CARGO_MANIFEST)
-                && let Ok(mut hosts) = collector.hosts.lock()
-            {
-                hosts.push(directory.to_path_buf());
+            if let Ok(mut walked) = collector.walked.lock() {
+                walked.push(directory.to_path_buf());
             }
-            if reach == Reach::Children && depth > 0 {
+            if reach == Reach::Children && depth > usize::from(collector.only.is_some()) {
                 return Tally::empty(collector.options.measure);
             }
             None
@@ -523,6 +534,12 @@ fn walk(
     let children = contents
         .directories
         .par_iter()
+        .filter(|(child, _)| {
+            depth > 0
+                || collector
+                    .only
+                    .is_none_or(|only| child.file_name() == Some(only))
+        })
         .map(|(child, child_metadata)| {
             let next = if inside {
                 Region::Artifact
@@ -587,6 +604,13 @@ fn admit_entry(
     contents: &mut Contents,
     collector: &Collector<'_>,
 ) {
+    if collector.descent != Descent::Measure
+        && let Ok(kind) = entry.file_type()
+        && kind.is_file()
+    {
+        contents.names.file(entry.file_name().as_encoded_bytes());
+        return;
+    }
     let path = entry.path();
     let child = match fs::symlink_metadata(&path) {
         Ok(child) => child,
@@ -655,22 +679,12 @@ fn sighted(directory: &Path, admission: Admission, collector: &Collector<'_>) {
             return;
         },
     };
-    let markers = match admission.kind().protocol() {
-        Some(_) => match crate::busy::survey(directory) {
-            Ok(survey) => survey.markers,
-            Err(rejection) => {
-                collector.issue(rejection);
-                Vec::new()
-            },
-        },
-        None => Vec::new(),
-    };
     let candidate = Candidate::new(
         admission,
         Observed {
             identity,
             measurement: Measurement::UNMEASURED,
-            ownership: collector.owners.of(directory, &markers),
+            ownership: collector.owners.of(directory, &[]),
         },
         collector.protection.case(),
     );
@@ -715,8 +729,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_sighting_names_every_project_it_passes_that_has_no_target_yet() {
-        let temp = testkit::tempdir("scan-hosts");
+    fn a_file_is_not_accepted_as_a_scan_root() {
+        let temp = testkit::tempdir("scan-file-root");
+        let file = temp.path().join("file");
+        testkit::write_sized(&file, 1);
+        assert!(matches!(
+            validate_root(&file, &testkit::open_protection()),
+            Err(Rejection::NotADirectory { .. })
+        ));
+    }
+
+    #[test]
+    fn a_sighting_names_every_directory_it_walked_outside_the_candidates() {
+        let temp = testkit::tempdir("scan-walked");
         let root = fs::canonicalize(temp.path()).unwrap().join("work");
         let built = testkit::write_cargo_project(&root.join("built"), 1);
         testkit::write_cache_tag(&built);
@@ -737,8 +762,17 @@ mod tests {
         let owners = Owners::default();
         let everything = sight(&options, &protection, &owners, Reach::Everything);
         assert_eq!(
-            everything.hosts,
-            [root.join("bare"), root.join("built"), deep]
+            everything.walked,
+            [
+                root.clone(),
+                root.join("bare"),
+                root.join("built"),
+                root.join("deep"),
+                root.join("deep").join("down"),
+                deep,
+                root.join("plain"),
+                root.join("repo"),
+            ]
         );
         assert_eq!(
             everything
@@ -750,7 +784,45 @@ mod tests {
             [built.as_path()]
         );
         let children = sight(&options, &protection, &owners, Reach::Children);
-        assert_eq!(children.hosts, [root.join("bare"), root.join("built")]);
+        assert_eq!(children.walked.len(), 6);
         assert!(children.report.candidates.is_empty());
+
+        let into = sight_into(
+            &options,
+            &protection,
+            &owners,
+            (OsStr::new("built"), Reach::Everything),
+        );
+        assert_eq!(into.walked, [root.clone(), root.join("built")]);
+        assert_eq!(
+            into.report
+                .candidates
+                .iter()
+                .map(Found::path)
+                .collect::<Vec<_>>(),
+            [built.as_path()]
+        );
+        let beside = sight_into(
+            &options,
+            &protection,
+            &owners,
+            (OsStr::new("deep"), Reach::Everything),
+        );
+        assert_eq!(beside.walked.len(), 4);
+        assert!(beside.report.candidates.is_empty());
+        let shallow = sight_into(
+            &options,
+            &protection,
+            &owners,
+            (OsStr::new("deep"), Reach::Children),
+        );
+        assert_eq!(
+            shallow.walked,
+            [
+                root.clone(),
+                root.join("deep"),
+                root.join("deep").join("down")
+            ]
+        );
     }
 }

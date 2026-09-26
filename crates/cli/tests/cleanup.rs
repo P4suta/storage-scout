@@ -19,7 +19,7 @@ use storage_scout::core::reject::{Rejection, StaleField};
 use storage_scout::core::size::Bytes;
 use storage_scout::{Found, Measure, Mode, Plan, ScanOptions, ScanReport, Scout, Status, Summary};
 use testkit::{
-    Built, hard_link, link_dir, sparse_file, tempdir, write_cache_tag, write_cargo_project,
+    hard_link, link_dir, sparse_file, tempdir, write_cache_tag, write_cargo_project,
     write_declared_target, write_sized,
 };
 
@@ -353,7 +353,7 @@ fn a_link_inserted_after_discovery_is_never_followed() {
     let elsewhere = temp.path().join("elsewhere");
     write_sized(&elsewhere.join("payload"), 10);
     if link_dir(&target.join("link"), &elsewhere)
-        .or_skip("a directory link")
+        .or_decline("a directory link")
         .is_none()
     {
         return;
@@ -374,7 +374,7 @@ fn a_linked_root_is_refused() {
     let temp = tempdir("linked-root");
     let real = temp.path().join("real");
     let _target = write_cargo_project(&real, 10);
-    let Some(link) = link_dir(&temp.path().join("linked"), &real).or_skip("a directory link")
+    let Some(link) = link_dir(&temp.path().join("linked"), &real).or_decline("a directory link")
     else {
         return;
     };
@@ -414,7 +414,7 @@ fn a_hard_link_to_the_outside_is_not_reclaimable() {
     let inside = temp.path().join("proj/target/app.bin");
     write_sized(&inside, 64 * 1024);
     if hard_link(&temp.path().join("outside.bin"), &inside)
-        .or_skip("a hard link")
+        .or_decline("a hard link")
         .is_none()
     {
         return;
@@ -438,7 +438,7 @@ fn links_across_selected_candidates_count_once() {
     let first = temp.path().join("proj/bin/app.dll");
     write_sized(&first, 64 * 1024);
     if hard_link(&temp.path().join("proj/obj/app.dll"), &first)
-        .or_skip("a hard link")
+        .or_decline("a hard link")
         .is_none()
     {
         return;
@@ -465,7 +465,7 @@ fn a_sparse_file_is_measured_by_what_it_occupies() {
         &temp.path().join("sparse/target/sparse.bin"),
         8 * 1024 * 1024,
     )
-    .or_skip("a sparse file")
+    .or_decline("a sparse file")
     .is_none()
     {
         return;
@@ -626,7 +626,8 @@ fn a_lock_anywhere_outside_cargos_own_directories_is_found() {
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     fs::create_dir_all(target.join("debug/.fingerprint")).unwrap();
     write_sized(&target.join("debug/deps/libx.rlib"), 1024);
-    let Built::Yes(_) = link_dir(&target.join("a-link"), temp.path()) else {
+    let Some(_) = link_dir(&target.join("a-link"), temp.path()).or_decline("a directory link")
+    else {
         return;
     };
     refused_while_held(&target, &target.join("debug/scratch/run"));
@@ -642,6 +643,7 @@ fn a_directory_that_cannot_be_read_keeps_the_whole_target() {
     let report = discover(temp.path());
     let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
     let Some(restricted) = testkit::restrict(&private, 0o000) else {
+        testkit::decline("a restricted path");
         return;
     };
     let refused = apply(&plan, Mode::Execute);
@@ -667,6 +669,7 @@ fn a_lock_that_cannot_be_opened_is_never_taken_for_free() {
     let report = discover(temp.path());
     let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
     let Some(restricted) = testkit::restrict(&lock, 0o000) else {
+        testkit::decline("a restricted path");
         return;
     };
     let previewed = apply(&plan, Mode::DryRun);
@@ -706,6 +709,7 @@ fn a_removal_the_filesystem_refuses_is_a_failure_not_a_refusal() {
     let report = discover(temp.path());
     let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
     let Some(restricted) = testkit::restrict(&project, 0o555) else {
+        testkit::decline("a restricted path");
         return;
     };
     let summary = apply(&plan, Mode::Execute);
@@ -763,7 +767,9 @@ fn every_usable_root_is_scanned_once_whatever_comes_before_it() {
     let root = temp.path();
     let _target = write_cargo_project(&root.join("proj"), 4096);
     write_sized(&root.join("file"), 1);
-    let Built::Yes(link) = link_dir(&root.join("link"), &root.join("proj")) else {
+    let Some(link) =
+        link_dir(&root.join("link"), &root.join("proj")).or_decline("a directory link")
+    else {
         return;
     };
     for roots in [
@@ -967,10 +973,11 @@ fn a_manifest_replaced_by_a_link_is_no_longer_evidence() {
     let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
     write_sized(&temp.path().join("elsewhere.toml"), 1);
     fs::remove_file(project.join("Cargo.toml")).unwrap();
-    let Built::Yes(_) = testkit::symlink_file(
+    let Some(_) = testkit::symlink_file(
         &project.join("Cargo.toml"),
         &temp.path().join("elsewhere.toml"),
-    ) else {
+    )
+    .or_decline("a file link") else {
         return;
     };
     let summary = apply(&plan, Mode::Execute);

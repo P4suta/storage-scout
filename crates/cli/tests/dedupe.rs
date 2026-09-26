@@ -61,7 +61,7 @@ fn capable(root: &Path) -> Option<Method> {
             .collect::<Vec<_>>()
             .join("; ");
         assert!(!required, "this volume must share blocks: {reasons}");
-        let _skipped = Built::Unavailable(reasons).or_skip("a volume that shares blocks");
+        let _skipped = Built::Unavailable(reasons).or_decline("a volume that shares blocks");
     }
     found
 }
@@ -146,7 +146,9 @@ fn a_file_that_cannot_be_replaced_is_kept_and_the_plain_copy_is_shared_with_it()
     let [first, second, third, fourth, plain_target] = &targets;
     for target in [first, second] {
         write_patterned(&target.join("debug/app"), LEN, 5);
-        let Built::Yes(_) = testkit::executable(&target.join("debug/app")) else {
+        let Some(_) =
+            testkit::executable(&target.join("debug/app")).or_decline("an executable file")
+        else {
             return;
         };
     }
@@ -154,8 +156,8 @@ fn a_file_that_cannot_be_replaced_is_kept_and_the_plain_copy_is_shared_with_it()
         write_patterned(&target.join(RLIB), LEN, 6);
     }
     for target in [third, fourth] {
-        let Built::Yes(_) =
-            testkit::hard_link(&target.join("debug/linked.rlib"), &target.join(RLIB))
+        let Some(_) = testkit::hard_link(&target.join("debug/linked.rlib"), &target.join(RLIB))
+            .or_decline("a hard link")
         else {
             return;
         };
@@ -245,6 +247,7 @@ fn a_target_with_a_directory_that_cannot_be_read_is_left_whole() {
     }
     for sealed in [&secret, &private] {
         let Some(restricted) = testkit::restrict(sealed, 0o000) else {
+            testkit::decline("a restricted path");
             return;
         };
         let run = dedupe(root, Mode::Execute);
@@ -269,7 +272,8 @@ fn only_a_regular_lock_file_holds_a_target() {
     write_patterned(&b.join(RLIB), LEN, 16);
     let elsewhere = root.join("elsewhere.lock");
     write_sized(&elsewhere, 0);
-    let Built::Yes(_) = testkit::symlink_file(&b.join("debug/.cargo-build-lock"), &elsewhere)
+    let Some(_) = testkit::symlink_file(&b.join("debug/.cargo-build-lock"), &elsewhere)
+        .or_decline("a file link")
     else {
         return;
     };
@@ -296,7 +300,8 @@ fn extended_attributes_decide_whether_a_replacement_would_be_faithful() {
         return;
     }
     for (target, value) in [(&a, "one"), (&b, "one"), (&c, "two")] {
-        let Built::Yes(_) = testkit::set_xattr(&target.join(RLIB), "storage-scout.test", value)
+        let Some(_) = testkit::set_xattr(&target.join(RLIB), "storage-scout.test", value)
+            .or_decline("an extended attribute")
         else {
             return;
         };

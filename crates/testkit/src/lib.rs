@@ -6,7 +6,8 @@
     reason = "fixtures build real trees; a fixture that cannot be built is a broken test"
 )]
 
-use std::fs::{self, File};
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -72,7 +73,7 @@ pub fn ceiling() -> PathBuf {
         .join(SCRATCH);
     let _held = HELD.get_or_init(|| {
         fs::create_dir_all(&scratch).expect("the tests' scratch directory");
-        let lock = fs::OpenOptions::new()
+        let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
@@ -180,6 +181,10 @@ pub fn make_dir(path: &Path) {
     fs::create_dir_all(path).expect("a fixture directory");
 }
 
+pub fn remove_file(path: &Path) {
+    fs::remove_file(path).expect("a removed file");
+}
+
 pub fn remove_tree(path: &Path) {
     fs::remove_dir_all(path).expect("a fixture tree that can be removed");
 }
@@ -227,18 +232,52 @@ pub enum Built {
 }
 
 impl Built {
-    #[must_use]
-    pub fn or_skip(self, what: &str) -> Option<PathBuf> {
+    fn resolve(self, what: &str, notice: Option<&OsStr>) -> Option<PathBuf> {
         match self {
             Self::Yes(path) => Some(path),
             Self::Unavailable(reason) => {
                 let skipped = format!("skipping: cannot create {what} here ({reason})\n");
                 std::io::Write::write_all(&mut std::io::stderr(), skipped.as_bytes())
                     .expect("stderr is writable");
+                report_decline(notice, what);
                 None
             },
         }
     }
+
+    #[must_use]
+    pub fn or_skip(self, what: &str) -> Option<PathBuf> {
+        self.resolve(what, None)
+    }
+
+    #[must_use]
+    pub fn or_decline(self, why: &str) -> Option<PathBuf> {
+        let notice = std::env::var_os("RUST_MUTANTS_DECLINE_NOTICE");
+        self.resolve(why, notice.as_deref())
+    }
+}
+
+fn report_decline(notice: Option<&OsStr>, why: &str) {
+    let Some(path) = notice else {
+        return;
+    };
+    assert!(!why.contains(['\t', '\n']), "a stable single-line reason");
+    let thread = std::thread::current();
+    let name = thread.name().expect("a test thread has a name");
+    let line = format!("{name}\t{why}\n");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("the decline notice is writable");
+    let written = std::io::Write::write(&mut file, line.as_bytes())
+        .expect("the decline notice accepts one line");
+    assert_eq!(written, line.len(), "the decline notice accepts one line");
+}
+
+pub fn decline(why: &str) {
+    let notice = std::env::var_os("RUST_MUTANTS_DECLINE_NOTICE");
+    report_decline(notice.as_deref(), why);
 }
 
 #[must_use]
@@ -374,7 +413,7 @@ pub fn watches_subtrees() -> bool {
     let whole = cfg!(any(target_os = "macos", windows));
     if !whole {
         let _skipped = Built::Unavailable(String::from("inotify watches one directory at a time"))
-            .or_skip("a watcher that reports every directory below a root");
+            .or_decline("a watcher that reports every directory below a root");
     }
     whole
 }
@@ -901,4 +940,37 @@ pub fn hold_session_lock(path: &Path) -> Option<Holder> {
         path.display()
     );
     Some(Holder(child))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_decline_notice_names_the_test_and_only_the_stable_reason() {
+        let temp = tempdir("decline-notice");
+        let notice = temp.path().join("notice");
+        let result = Built::Unavailable(String::from("dynamic /machine/path"))
+            .resolve("a volume that shares blocks", Some(notice.as_os_str()));
+        assert!(result.is_none());
+        let thread = std::thread::current();
+        let name = thread.name().unwrap();
+        assert_eq!(
+            fs::read_to_string(notice).unwrap(),
+            format!("{name}\ta volume that shares blocks\n")
+        );
+    }
+
+    #[test]
+    fn an_optional_skip_and_an_absent_notice_create_no_notice() {
+        let temp = tempdir("decline-optional");
+        let notice = temp.path().join("notice");
+        assert!(
+            Built::Unavailable(String::from("optional capability"))
+                .or_skip("an optional capability")
+                .is_none()
+        );
+        report_decline(None, "an unavailable capability");
+        let _absent = fs::symlink_metadata(notice).expect_err("no decline notice");
+    }
 }
