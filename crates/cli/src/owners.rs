@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -105,7 +105,33 @@ fn gitdir(file: &Path) -> Option<PathBuf> {
     })
 }
 
+pub(crate) fn repository(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find_map(|directory| match dot_git(directory) {
+            Dot::Directory => Some(directory.join(".git")),
+            Dot::File(file) => gitdir(&file)
+                .as_deref()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+            Dot::Absent | Dot::Unreadable => None,
+        })
+}
+
 impl Owners {
+    pub(crate) fn forget(&self, repositories: Option<&BTreeSet<PathBuf>>) {
+        let mut worktrees = match self.worktrees.lock() {
+            Ok(worktrees) => worktrees,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match repositories {
+            None => worktrees.clear(),
+            Some(repositories) => worktrees.retain(|root, _| {
+                !repository(root).is_some_and(|found| repositories.contains(&found))
+            }),
+        }
+    }
+
     pub(crate) fn new(ceilings: Vec<PathBuf>) -> Self {
         Self {
             ceilings: ceilings

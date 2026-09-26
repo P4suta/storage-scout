@@ -33,8 +33,37 @@ pub(crate) mod spawn;
     expect(dead_code, reason = "nothing is watched on this platform")
 )]
 pub(crate) enum Change {
-    Directory(PathBuf),
+    Entry { path: PathBuf, event: Event },
     Lost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "only inotify can run out of watches")
+)]
+pub(crate) enum Coverage {
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(test, target_os = "linux", windows)),
+    expect(
+        dead_code,
+        reason = "FSEvents reports the directories that changed, not their entries"
+    )
+)]
+pub(crate) enum Event {
+    Appeared,
+    Vanished,
+    Written,
+    Unsure,
+}
+
+pub(crate) fn background() {
+    events::background();
 }
 
 pub(crate) struct Watcher(events::Source);
@@ -54,7 +83,7 @@ impl Watcher {
             reason = "only inotify adds watches one directory at a time"
         )
     )]
-    pub(crate) fn watch(&self, directories: &[&Path]) -> io::Result<()> {
+    pub(crate) fn watch(&self, directories: &[&Path]) -> io::Result<Coverage> {
         self.0.watch(directories)
     }
 

@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::Change;
+use super::{Change, Coverage};
 
 type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 
@@ -25,7 +25,9 @@ impl Source {
         clippy::unnecessary_wraps,
         reason = "nothing is ever watched here"
     )]
-    pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<()> {
-        Ok(())
+    pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<Coverage> {
+        Ok(Coverage::Complete)
     }
 }
+
+pub(super) const fn background() {}

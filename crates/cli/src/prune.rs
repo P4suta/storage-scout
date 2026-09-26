@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -203,10 +204,13 @@ fn relative(root: &Path, path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn sessions(root: &Path, profile: &Path, doomed: &mut Vec<Doomed>) {
+fn sessions(root: &Path, profile: &Path, scope: Scope<'_>, doomed: &mut Vec<Doomed>) {
     let incremental = profile.join(prune::INCREMENTAL);
-    for unit in listed(&incremental, fs::FileType::is_dir) {
-        let directory = incremental.join(&unit);
+    for directory in listed(&incremental, fs::FileType::is_dir)
+        .into_iter()
+        .map(|unit| incremental.join(unit))
+        .filter(|directory| scope.touches(directory))
+    {
         let names = listed(&directory, fs::FileType::is_dir);
         let parsed = names
             .iter()
@@ -339,9 +343,12 @@ fn object_directories(profile: &Path) -> Vec<PathBuf> {
     directories
 }
 
-fn objects(root: &Path, profile: &Path, doomed: &mut Vec<Doomed>) -> u64 {
+fn objects(root: &Path, profile: &Path, scope: Scope<'_>, doomed: &mut Vec<Doomed>) -> u64 {
     let mut unreadable = 0u64;
-    for directory in object_directories(profile) {
+    for directory in object_directories(profile)
+        .into_iter()
+        .filter(|directory| scope.touches(directory))
+    {
         let names = listed(&directory, fs::FileType::is_file);
         let parsed = names
             .iter()
@@ -409,13 +416,13 @@ struct Gathered {
     unreadable: u64,
 }
 
-fn gather(root: &Path, survey: &busy::Survey) -> Gathered {
+fn gather(root: &Path, survey: &busy::Survey, scope: Scope<'_>) -> Gathered {
     let profiles = profiles(survey);
     let mut doomed = Vec::new();
     let mut unreadable = 0u64;
-    for profile in &profiles {
-        sessions(root, profile, &mut doomed);
-        unreadable = unreadable.saturating_add(objects(root, profile, &mut doomed));
+    for profile in profiles.iter().filter(|profile| scope.touches(profile)) {
+        sessions(root, profile, scope, &mut doomed);
+        unreadable = unreadable.saturating_add(objects(root, profile, scope, &mut doomed));
     }
     Gathered {
         profiles: profiles.len(),
@@ -443,11 +450,23 @@ fn rejected(found: &Found, rejection: Rejection) -> Pass {
     }
 }
 
-fn candidate(found: &Found, terms: &Terms<'_>, mode: Mode) -> Pass {
+fn candidate(
+    found: &Found,
+    terms: &Terms<'_>,
+    mode: Mode,
+    (known, scope): (Option<&busy::Survey>, Scope<'_>),
+) -> Pass {
     let attempt = || -> Result<Pass, Rejection> {
         let observed = observe::observe(found.path())?;
         let site = observed.site(terms.protection, terms.excludes);
-        let survey = busy::survey(&observed.path)?;
+        let surveyed;
+        let survey = match known {
+            Some(survey) => survey,
+            None => {
+                surveyed = busy::survey(&observed.path)?;
+                &surveyed
+            },
+        };
         let ownership = terms.owners.of(&observed.path, &survey.markers);
         let (lease, liveness) = match mode {
             Mode::DryRun => match busy::probe(&survey.locks) {
@@ -472,7 +491,7 @@ fn candidate(found: &Found, terms: &Terms<'_>, mode: Mode) -> Pass {
             Some(lease) => Some(Prunable::new(clearance, lease, &observed.path)?),
             None => None,
         };
-        let gathered = gather(&observed.path, &survey);
+        let gathered = gather(&observed.path, survey, scope);
         let mut removed = Removed::default();
         let mut held = Tally::default();
         let mut failures = Vec::new();
@@ -520,6 +539,55 @@ fn free_space(found: &[Found]) -> Volumes {
     }))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Scope<'a> {
+    Everything,
+    Changed(&'a BTreeSet<PathBuf>),
+}
+
+impl Scope<'_> {
+    fn touches(self, directory: &Path) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Changed(changed) => {
+                directory
+                    .ancestors()
+                    .any(|ancestor| changed.contains(ancestor))
+                    || changed
+                        .range::<Path, _>((Bound::Excluded(directory), Bound::Unbounded))
+                        .next()
+                        .is_some_and(|path| path.starts_with(directory))
+            },
+        }
+    }
+}
+
+pub(crate) fn run_changed(
+    found: &Found,
+    survey: &busy::Survey,
+    scope: Scope<'_>,
+    (excludes, protection, owners): (&[Location], &Protection, &Owners),
+) -> PruneRun {
+    let terms = Terms {
+        excludes,
+        protection,
+        owners,
+    };
+    let before = free_space(std::slice::from_ref(found));
+    let pass = candidate(found, &terms, Mode::Execute, (Some(survey), scope));
+    let mut totals = Removed::default();
+    totals.merge(&pass.subject.removed);
+    PruneRun {
+        schema_version: SCHEMA_VERSION,
+        command: "prune",
+        mode: Mode::Execute,
+        subjects: vec![pass.subject],
+        totals,
+        failures: pass.failures,
+        observed_freed: before.gained(&free_space(std::slice::from_ref(found))),
+    }
+}
+
 pub(crate) fn run(
     found: &[Found],
     excludes: &[Location],
@@ -540,7 +608,7 @@ pub(crate) fn run(
     let mut failures = Vec::new();
     let mut totals = Removed::default();
     for each in found {
-        let pass = candidate(each, &terms, mode);
+        let pass = candidate(each, &terms, mode, (None, Scope::Everything));
         totals.merge(&pass.subject.removed);
         failures.extend(pass.failures);
         subjects.push(pass.subject);

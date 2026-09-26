@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
@@ -26,7 +27,7 @@ use storage_scout_core::size::Bytes;
 use self::capability::Shareable;
 use crate::apply::Mode;
 use crate::measure::Volumes;
-use crate::platform::{self, FileFacts, Request};
+use crate::platform::{self, Event, FileFacts, Request};
 use crate::scan::Found;
 use crate::{SCHEMA_VERSION, busy, failure, host, observe};
 
@@ -221,9 +222,13 @@ fn temporary(name: &OsStr) -> bool {
 }
 
 fn inventory(root: &Path) -> Result<Inventory, Rejection> {
+    inventory_under(root, root)
+}
+
+fn inventory_under(root: &Path, start: &Path) -> Result<Inventory, Rejection> {
     let top = fs::symlink_metadata(root).map_err(|e| failure::io(root, FsOp::Inspect, &e))?;
     let device = platform::device(&top);
-    let mut pending = vec![root.to_path_buf()];
+    let mut pending = vec![start.to_path_buf()];
     let mut files = Vec::new();
     let mut unreadable = 0usize;
     while let Some(directory) = pending.pop() {
@@ -387,19 +392,22 @@ struct Stock {
     found: Found,
     subject: Subject,
     method: Option<Method>,
-    files: Vec<(Box<Path>, FileFacts)>,
+    files: BTreeMap<Box<Path>, FileFacts>,
 }
+
+type Member = (PathBuf, Box<Path>);
 
 #[derive(Default)]
 pub(crate) struct Pool {
     stocks: BTreeMap<PathBuf, Stock>,
+    lengths: BTreeMap<u64, BTreeSet<Member>>,
 }
 
 pub(crate) enum Focus<'a> {
     Everything,
     Fresh {
         roots: &'a BTreeSet<PathBuf>,
-        identities: &'a BTreeSet<Identity>,
+        fresh: &'a BTreeMap<Identity, u64>,
     },
 }
 
@@ -414,40 +422,111 @@ impl Focus<'_> {
     fn group<T: Borrow<Record>>(&self, group: &Group<'_, T>) -> bool {
         match self {
             Self::Everything => true,
-            Self::Fresh { identities, .. } => group
+            Self::Fresh { fresh, .. } => group
                 .members
                 .iter()
-                .any(|member| identities.contains(&(*member).borrow().identity)),
+                .any(|member| fresh.contains_key(&(*member).borrow().identity)),
         }
     }
 }
 
+fn still_there(path: &Path, relative: &Path, recorded: &Path) -> bool {
+    match recorded.strip_prefix(relative) {
+        Ok(below) => below
+            .components()
+            .next()
+            .is_some_and(|first| fs::symlink_metadata(path.join(first)).is_ok()),
+        Err(_outside) => false,
+    }
+}
+
+fn shallow(root: &Path, directory: &Path) -> Vec<(Box<Path>, FileFacts)> {
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| matches!(entry.file_type(), Ok(kind) if kind.is_file()))
+        .flat_map(|entry| present(root, &entry.path(), Event::Written))
+        .collect()
+}
+
+fn present(root: &Path, path: &Path, event: Event) -> Vec<(Box<Path>, FileFacts)> {
+    let listed = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && event == Event::Unsure => {
+            return shallow(root, path);
+        },
+        Ok(metadata) if metadata.is_dir() => match inventory_under(root, path) {
+            Ok(listed) => listed.files,
+            Err(_unreadable) => Vec::new(),
+        },
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.len() >= MINIMUM
+                && !path.file_name().is_some_and(temporary) =>
+        {
+            match (
+                path.strip_prefix(root),
+                platform::file_facts(path, &metadata),
+            ) {
+                (Ok(relative), Ok(facts)) => {
+                    vec![(path.to_path_buf(), relative.to_path_buf(), facts)]
+                },
+                (Ok(_) | Err(_), Ok(_) | Err(_)) => Vec::new(),
+            }
+        },
+        Ok(_) | Err(_) => Vec::new(),
+    };
+    listed
+        .into_iter()
+        .map(|(_, relative, facts)| (relative.into_boxed_path(), facts))
+        .collect()
+}
+
 impl Pool {
+    fn index(&mut self, root: &Path, files: &BTreeMap<Box<Path>, FileFacts>) {
+        for (relative, facts) in files {
+            self.lengths
+                .entry(facts.len)
+                .or_default()
+                .insert((root.to_path_buf(), relative.clone()));
+        }
+    }
+
+    fn unindex(&mut self, root: &Path, files: &BTreeMap<Box<Path>, FileFacts>) {
+        for (relative, facts) in files {
+            if let Some(members) = self.lengths.get_mut(&facts.len) {
+                members.remove(&(root.to_path_buf(), relative.clone()));
+                if members.is_empty() {
+                    self.lengths.remove(&facts.len);
+                }
+            }
+        }
+    }
+
     pub(crate) fn stock(
         &mut self,
         found: &Found,
         excludes: &[Location],
         protection: &Protection,
-    ) -> BTreeSet<Identity> {
+    ) -> BTreeMap<Identity, u64> {
         let terms = Terms {
             excludes,
             protection,
         };
-        let known = self
-            .stocks
-            .get(found.path())
-            .map(|stock| {
-                stock
-                    .files
-                    .iter()
-                    .map(|(_, facts)| facts.identity)
+        let known = match self.stocks.remove(found.path()) {
+            Some(old) => {
+                self.unindex(found.path(), &old.files);
+                old.files
+                    .values()
+                    .map(|facts| facts.identity)
                     .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
+            },
+            None => BTreeSet::new(),
+        };
         let admitted = admit(found, &terms)
             .and_then(|method| inventory(found.path()).map(|listed| (method, listed)));
         let (admission, method, files) = match admitted {
-            Err(rejection) => (Admission::Rejected { rejection }, None, Vec::new()),
+            Err(rejection) => (Admission::Rejected { rejection }, None, BTreeMap::new()),
             Ok((method, listed)) => (
                 Admission::Admitted {
                     method,
@@ -459,14 +538,15 @@ impl Pool {
                     .files
                     .into_iter()
                     .map(|(_, relative, facts)| (relative.into_boxed_path(), facts))
-                    .collect::<Vec<_>>(),
+                    .collect::<BTreeMap<_, _>>(),
             ),
         };
         let fresh = files
-            .iter()
-            .map(|(_, facts)| facts.identity)
-            .filter(|identity| !known.contains(identity))
+            .values()
+            .filter(|facts| !known.contains(&facts.identity))
+            .map(|facts| (facts.identity, facts.len))
             .collect();
+        self.index(found.path(), &files);
         self.stocks.insert(
             found.path().to_path_buf(),
             Stock {
@@ -483,61 +563,111 @@ impl Pool {
         fresh
     }
 
+    pub(crate) fn note(
+        &mut self,
+        root: &Path,
+        changed: &BTreeMap<PathBuf, Event>,
+    ) -> BTreeMap<Identity, u64> {
+        let Some(stock) = self.stocks.get_mut(root) else {
+            return BTreeMap::new();
+        };
+        if stock.method.is_none() {
+            return BTreeMap::new();
+        }
+        let mut removed = BTreeMap::new();
+        let mut added = BTreeMap::new();
+        for (path, event) in changed {
+            if let Ok(relative) = path.strip_prefix(root) {
+                let below = stock
+                    .files
+                    .range::<Path, _>((Bound::Included(relative), Bound::Unbounded))
+                    .take_while(|(recorded, _)| recorded.starts_with(relative))
+                    .map(|(recorded, _)| recorded.clone())
+                    .filter(|recorded| match event {
+                        Event::Unsure => {
+                            recorded.parent() == Some(relative)
+                                || !still_there(path, relative, recorded)
+                        },
+                        Event::Appeared | Event::Vanished | Event::Written => true,
+                    })
+                    .collect::<Vec<_>>();
+                for recorded in below {
+                    if let Some(facts) = stock.files.remove(&recorded) {
+                        removed.insert(recorded, facts);
+                    }
+                }
+                added.extend(present(root, path, *event));
+            }
+        }
+        let known = removed
+            .values()
+            .map(|facts| facts.identity)
+            .collect::<BTreeSet<_>>();
+        let fresh = added
+            .values()
+            .filter(|facts| !known.contains(&facts.identity))
+            .map(|facts| (facts.identity, facts.len))
+            .collect();
+        stock.files.extend(added.clone());
+        self.unindex(root, &removed);
+        self.index(root, &added);
+        fresh
+    }
+
     pub(crate) fn forget(&mut self, root: &Path) {
-        self.stocks.remove(root);
+        if let Some(stock) = self.stocks.remove(root) {
+            self.unindex(root, &stock.files);
+        }
     }
 
     fn lengths(&self, focus: &Focus<'_>) -> BTreeSet<u64> {
-        let mut counts = BTreeMap::<u64, usize>::new();
-        for (_, facts) in self
-            .stocks
-            .values()
-            .filter(|stock| stock.method.is_some())
-            .flat_map(|stock| &stock.files)
-        {
-            let count = counts.entry(facts.len).or_default();
-            *count = count.saturating_add(1);
-        }
-        let repeated = counts
-            .into_iter()
-            .filter(|(_, count)| *count > 1)
-            .map(|(len, _)| len);
+        let repeated = |len: &u64| {
+            self.lengths
+                .get(len)
+                .is_some_and(|members| members.len() > 1)
+        };
         match focus {
-            Focus::Everything => repeated.collect(),
-            Focus::Fresh { identities, .. } => {
-                let fresh = self
-                    .stocks
-                    .values()
-                    .flat_map(|stock| &stock.files)
-                    .filter(|(_, facts)| identities.contains(&facts.identity))
-                    .map(|(_, facts)| facts.len)
-                    .collect::<BTreeSet<_>>();
-                repeated.filter(|len| fresh.contains(len)).collect()
-            },
+            Focus::Everything => self
+                .lengths
+                .keys()
+                .filter(|len| repeated(len))
+                .copied()
+                .collect(),
+            Focus::Fresh { fresh, .. } => fresh
+                .values()
+                .filter(|len| repeated(len))
+                .copied()
+                .collect(),
         }
     }
 
     fn items(&self, focus: &Focus<'_>) -> (Vec<Subject>, Vec<Item<'_>>) {
-        let lengths = self.lengths(focus);
-        let mut subjects = Vec::new();
-        let mut items = Vec::new();
+        let subjects = self
+            .stocks
+            .iter()
+            .filter(|(root, _)| focus.subject(root))
+            .map(|(_, stock)| stock.subject.clone())
+            .collect();
         let mut seen = BTreeSet::new();
-        for (root, stock) in &self.stocks {
-            if focus.subject(root) {
-                subjects.push(stock.subject.clone());
-            }
-            let Some(method) = stock.method else {
-                continue;
-            };
-            for (relative, facts) in &stock.files {
-                if !lengths.contains(&facts.len) {
-                    continue;
-                }
+        let items = self
+            .lengths(focus)
+            .into_iter()
+            .flat_map(|len| self.lengths.get(&len).into_iter().flatten())
+            .filter_map(|(root, relative)| {
+                let stock = self.stocks.get(root)?;
+                Some((
+                    root,
+                    relative,
+                    stock,
+                    stock.method?,
+                    stock.files.get(relative)?,
+                ))
+            })
+            .filter(|(.., facts)| seen.insert(facts.identity))
+            .filter_map(|(root, relative, stock, method, facts)| {
                 let path = root.join(relative);
-                if seen.insert(facts.identity)
-                    && let Ok(location) = host::locate(&path)
-                {
-                    items.push(Item {
+                match host::locate(&path) {
+                    Ok(location) => Some(Item {
                         record: Record {
                             location,
                             len: facts.len,
@@ -552,10 +682,11 @@ impl Pool {
                         found: &stock.found,
                         path,
                         relative: relative.to_path_buf(),
-                    });
+                    }),
+                    Err(_unnameable) => None,
                 }
-            }
-        }
+            })
+            .collect();
         (subjects, items)
     }
 
@@ -570,12 +701,18 @@ impl Pool {
             excludes,
             protection,
         };
-        let found = || self.stocks.values().map(|stock| &stock.found);
+        let (subjects, items) = self.items(focus);
+        let found = || {
+            items
+                .iter()
+                .map(|item| (item.found.path(), item.found))
+                .collect::<BTreeMap<_, _>>()
+                .into_values()
+        };
         let before = match mode {
             Mode::Execute => Some(free_space(found())),
             Mode::DryRun => None,
         };
-        let (subjects, items) = self.items(focus);
         let sized = share::groups(&items)
             .into_iter()
             .filter(|group| focus.group(group))
@@ -798,6 +935,18 @@ mod tests {
                     rejection: Rejection::NoRoots,
                 },
             };
+            let files = files
+                .iter()
+                .map(|(file, len)| {
+                    (
+                        PathBuf::from(format!("f{file}")).into_boxed_path(),
+                        facts(*file, *len),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            if method.is_some() {
+                pool.index(&path, &files);
+            }
             pool.stocks.insert(
                 path.clone(),
                 Stock {
@@ -808,15 +957,7 @@ mod tests {
                     },
                     found,
                     method: *method,
-                    files: files
-                        .iter()
-                        .map(|(file, len)| {
-                            (
-                                PathBuf::from(format!("f{file}")).into_boxed_path(),
-                                facts(*file, *len),
-                            )
-                        })
-                        .collect(),
+                    files,
                 },
             );
             roots.push(path);
@@ -846,17 +987,17 @@ mod tests {
         );
         let (subjects, items) = pool.items(&Focus::Everything);
         assert_eq!(subjects.len(), 3);
-        assert_eq!(files(&items), [1, 2, 4, 5]);
+        assert_eq!(files(&items), [1, 4, 2, 5]);
         assert_eq!(
             items.first().map(|item| item.path.clone()),
             roots.first().map(|root| root.join("f1"))
         );
 
         let fresh_roots = BTreeSet::from([roots[0].clone()]);
-        let fresh_identities = BTreeSet::from([Identity { volume: 1, file: 5 }]);
+        let fresh_identities = BTreeMap::from([(Identity { volume: 1, file: 5 }, TWICE)]);
         let fresh = Focus::Fresh {
             roots: &fresh_roots,
-            identities: &fresh_identities,
+            fresh: &fresh_identities,
         };
         assert_eq!(pool.lengths(&fresh), BTreeSet::from([TWICE]));
         let (focused, narrowed) = pool.items(&fresh);
@@ -879,10 +1020,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [TWICE]
         );
-        let stale_identities = BTreeSet::from([Identity { volume: 1, file: 6 }]);
+        let stale_identities = BTreeMap::from([(Identity { volume: 1, file: 6 }, THRICE)]);
         let stale = Focus::Fresh {
             roots: &fresh_roots,
-            identities: &stale_identities,
+            fresh: &stale_identities,
         };
         assert!(pool.lengths(&stale).is_empty());
         assert!(!groups.iter().any(|group| stale.group(group)));
@@ -916,10 +1057,54 @@ mod tests {
             return;
         }
         let one = platform::identity(&target.join("debug/deps/one.rlib")).unwrap();
-        assert_eq!(first, BTreeSet::from([one]));
+        assert_eq!(first, BTreeMap::from([(one, MINIMUM)]));
         assert!(pool.stock(&found, &[], &protection).is_empty());
+        assert!(pool.lengths(&Focus::Everything).is_empty());
         testkit::write_patterned(&target.join("debug/deps/two.rlib"), MINIMUM, 2);
         let two = platform::identity(&target.join("debug/deps/two.rlib")).unwrap();
-        assert_eq!(pool.stock(&found, &[], &protection), BTreeSet::from([two]));
+        assert_eq!(
+            pool.stock(&found, &[], &protection),
+            BTreeMap::from([(two, MINIMUM)])
+        );
+        assert_eq!(pool.lengths(&Focus::Everything), BTreeSet::from([MINIMUM]));
+
+        let three_path = target.join("debug/deps/three.rlib");
+        testkit::write_patterned(&three_path, TWICE, 3);
+        let changed = BTreeMap::from([(three_path.clone(), Event::Written)]);
+        let three = platform::identity(&three_path).unwrap();
+        assert_eq!(
+            pool.note(found.path(), &changed),
+            BTreeMap::from([(three, TWICE)])
+        );
+        assert!(pool.note(found.path(), &changed).is_empty());
+        let deps = BTreeMap::from([(target.join("debug/deps"), Event::Unsure)]);
+        assert!(pool.note(found.path(), &deps).is_empty());
+        testkit::write_patterned(&target.join("debug/deps/four.rlib"), TWICE, 4);
+        let four = platform::identity(&target.join("debug/deps/four.rlib")).unwrap();
+        assert_eq!(
+            pool.note(found.path(), &deps),
+            BTreeMap::from([(four, TWICE)])
+        );
+        assert_eq!(
+            pool.lengths(&Focus::Everything),
+            BTreeSet::from([MINIMUM, TWICE])
+        );
+        testkit::remove_file(&three_path);
+        let gone = BTreeMap::from([(three_path, Event::Vanished)]);
+        assert!(pool.note(found.path(), &gone).is_empty());
+        assert_eq!(pool.lengths(&Focus::Everything), BTreeSet::from([MINIMUM]));
+        testkit::write_patterned(&target.join("debug/deps/nested/five.rlib"), TWICE, 5);
+        let nested = BTreeMap::from([(target.join("debug/deps/nested"), Event::Appeared)]);
+        assert_eq!(pool.note(found.path(), &nested).len(), 1);
+        assert_eq!(
+            pool.lengths(&Focus::Everything),
+            BTreeSet::from([MINIMUM, TWICE])
+        );
+        testkit::remove_file(&target.join("debug/deps/four.rlib"));
+        testkit::remove_tree(&target.join("debug/deps/nested"));
+        assert!(pool.note(found.path(), &deps).is_empty());
+        assert_eq!(pool.lengths(&Focus::Everything), BTreeSet::from([MINIMUM]));
+        pool.forget(found.path());
+        assert!(pool.lengths.is_empty());
     }
 }

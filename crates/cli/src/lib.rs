@@ -126,6 +126,22 @@ impl Scout {
         self.clone()
     }
 
+    pub(crate) fn sighting_into(
+        &self,
+        parent: &Path,
+        child: (&std::ffi::OsStr, scan::Reach),
+        excludes: &[PathBuf],
+    ) -> Result<scan::Sighting, Rejection> {
+        let validated =
+            self.validated(&ScanOptions::sighting(&[parent.to_path_buf()], excludes))?;
+        Ok(scan::sight_into(
+            &validated,
+            &self.protection,
+            &self.owners,
+            child,
+        ))
+    }
+
     fn validated(&self, options: &ScanOptions) -> Result<ScanOptions, Rejection> {
         let mut roots = Vec::new();
         for root in &options.roots {

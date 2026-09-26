@@ -180,6 +180,10 @@ pub fn make_dir(path: &Path) {
     fs::create_dir_all(path).expect("a fixture directory");
 }
 
+pub fn remove_file(path: &Path) {
+    fs::remove_file(path).expect("a removed file");
+}
+
 pub fn remove_tree(path: &Path) {
     fs::remove_dir_all(path).expect("a fixture tree that can be removed");
 }

@@ -21,8 +21,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     ReadDirectoryChangesW,
 };
 use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+};
 
-use super::Change;
+use super::{Change, Coverage, Event};
 
 type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 
@@ -87,11 +90,15 @@ fn changed(bytes: &[u8], root: &Path, deliver: &Deliver) {
             .iter()
             .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
-        let path = root.join(OsString::from_wide(&units));
-        deliver(Change::Directory(match path.parent() {
-            Some(parent) => parent.to_path_buf(),
-            None => path,
-        }));
+        deliver(Change::Entry {
+            path: root.join(OsString::from_wide(&units)),
+            event: match word(bytes, at.saturating_add(4)) {
+                Some(1 | 5) => Event::Appeared,
+                Some(2 | 4) => Event::Vanished,
+                Some(3) => Event::Written,
+                Some(_) | None => Event::Unsure,
+            },
+        });
         let Ok(next) = usize::try_from(next) else {
             return;
         };
@@ -210,9 +217,16 @@ impl Source {
         clippy::unnecessary_wraps,
         reason = "ReadDirectoryChangesW already reports every directory below the roots"
     )]
-    pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<()> {
-        Ok(())
+    pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<Coverage> {
+        Ok(Coverage::Complete)
     }
+}
+
+pub(super) fn background() {
+    // SAFETY: GetCurrentThread takes no arguments and returns this thread's pseudo-handle.
+    let thread = unsafe { GetCurrentThread() };
+    // SAFETY: the pseudo-handle names the calling thread, which may lower its own priority.
+    let _lowered = unsafe { SetThreadPriority(thread, THREAD_MODE_BACKGROUND_BEGIN) };
 }
 
 #[cfg(test)]
@@ -234,6 +248,12 @@ mod tests {
         )
         .unwrap();
         testkit::write_sized(&root.join("file"), 1);
-        assert_eq!(receiver.recv().unwrap(), Change::Directory(root));
+        assert_eq!(
+            receiver.recv().unwrap(),
+            Change::Entry {
+                path: root.join("file"),
+                event: Event::Appeared,
+            }
+        );
     }
 }

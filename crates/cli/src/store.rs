@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
@@ -79,12 +80,46 @@ impl Station {
         reason = "the store is the one module that writes files storage-scout owns"
     )]
     pub(crate) fn raise(&self) -> io::Result<()> {
-        OpenOptions::new()
+        let mut flag = OpenOptions::new()
             .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&self.flag)
-            .map(drop)
+            .append(true)
+            .open(&self.flag)?;
+        let repository = match std::env::current_dir() {
+            Ok(directory) => crate::owners::repository(&directory),
+            Err(_unknown) => None,
+        };
+        match repository {
+            Some(repository) => {
+                let mut line = repository.into_os_string().into_encoded_bytes();
+                line.push(b'\n');
+                flag.write_all(&line)
+            },
+            None => Ok(()),
+        }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the pending flag is the store's own file"
+    )]
+    pub(crate) fn take(&self) -> io::Result<Option<BTreeSet<PathBuf>>> {
+        let taken = self.flag.with_extension("taken");
+        match fs::rename(&self.flag, &taken) {
+            Ok(()) => {},
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let bytes = fs::read(&taken)?;
+        fs::remove_file(&taken)?;
+        let named = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| match std::str::from_utf8(line) {
+                Ok(text) => Some(PathBuf::from(text)),
+                Err(_foreign) => None,
+            })
+            .collect::<Option<BTreeSet<_>>>();
+        Ok(Some(named.unwrap_or_default()))
     }
 
     #[expect(

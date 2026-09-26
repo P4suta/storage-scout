@@ -5,7 +5,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::Change;
+use super::{Change, Coverage, Event};
 
 type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 
@@ -68,6 +68,11 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    fn dispatch_queue_attr_make_with_qos_class(
+        attributes: *const c_void,
+        class: libc::qos_class_t,
+        relative: i32,
+    ) -> *const c_void;
     fn dispatch_queue_create(label: *const c_char, attributes: *const c_void) -> *mut c_void;
     fn dispatch_release(object: *mut c_void);
 }
@@ -77,8 +82,8 @@ const SINCE_NOW: u64 = u64::MAX;
 const NO_DEFER: u32 = 0x02;
 const WATCH_ROOT: u32 = 0x04;
 const IGNORE_SELF: u32 = 0x08;
-const IMMEDIATELY: f64 = 0.0;
-const LOST: u32 = 0x01 | 0x02 | 0x04 | 0x20;
+const COALESCED: f64 = 1.0;
+const LOST: u32 = 0x02 | 0x04 | 0x20;
 
 extern "C" fn delivered(
     _stream: *const c_void,
@@ -96,15 +101,18 @@ extern "C" fn delivered(
     // SAFETY: FSEvents passes one flag word per path.
     let flags = unsafe { std::slice::from_raw_parts(flags, count) };
     for (path, flag) in paths.iter().zip(flags) {
-        if flag & LOST != 0 {
-            deliver(Change::Lost);
-        }
         // SAFETY: each path is a NUL-terminated string owned by FSEvents for this call.
         let bytes = unsafe { CStr::from_ptr(*path) }.to_bytes();
+        if flag & LOST != 0 {
+            tracing::debug!(flag, path = %String::from_utf8_lossy(bytes), "lost");
+            deliver(Change::Lost);
+            continue;
+        }
         let trimmed = bytes.strip_suffix(b"/").unwrap_or(bytes);
-        deliver(Change::Directory(PathBuf::from(
-            std::ffi::OsStr::from_bytes(trimmed),
-        )));
+        deliver(Change::Entry {
+            path: PathBuf::from(std::ffi::OsStr::from_bytes(trimmed)),
+            event: Event::Unsure,
+        });
     }
 }
 
@@ -198,7 +206,7 @@ impl Source {
                 &raw const context,
                 array,
                 SINCE_NOW,
-                IMMEDIATELY,
+                COALESCED,
                 NO_DEFER | WATCH_ROOT | IGNORE_SELF,
             )
         };
@@ -210,9 +218,16 @@ impl Source {
             drop(unsafe { Box::from_raw(deliver) });
             return Err(io::Error::other("FSEvents refused the stream"));
         }
-        // SAFETY: the label is NUL-terminated and a null attribute asks for a serial queue.
-        let queue =
-            unsafe { dispatch_queue_create(c"storage-scout.events".as_ptr(), std::ptr::null()) };
+        // SAFETY: a null attribute is the serial queue attribute the QoS class is added to.
+        let attributes = unsafe {
+            dispatch_queue_attr_make_with_qos_class(
+                std::ptr::null(),
+                libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+                0,
+            )
+        };
+        // SAFETY: the label is NUL-terminated and the attributes came from libdispatch.
+        let queue = unsafe { dispatch_queue_create(c"storage-scout.events".as_ptr(), attributes) };
         // SAFETY: the stream is live and the queue outlives it.
         unsafe { FSEventStreamSetDispatchQueue(stream, queue) };
         // SAFETY: the stream is scheduled on a queue, so it may start.
@@ -247,7 +262,13 @@ impl Source {
         clippy::unnecessary_wraps,
         reason = "FSEvents already reports every directory below the roots"
     )]
-    pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<()> {
-        Ok(())
+    pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<Coverage> {
+        Ok(Coverage::Complete)
     }
+}
+
+pub(super) fn background() {
+    // SAFETY: the call sets only the calling thread's own QoS class.
+    let _lowered =
+        unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0) };
 }
