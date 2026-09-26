@@ -367,7 +367,7 @@ impl Session<'_> {
             root.clone(),
             Watched {
                 found,
-                repository: owners::repository(&root),
+                repository: self.scout.owners().repository(&root),
                 survey,
                 changed: BTreeMap::new(),
                 whole,

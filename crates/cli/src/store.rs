@@ -91,7 +91,7 @@ impl Station {
 
     pub(crate) fn raise(&self) -> io::Result<()> {
         let repository = match std::env::current_dir() {
-            Ok(directory) => crate::owners::repository(&directory),
+            Ok(directory) => crate::owners::Owners::detect().repository(&directory),
             Err(_unknown) => None,
         };
         self.raise_from(repository.as_deref())
