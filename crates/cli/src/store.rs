@@ -52,6 +52,7 @@ fn create(directory: &Path) -> io::Result<()> {
 #[derive(Debug, Clone)]
 pub(crate) struct Station {
     lock: PathBuf,
+    signal: PathBuf,
     flag: PathBuf,
     last: PathBuf,
 }
@@ -68,11 +69,18 @@ impl Station {
             let _written = write!(key, "{byte:02x}");
             key
         });
+        let signal = state.join(format!("auto-{key}.signal"));
         Self {
             lock: state.join(format!("auto-{key}.lock")),
-            flag: state.join(format!("auto-{key}.pending")),
+            flag: signal.join("pending"),
+            signal,
             last: state.join(format!("auto-{key}.last.json")),
         }
+    }
+
+    pub(crate) fn signal(&self) -> io::Result<PathBuf> {
+        create(&self.signal)?;
+        Ok(self.signal.clone())
     }
 
     pub(crate) fn raise(&self) -> io::Result<()> {
@@ -88,6 +96,7 @@ impl Station {
         reason = "the store is the one module that writes files storage-scout owns"
     )]
     fn raise_from(&self, repository: Option<&Path>) -> io::Result<()> {
+        create(&self.signal)?;
         let mut flag = OpenOptions::new()
             .create(true)
             .append(true)

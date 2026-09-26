@@ -110,6 +110,7 @@ pub enum WatchError {
 struct Hooks<'a> {
     station: Station,
     state: PathBuf,
+    signal: PathBuf,
     log: Option<PathBuf>,
     render: &'a dyn Fn(&WatchRecord) -> io::Result<()>,
 }
@@ -880,7 +881,7 @@ fn open<'a>(
         })
         .collect::<Vec<_>>();
     let mut paths = roots.clone();
-    paths.push(hooks.state.clone());
+    paths.push(hooks.signal.clone());
     let deliver = sender.clone();
     let watcher = Watcher::start(&paths, move |change| {
         let _closed = deliver.send(Signal::Changed(change));
@@ -914,10 +915,12 @@ fn watching(
         .and_then(fs::canonicalize)
         .map_err(WatchError::Station)?;
     let station = Station::for_policy(&state, config);
+    let signal = station.signal().map_err(WatchError::Station)?;
     let _held = station.wait().map_err(WatchError::Station)?;
     let hooks = Hooks {
         station,
         state,
+        signal,
         log: policy.log_file.clone(),
         render,
     };
@@ -976,9 +979,12 @@ mod tests {
             records.borrow_mut().push(record.clone());
             Ok(())
         };
+        let station = Station::for_policy(&state, &base.join("auto.toml"));
+        let signal = station.signal().unwrap();
         let hooks = Hooks {
-            station: Station::for_policy(&state, &base.join("auto.toml")),
+            station,
             state,
+            signal,
             log: None,
             render: &render,
         };

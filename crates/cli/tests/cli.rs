@@ -26,6 +26,16 @@ fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn pending(state: &Path) -> bool {
+    fs::read_dir(state).unwrap().flatten().any(|entry| {
+        fs::read_dir(entry.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|child| child.file_name() == "pending")
+    })
+}
+
 fn open_space(root: &Path) -> bool {
     let scout = Scout::detect().unwrap();
     let open = scout.protection().area_of(&testkit::location(root)) == Area::Open;
@@ -411,14 +421,7 @@ fn a_run_while_another_holds_the_station_is_handed_over() {
     assert_eq!(handed.status.code(), Some(0), "{handed:#?}");
     assert!(String::from_utf8_lossy(&handed.stderr).contains("in progress"));
     testkit::assert_present(&released);
-    let pending = fs::read_dir(&state).unwrap().any(|entry| {
-        entry
-            .unwrap()
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "pending")
-    });
-    assert!(pending, "the request must wait for the holder");
+    assert!(pending(&state), "the request must wait for the holder");
     drop(holder);
     let served = hooked(&["auto", "--config", config, "--execute"], &state, b"");
     assert_eq!(served.status.code(), Some(0), "{served:#?}");
@@ -450,14 +453,7 @@ fn a_detached_run_finishes_in_the_background() {
         answer["pid"].as_u64().is_some_and(|pid| pid > 0),
         "{answer}"
     );
-    let flag = |path: &Path| {
-        path.extension()
-            .is_some_and(|extension| extension == "pending")
-    };
-    while fs::read_dir(&state)
-        .unwrap()
-        .any(|entry| flag(&entry.unwrap().path()))
-    {
+    while pending(&state) {
         std::thread::yield_now();
     }
     let lock = fs::read_dir(&state)
