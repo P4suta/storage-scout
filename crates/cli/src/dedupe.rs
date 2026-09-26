@@ -29,6 +29,8 @@ use crate::apply::Mode;
 use crate::measure::Volumes;
 use crate::platform::{self, Event, FileFacts, Request};
 use crate::scan::Found;
+#[cfg(target_os = "macos")]
+use crate::store::{CachedStock, InventoryChanges, InventoryRoot};
 use crate::{SCHEMA_VERSION, busy, failure, host, observe};
 
 const SAMPLE: u64 = 4096;
@@ -409,6 +411,16 @@ type Member = (PathBuf, Box<Path>);
 pub(crate) struct Pool {
     stocks: BTreeMap<PathBuf, Stock>,
     lengths: BTreeMap<u64, BTreeSet<Member>>,
+    #[cfg(target_os = "macos")]
+    journal: Journal,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct Journal {
+    cleared: BTreeSet<PathBuf>,
+    roots: BTreeMap<PathBuf, (Identity, usize)>,
+    files: BTreeMap<(PathBuf, Box<Path>), Option<FileFacts>>,
 }
 
 pub(crate) enum Focus<'a> {
@@ -516,6 +528,127 @@ impl Pool {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn replace_cached(
+        &mut self,
+        found: &Found,
+        unreadable: usize,
+        files: &BTreeMap<Box<Path>, FileFacts>,
+    ) {
+        let root = found.path().to_path_buf();
+        self.journal.cleared.insert(root.clone());
+        self.journal.files.retain(|(known, _), _| known != &root);
+        self.journal
+            .roots
+            .insert(root.clone(), (found.candidate().identity(), unreadable));
+        for (relative, facts) in files {
+            self.journal
+                .files
+                .insert((root.clone(), relative.clone()), Some(*facts));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn note_cached(
+        &mut self,
+        root: &Path,
+        removed: &BTreeMap<Box<Path>, FileFacts>,
+        added: &BTreeMap<Box<Path>, FileFacts>,
+    ) {
+        for relative in removed.keys() {
+            self.journal
+                .files
+                .insert((root.to_path_buf(), relative.clone()), None);
+        }
+        for (relative, facts) in added {
+            self.journal
+                .files
+                .insert((root.to_path_buf(), relative.clone()), Some(*facts));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn forget_cached(&mut self, root: &Path) {
+        self.journal.cleared.insert(root.to_path_buf());
+        self.journal.roots.remove(root);
+        self.journal.files.retain(|(known, _), _| known != root);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn restore(
+        &mut self,
+        found: &Found,
+        cached: CachedStock,
+        excludes: &[Location],
+        protection: &Protection,
+    ) -> bool {
+        if cached.root != found.path() || cached.identity != found.candidate().identity() {
+            return false;
+        }
+        let terms = Terms {
+            excludes,
+            protection,
+        };
+        let (admission, method, files, replace) = match admit(found, &terms) {
+            Ok(method) => (
+                Admission::Admitted {
+                    method,
+                    files: cached.files.len(),
+                    unreadable: cached.unreadable,
+                },
+                Some(method),
+                cached.files,
+                false,
+            ),
+            Err(rejection) => (
+                Admission::Rejected { rejection },
+                None,
+                BTreeMap::new(),
+                true,
+            ),
+        };
+        if replace {
+            self.replace_cached(found, 0, &files);
+        }
+        self.index(found.path(), &files);
+        self.stocks.insert(
+            found.path().to_path_buf(),
+            Stock {
+                found: found.clone(),
+                subject: Subject {
+                    id: found.candidate().id().clone(),
+                    location: found.candidate().location().clone(),
+                    admission,
+                },
+                method,
+                files,
+            },
+        );
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn changes(&mut self) -> InventoryChanges {
+        let journal = std::mem::take(&mut self.journal);
+        InventoryChanges {
+            cleared: journal.cleared.into_iter().collect(),
+            roots: journal
+                .roots
+                .into_iter()
+                .map(|(root, (identity, unreadable))| InventoryRoot {
+                    root,
+                    identity,
+                    unreadable,
+                })
+                .collect(),
+            files: journal
+                .files
+                .into_iter()
+                .map(|((root, relative), facts)| (root, relative, facts))
+                .collect(),
+        }
+    }
+
     pub(crate) fn stock(
         &mut self,
         found: &Found,
@@ -559,6 +692,13 @@ impl Pool {
             .filter(|facts| !known.contains(&facts.identity))
             .map(|facts| (facts.identity, facts.len))
             .collect();
+        #[cfg(target_os = "macos")]
+        let unreadable = match &admission {
+            Admission::Admitted { unreadable, .. } => *unreadable,
+            Admission::Rejected { .. } => 0,
+        };
+        #[cfg(target_os = "macos")]
+        self.replace_cached(found, unreadable, &files);
         self.index(found.path(), &files);
         self.stocks.insert(
             found.path().to_path_buf(),
@@ -622,6 +762,8 @@ impl Pool {
             .map(|facts| (facts.identity, facts.len))
             .collect();
         stock.files.extend(added.clone());
+        #[cfg(target_os = "macos")]
+        self.note_cached(root, &removed, &added);
         self.unindex(root, &removed);
         self.index(root, &added);
         fresh
@@ -631,6 +773,8 @@ impl Pool {
         if let Some(stock) = self.stocks.remove(root) {
             self.unindex(root, &stock.files);
         }
+        #[cfg(target_os = "macos")]
+        self.forget_cached(root);
     }
 
     fn lengths(&self, focus: &Focus<'_>) -> BTreeSet<u64> {
@@ -1154,6 +1298,76 @@ mod tests {
         pool.stocks.get_mut(found.path()).unwrap().method = method;
         pool.forget(found.path());
         assert!(pool.lengths.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restored_stock_reuses_cached_files_and_journals_later_changes() {
+        let temp = testkit::tempdir("dedupe-restored-stock");
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let target = testkit::write_cargo_project(&root.join("app"), 1);
+        testkit::write_cache_tag(&target);
+        testkit::write_sized(&target.join("debug/.cargo-lock"), 0);
+        let sighted = crate::scan::sight(
+            &crate::ScanOptions::sighting(std::slice::from_ref(&root), &[]),
+            &testkit::open_protection(),
+            &crate::owners::Owners::default(),
+            crate::scan::Reach::Everything,
+        );
+        let found = sighted.report.candidates.first().unwrap().clone();
+        let identity = found.candidate().identity();
+        let relative = PathBuf::from("debug/deps/cached.rlib").into_boxed_path();
+        let cached_facts = FileFacts {
+            identity: Identity {
+                volume: identity.volume,
+                file: identity.file.saturating_add(1),
+            },
+            len: MINIMUM,
+            links: 1,
+            owner: share::Owner::Caller,
+            mode: share::Mode::Plain,
+            sharing: share::Sharing::Unknown,
+        };
+        let cached = CachedStock {
+            root: target.clone(),
+            identity,
+            unreadable: 2,
+            files: BTreeMap::from([(relative.clone(), cached_facts)]),
+        };
+        let protection = testkit::open_protection();
+        let mut pool = Pool::default();
+        assert!(pool.restore(&found, cached, &[], &protection));
+        match &pool.stocks[&target].subject.admission {
+            Admission::Admitted {
+                files, unreadable, ..
+            } => {
+                assert_eq!(*files, 1);
+                assert_eq!(*unreadable, 2);
+                assert_eq!(pool.file_count(&target), 1);
+                assert!(pool.changes().files.is_empty());
+                assert!(
+                    pool.note(
+                        &target,
+                        &BTreeMap::from([(target.join(&relative), Event::Vanished)])
+                    )
+                    .is_empty()
+                );
+                let changes = pool.changes();
+                assert_eq!(changes.files.len(), 1);
+                assert_eq!(changes.files[0].0, target);
+                assert_eq!(changes.files[0].1, relative);
+                assert!(changes.files[0].2.is_none());
+            },
+            Admission::Rejected { .. } => {
+                assert_eq!(pool.file_count(&target), 0);
+                let changes = pool.changes();
+                assert_eq!(changes.cleared.as_slice(), std::slice::from_ref(&target));
+                assert_eq!(changes.roots.len(), 1);
+                assert!(changes.files.is_empty());
+            },
+        }
+        pool.forget(&target);
+        assert_eq!(pool.changes().cleared, [target]);
     }
 
     #[test]
