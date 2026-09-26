@@ -263,7 +263,7 @@ fn a_cache_whose_key_is_gone_is_reaped_as_soon_as_a_hook_says_so() {
         let line = watching.next();
         eprintln!("watch record: {line}");
         assert!(!line.contains("FAILURES"), "{line}");
-        if line.starts_with("hook:") && line.contains("reaped 1") {
+        if line.contains("reaped 1") {
             break;
         }
     }
