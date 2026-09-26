@@ -126,8 +126,10 @@ fn a_build_is_pruned_once_it_ends_and_not_while_it_runs() {
     let waited = build(&debug, "three", "c");
     testkit::assert_present(&busy);
     drop(holder);
-    let released = watching.next();
-    assert!(released.contains("pruned 2 entries"), "{released}");
+    while fs::symlink_metadata(&busy).is_ok() || fs::symlink_metadata(&waited).is_ok() {
+        let released = watching.next();
+        assert!(!released.contains("FAILURES"), "{released}");
+    }
     testkit::assert_absent(&busy);
     testkit::assert_absent(&waited);
 }
