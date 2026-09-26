@@ -89,15 +89,19 @@ Parallel worktrees build the same dependencies into separate `target/` directori
 ## Running on events
 
 `watch` is the resident form: run it as a login agent (launchd, systemd `--user`, a Task Scheduler logon task).
-It keeps the candidates and their files in memory and reacts only to what changed:
+It keeps candidate surveys and the sharing inventory in memory, runs at background priority, and reacts only to what changed:
 
-- a write inside a cache waits for the cache's writer to release its lock, then prunes and shares that cache's new files;
+- a write inside a cache updates that cache's changed files, waits for its writer to release its lock, then prunes and shares only the affected work;
 - an owner releasing its lock reaps what it owned;
-- a new directory is looked at when it appears.
+- a new directory is examined when it appears, while a directory already walked is only re-listed for new children and evidence.
 
 Filesystem events come from FSEvents on macOS, `ReadDirectoryChangesW` on Windows, and inotify on Linux.
-On macOS and Windows the watcher sees every directory below its roots, so a ref update under `.git/refs` is enough for it to ask the owners again and git hooks are optional.
-Linux watches one directory at a time, so there ownership that only git knows changes through git hooks:
+Windows and Linux name the entry that appeared, vanished, or was written.
+FSEvents names the changed directory, so macOS re-lists that directory shallowly; the operating system coalesces notifications for one second with `NoDefer` to keep the event stream responsive under build bursts.
+That second is transport batching only: it neither makes a cleanup decision nor causes storage-scout to poll or wait before deciding.
+macOS and Windows observe every directory below their roots, while Linux registers every directory it walks and each repository's ref tree individually.
+A ref update under `.git/refs`, `packed-refs`, `HEAD`, or `worktrees` invalidates only that repository's cached ownership answers.
+Linux also uses git hooks for ownership changes known only to git:
 
 ```sh
 storage-scout auto --execute --detach --event post-merge -- "$@"
@@ -106,7 +110,8 @@ storage-scout auto --execute --detach --event reference-transaction -- "$@"   # 
 ```
 
 Irrelevant events exit at once.
-When a watcher is running, a hook only raises its flag; otherwise it starts one full `auto` run, and concurrent runs coalesce into one.
+When a watcher is running, a hook records its repository and raises the flag, so only that repository's candidates are re-checked; a hook whose repository is unknown safely re-checks every candidate.
+Without a watcher the hook starts one full `auto` run, and concurrent runs coalesce into one.
 
 ## Safety
 
