@@ -12,8 +12,7 @@ use storage_scout::core::ownership::Settlement;
 use storage_scout::core::size::Bytes;
 use storage_scout::{AutoPolicy, Measure, Mode, ScanOptions, Scout, Status};
 use testkit::{
-    Built, Git, MarkerKeep, MarkerRole, claim, tempdir, write_bytes, write_owner_marker,
-    write_sized,
+    Git, MarkerKeep, MarkerRole, claim, tempdir, write_bytes, write_owner_marker, write_sized,
 };
 
 struct Repo {
@@ -331,6 +330,7 @@ fn a_worktree_whose_repository_cannot_be_read_is_not_called_forgotten() {
     let detached = repo.worktree("detached", &["--detach"]);
     let target = build(&detached);
     let Some(restricted) = testkit::restrict(&repo.work.join(".git/worktrees"), 0o000) else {
+        testkit::decline("a restricted path");
         return;
     };
     let settled = repo.settlement(&target);
@@ -379,8 +379,8 @@ fn a_git_link_that_is_a_symbolic_link_is_not_trusted() {
         &root.join("elsewhere/gitfile"),
         b"gitdir: /nonexistent/storage-scout\n",
     );
-    let Built::Yes(_) =
-        testkit::symlink_file(&project.join(".git"), &root.join("elsewhere/gitfile"))
+    let Some(_) = testkit::symlink_file(&project.join(".git"), &root.join("elsewhere/gitfile"))
+        .or_decline("a file link")
     else {
         return;
     };
@@ -479,6 +479,7 @@ fn a_key_that_cannot_be_looked_at_keeps_the_cache() {
     );
     let scout = Scout::with(testkit::open_protection()).confined(vec![root.to_path_buf()]);
     let Some(restricted) = testkit::restrict(&sealed, 0o000) else {
+        testkit::decline("a restricted path");
         return;
     };
     let settled = settlement(&scout, root, &cache);

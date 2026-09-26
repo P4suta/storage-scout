@@ -15,7 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  NJUTEST_REV: 0821533b67b451d80fcff38517f1c7db1d25481a
+  NJUTEST_REV: 937da694b4ad9f4e8c0993e04e7b7d437647474e
 
 jobs:
   quality:

@@ -59,7 +59,7 @@ impl Watching {
                 complaint.contains("cannot watch for changes here"),
                 "{complaint}"
             );
-            let _skipped = Built::Unavailable(complaint).or_skip("a filesystem watcher");
+            let _skipped = Built::Unavailable(complaint).or_decline("a filesystem watcher");
             return None;
         };
         let started = started.unwrap();
@@ -195,7 +195,7 @@ fn capable(root: &Path) -> bool {
             "this volume must share blocks: {run:#?}"
         );
         let _skipped = Built::Unavailable(String::from("no block sharing"))
-            .or_skip("a volume that shares blocks");
+            .or_decline("a volume that shares blocks");
     }
     admitted
 }
