@@ -27,6 +27,21 @@ const MASK: u32 = libc::IN_CREATE
 const HEADER: usize = 16;
 const BUFFER: usize = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchFailure {
+    Ignore,
+    Partial,
+    Return,
+}
+
+const fn watch_failure(code: Option<i32>) -> WatchFailure {
+    match code {
+        Some(libc::ENOENT | libc::ENOTDIR | libc::EACCES) => WatchFailure::Ignore,
+        Some(libc::ENOSPC) => WatchFailure::Partial,
+        Some(_) | None => WatchFailure::Return,
+    }
+}
+
 fn field(bytes: &[u8], at: usize) -> Option<[u8; 4]> {
     bytes.get(at..)?.first_chunk::<4>().copied()
 }
@@ -152,20 +167,18 @@ impl Source {
             let wd = unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), name.as_ptr(), MASK) };
             if wd == -1 {
                 let error = io::Error::last_os_error();
-                match error.raw_os_error() {
-                    Some(libc::ENOENT | libc::ENOTDIR | libc::EACCES) => continue,
-                    Some(libc::ENOSPC) => {
-                        coverage = Coverage::Partial;
-                        continue;
-                    },
-                    Some(_) | None => return Err(error),
+                match watch_failure(error.raw_os_error()) {
+                    WatchFailure::Ignore => {},
+                    WatchFailure::Partial => coverage = Coverage::Partial,
+                    WatchFailure::Return => return Err(error),
                 }
+            } else {
+                let mut known = match self.watches.lock() {
+                    Ok(known) => known,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                known.insert(wd, directory.to_path_buf());
             }
-            let mut known = match self.watches.lock() {
-                Ok(known) => known,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            known.insert(wd, directory.to_path_buf());
         }
         Ok(coverage)
     }
@@ -295,5 +308,15 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(watched, vec![there, temp.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn watch_errors_distinguish_missing_capacity_and_failure() {
+        for code in [libc::ENOENT, libc::ENOTDIR, libc::EACCES] {
+            assert_eq!(watch_failure(Some(code)), WatchFailure::Ignore);
+        }
+        assert_eq!(watch_failure(Some(libc::ENOSPC)), WatchFailure::Partial);
+        assert_eq!(watch_failure(Some(libc::EIO)), WatchFailure::Return);
+        assert_eq!(watch_failure(None), WatchFailure::Return);
     }
 }

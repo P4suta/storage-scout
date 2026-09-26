@@ -346,6 +346,18 @@ fn request<'a>(pair: &Pair<'a, Item<'_>>) -> Request<'a> {
 
 type Held<'f> = Option<(&'f Found, Result<Shareable, Rejection>)>;
 
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "mutation measurement must be able to instrument each classification"
+)]
+fn shared(result: Result<(), Failure>) -> PairStatus {
+    match result {
+        Ok(()) => PairStatus::Shared,
+        Err(failure) if failure.overtaken() => PairStatus::Overtaken { failure },
+        Err(failure) => PairStatus::Failed { failure },
+    }
+}
+
 fn settle<'f>(
     pair: &Pair<'_, Item<'f>>,
     mode: Mode,
@@ -369,11 +381,7 @@ fn settle<'f>(
                 Err(rejection) => PairStatus::Withheld {
                     rejection: rejection.clone(),
                 },
-                Ok(shareable) => match shareable.share(&request(pair)) {
-                    Ok(()) => PairStatus::Shared,
-                    Err(failure) if failure.overtaken() => PairStatus::Overtaken { failure },
-                    Err(failure) => PairStatus::Failed { failure },
-                },
+                Ok(shareable) => shared(shareable.share(&request(pair))),
             }
         },
     }
@@ -806,6 +814,23 @@ mod tests {
     use super::*;
 
     const LEN: u64 = SAMPLE * 3;
+
+    #[test]
+    fn a_changed_file_is_overtaken_and_an_operating_failure_is_failed() {
+        assert!(matches!(
+            shared(Err(Failure::KeeperChanged)),
+            PairStatus::Overtaken {
+                failure: Failure::KeeperChanged
+            }
+        ));
+        assert!(matches!(
+            shared(Err(Failure::Leftover)),
+            PairStatus::Failed {
+                failure: Failure::Leftover
+            }
+        ));
+        assert!(matches!(shared(Ok(())), PairStatus::Shared));
+    }
 
     fn written(root: &Path, name: &str, change: Option<u64>) -> (PathBuf, Identity) {
         let path = root.join(name);
