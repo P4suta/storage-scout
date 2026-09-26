@@ -39,7 +39,7 @@ pub(crate) enum Change {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-    not(target_os = "linux"),
+    not(any(test, target_os = "linux")),
     expect(dead_code, reason = "only inotify can run out of watches")
 )]
 pub(crate) enum Coverage {
@@ -317,7 +317,7 @@ mod tests {
                 }),
                 Capability::Unsupported { filesystem } => {
                     let _skipped = Built::Unavailable(filesystem.to_string())
-                        .or_skip("a volume that shares blocks");
+                        .or_decline("a volume that shares blocks");
                     None
                 },
             }
@@ -377,7 +377,7 @@ mod tests {
         match Tree::open(&temp.path().join("one"), other) {
             Err(WalkError::Moved { .. }) => {},
             Err(WalkError::Io { error, .. }) if error.kind() == io::ErrorKind::Unsupported => {
-                let _skipped = Built::Unavailable(error.to_string()).or_skip("a directory tree");
+                let _skipped = Built::Unavailable(error.to_string()).or_decline("a directory tree");
             },
             Ok(_) | Err(WalkError::Boundary { .. } | WalkError::Io { .. }) => {
                 panic!("a tree opened as another directory")
@@ -462,8 +462,8 @@ mod tests {
         let Some(fixture) = Fixture::new("platform-link") else {
             return;
         };
-        let Built::Yes(_) =
-            testkit::link_dir(&fixture.root.join("linked"), &fixture.root.join("sub"))
+        let Some(_) = testkit::link_dir(&fixture.root.join("linked"), &fixture.root.join("sub"))
+            .or_decline("a directory link")
         else {
             return;
         };
@@ -481,6 +481,7 @@ mod tests {
         };
         let right = identity(&fixture.root.join(dup())).unwrap();
         let Some(restricted) = testkit::restrict(&fixture.root.join("sub"), 0o000) else {
+            testkit::decline("a restricted path");
             return;
         };
         let result = fixture.share_as(dup(), right, LEN);
@@ -522,7 +523,7 @@ mod tests {
             } else {
                 testkit::executable(&path)
             };
-            let Built::Yes(_) = built else {
+            let Some(_) = built.or_decline("a hard link or executable bit") else {
                 return;
             };
             let expected = match fixture.method {
@@ -541,11 +542,13 @@ mod tests {
         if fixture.method != Method::CloneAndSwap {
             return;
         }
-        let Built::Yes(_) = testkit::set_xattr(&fixture.keeper, "storage-scout.test", "one") else {
+        let Some(_) = testkit::set_xattr(&fixture.keeper, "storage-scout.test", "one")
+            .or_decline("an extended attribute")
+        else {
             return;
         };
-        let Built::Yes(_) =
-            testkit::set_xattr(&fixture.root.join(dup()), "storage-scout.test", "two")
+        let Some(_) = testkit::set_xattr(&fixture.root.join(dup()), "storage-scout.test", "two")
+            .or_decline("an extended attribute")
         else {
             return;
         };
@@ -575,7 +578,7 @@ mod tests {
             return;
         };
         let path = fixture.root.join(dup());
-        let Built::Yes(_) = testkit::other_group(&path) else {
+        let Some(_) = testkit::other_group(&path).or_decline("a file in another group") else {
             return;
         };
         let before = testkit::group_of(&path);
@@ -588,7 +591,7 @@ mod tests {
             Ok(pruning) => Some(pruning),
             Err(WalkError::Io { error, .. }) if error.kind() == io::ErrorKind::Unsupported => {
                 let _skipped =
-                    Built::Unavailable(error.to_string()).or_skip("a tree that can be pruned");
+                    Built::Unavailable(error.to_string()).or_decline("a tree that can be pruned");
                 None
             },
             Err(error) => panic!("{error:?}"),
@@ -731,15 +734,19 @@ mod tests {
         let sealed = identity(&root.join("deps/sealed/stale.o")).unwrap();
         let listed = identity(&root.join("deps/listed/stale.o")).unwrap();
         let Some(_lock) = testkit::restrict(&unit.join("s-a-b.lock"), 0o000) else {
+            testkit::decline("a restricted path");
             return;
         };
         let Some(_closed) = testkit::restrict(&root.join(closed), 0o000) else {
+            testkit::decline("a restricted path");
             return;
         };
         let Some(_sealed) = testkit::restrict(&root.join("deps/sealed"), 0o000) else {
+            testkit::decline("a restricted path");
             return;
         };
         let Some(_listed) = testkit::restrict(&root.join("deps/listed"), 0o400) else {
+            testkit::decline("a restricted path");
             return;
         };
         let unlocked = std::ffi::OsStr::new("s-a-b.lock");

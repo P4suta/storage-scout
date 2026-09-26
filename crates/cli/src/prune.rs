@@ -635,6 +635,21 @@ mod tests {
     }
 
     #[test]
+    fn paths_and_image_names_have_to_belong_to_the_profile() {
+        let temp = testkit::tempdir("prune-relative");
+        let root = temp.path().join("root");
+        assert_eq!(
+            relative(&root, &root.join("deps/app.o")),
+            Some(PathBuf::from("deps/app.o"))
+        );
+        assert_eq!(relative(&root, &temp.path().join("outside")), None);
+        assert!(matches!(
+            referenced(&root, &[0xff, 0xfe]),
+            Some(Err(ImageError::Mach))
+        ));
+    }
+
+    #[test]
     fn removals_add_up_per_rule() {
         let mut one = Removed::default();
         one.add(Rule::StaleObject, 10);

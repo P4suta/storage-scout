@@ -249,4 +249,41 @@ mod tests {
         assert!(Owners::from_ceilings(Some(&empty)).ceilings.is_empty());
         assert_eq!(owners.clone().ceilings, owners.ceilings);
     }
+
+    #[test]
+    fn forgetting_one_repository_keeps_the_other_repositories_answers() {
+        let temp = testkit::tempdir("owners-forget");
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let one = base.join("one");
+        let two = base.join("two");
+        testkit::make_dir(&one.join(".git"));
+        testkit::make_dir(&two.join(".git"));
+        let owners = Owners::default();
+        let _one = owners.of(&one, &[]);
+        let _two = owners.of(&two, &[]);
+        assert_eq!(owners.worktrees.lock().unwrap().len(), 2);
+
+        owners.forget(Some(&BTreeSet::from([one.join(".git")])));
+        let cached = owners.worktrees.lock().unwrap();
+        assert!(!cached.contains_key(&one));
+        assert!(cached.contains_key(&two));
+        drop(cached);
+
+        owners.forget(None);
+        assert!(owners.worktrees.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_git_file_has_to_name_a_git_directory() {
+        let temp = testkit::tempdir("owners-git-file");
+        let file = temp.path().join(".git");
+        assert_eq!(gitdir(&file), None);
+        testkit::write_bytes(&file, b"not a git directory\n");
+        assert_eq!(gitdir(&file), None);
+        testkit::write_bytes(&file, b"gitdir: ../repository/.git/worktrees/linked\n");
+        assert_eq!(
+            gitdir(&file),
+            Some(temp.path().join("../repository/.git/worktrees/linked"))
+        );
+    }
 }

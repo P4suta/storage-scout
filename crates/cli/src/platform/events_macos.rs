@@ -85,6 +85,19 @@ const IGNORE_SELF: u32 = 0x08;
 const COALESCED: f64 = 1.0;
 const LOST: u32 = 0x02 | 0x04 | 0x20;
 
+fn change(bytes: &[u8], flag: u32) -> Change {
+    if flag & LOST != 0 {
+        tracing::debug!(flag, path = %String::from_utf8_lossy(bytes), "lost");
+        Change::Lost
+    } else {
+        let trimmed = bytes.strip_suffix(b"/").unwrap_or(bytes);
+        Change::Entry {
+            path: PathBuf::from(std::ffi::OsStr::from_bytes(trimmed)),
+            event: Event::Unsure,
+        }
+    }
+}
+
 extern "C" fn delivered(
     _stream: *const c_void,
     info: *mut c_void,
@@ -103,16 +116,7 @@ extern "C" fn delivered(
     for (path, flag) in paths.iter().zip(flags) {
         // SAFETY: each path is a NUL-terminated string owned by FSEvents for this call.
         let bytes = unsafe { CStr::from_ptr(*path) }.to_bytes();
-        if flag & LOST != 0 {
-            tracing::debug!(flag, path = %String::from_utf8_lossy(bytes), "lost");
-            deliver(Change::Lost);
-            continue;
-        }
-        let trimmed = bytes.strip_suffix(b"/").unwrap_or(bytes);
-        deliver(Change::Entry {
-            path: PathBuf::from(std::ffi::OsStr::from_bytes(trimmed)),
-            event: Event::Unsure,
-        });
+        deliver(change(bytes, *flag));
     }
 }
 
@@ -271,4 +275,30 @@ pub(super) fn background() {
     // SAFETY: the call sets only the calling thread's own QoS class.
     let _lowered =
         unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_events_are_lost_and_directories_are_trimmed() {
+        for flag in [0x02, 0x04, 0x20] {
+            assert_eq!(change(b"/work/target/", flag), Change::Lost);
+        }
+        assert_eq!(
+            change(b"/work/target/", 0),
+            Change::Entry {
+                path: PathBuf::from("/work/target"),
+                event: Event::Unsure,
+            }
+        );
+        assert_eq!(
+            change(b"/work/target", 0),
+            Change::Entry {
+                path: PathBuf::from("/work/target"),
+                event: Event::Unsure,
+            }
+        );
+    }
 }

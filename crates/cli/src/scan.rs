@@ -729,6 +729,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_file_is_not_accepted_as_a_scan_root() {
+        let temp = testkit::tempdir("scan-file-root");
+        let file = temp.path().join("file");
+        testkit::write_sized(&file, 1);
+        assert!(matches!(
+            validate_root(&file, &testkit::open_protection()),
+            Err(Rejection::NotADirectory { .. })
+        ));
+    }
+
+    #[test]
     fn a_sighting_names_every_directory_it_walked_outside_the_candidates() {
         let temp = testkit::tempdir("scan-walked");
         let root = fs::canonicalize(temp.path()).unwrap().join("work");

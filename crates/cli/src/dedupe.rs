@@ -1053,7 +1053,7 @@ mod tests {
             let required = std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_some();
             assert!(!required, "this volume must share blocks");
             let _skipped = testkit::Built::Unavailable(String::from("sharing is refused here"))
-                .or_skip("a volume that shares blocks");
+                .or_decline("a volume that shares blocks");
             return;
         }
         let one = platform::identity(&target.join("debug/deps/one.rlib")).unwrap();
@@ -1104,7 +1104,75 @@ mod tests {
         testkit::remove_tree(&target.join("debug/deps/nested"));
         assert!(pool.note(found.path(), &deps).is_empty());
         assert_eq!(pool.lengths(&Focus::Everything), BTreeSet::from([MINIMUM]));
+        assert!(
+            !pool
+                .stocks
+                .get(found.path())
+                .unwrap()
+                .files
+                .contains_key(Path::new("debug/deps/nested/five.rlib"))
+        );
+
+        let method = pool.stocks.get_mut(found.path()).unwrap().method.take();
+        let six = target.join("debug/deps/six.rlib");
+        testkit::write_patterned(&six, TWICE, 6);
+        assert!(
+            pool.note(found.path(), &BTreeMap::from([(six, Event::Written)]))
+                .is_empty()
+        );
+        assert_eq!(pool.stocks.get(found.path()).unwrap().files.len(), 2);
+        pool.stocks.get_mut(found.path()).unwrap().method = method;
         pool.forget(found.path());
         assert!(pool.lengths.is_empty());
+    }
+
+    #[test]
+    fn a_directory_event_only_relists_its_files_and_keeps_existing_subtrees() {
+        let temp = testkit::tempdir("dedupe-directory-event");
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let directory = root.join("deps");
+        let direct = directory.join("direct.rlib");
+        let nested = directory.join("nested/nested.rlib");
+        let small = directory.join("small.rlib");
+        let temporary = directory.join(format!("temporary{TEMPORARY_SUFFIX}"));
+        testkit::write_patterned(&direct, MINIMUM, 1);
+        testkit::write_patterned(&nested, MINIMUM, 2);
+        testkit::write_patterned(&small, MINIMUM - 1, 3);
+        testkit::write_patterned(&temporary, MINIMUM, 4);
+
+        let shallow = present(&root, &directory, Event::Unsure);
+        assert_eq!(
+            shallow
+                .iter()
+                .map(|(path, _)| path.as_ref())
+                .collect::<Vec<_>>(),
+            [Path::new("deps/direct.rlib")]
+        );
+        let recursive = present(&root, &directory, Event::Appeared);
+        assert_eq!(
+            recursive
+                .iter()
+                .map(|(path, _)| path.as_ref())
+                .collect::<Vec<_>>(),
+            [
+                Path::new("deps/direct.rlib"),
+                Path::new("deps/nested/nested.rlib")
+            ]
+        );
+        assert_eq!(present(&root, &direct, Event::Written).len(), 1);
+        assert!(present(&root, &small, Event::Written).is_empty());
+        assert!(present(&root, &temporary, Event::Written).is_empty());
+        assert!(present(&root, &root.join("missing"), Event::Written).is_empty());
+
+        let relative = Path::new("deps");
+        let recorded = Path::new("deps/nested/nested.rlib");
+        assert!(still_there(&directory, relative, recorded));
+        testkit::remove_tree(&directory.join("nested"));
+        assert!(!still_there(&directory, relative, recorded));
+        assert!(!still_there(
+            &directory,
+            relative,
+            Path::new("elsewhere/file")
+        ));
     }
 }

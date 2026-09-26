@@ -75,27 +75,36 @@ impl Station {
         }
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the store is the one module that writes files storage-scout owns"
-    )]
     pub(crate) fn raise(&self) -> io::Result<()> {
-        let mut flag = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.flag)?;
         let repository = match std::env::current_dir() {
             Ok(directory) => crate::owners::repository(&directory),
             Err(_unknown) => None,
         };
+        self.raise_from(repository.as_deref())
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the store is the one module that writes files storage-scout owns"
+    )]
+    fn raise_from(&self, repository: Option<&Path>) -> io::Result<()> {
+        let mut flag = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.flag)?;
         match repository {
             Some(repository) => {
-                let mut line = repository.into_os_string().into_encoded_bytes();
+                let mut line = repository.as_os_str().as_encoded_bytes().to_vec();
                 line.push(b'\n');
                 flag.write_all(&line)
             },
             None => Ok(()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raise_for(&self, repository: Option<&Path>) -> io::Result<()> {
+        self.raise_from(repository)
     }
 
     #[expect(

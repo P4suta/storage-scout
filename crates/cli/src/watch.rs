@@ -237,6 +237,30 @@ fn watched(root: &Path, survey: Option<&busy::Survey>) -> Vec<PathBuf> {
     directories
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchDepth {
+    Recursive,
+    Named,
+}
+
+fn additional_watches(depth: WatchDepth, walked: &[PathBuf]) -> Vec<PathBuf> {
+    match depth {
+        WatchDepth::Recursive => Vec::new(),
+        WatchDepth::Named => {
+            let mut directories = walked.to_vec();
+            directories.extend(walked.iter().flat_map(|directory| refs(directory)));
+            directories
+        },
+    }
+}
+
+const fn complete(coverage: Coverage) -> bool {
+    match coverage {
+        Coverage::Complete => true,
+        Coverage::Partial => false,
+    }
+}
+
 fn surveyed(root: &Path) -> Option<busy::Survey> {
     match busy::survey(root) {
         Ok(survey) => Some(survey),
@@ -277,20 +301,23 @@ impl Session<'_> {
 
     fn follow(&mut self, directories: &[PathBuf]) -> Result<(), WatchError> {
         let borrowed = directories.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-        match self.watcher.watch(&borrowed).map_err(WatchError::Events)? {
-            Coverage::Complete => {},
-            Coverage::Partial => self.covered = false,
-        }
+        let coverage = self.watcher.watch(&borrowed).map_err(WatchError::Events)?;
+        self.covered &= complete(coverage);
         Ok(())
     }
 
     fn saw(&mut self, walked: &[PathBuf]) -> Result<(), WatchError> {
+        let depth = if self.watcher.recursive() {
+            WatchDepth::Recursive
+        } else {
+            WatchDepth::Named
+        };
+        self.saw_with(walked, depth)
+    }
+
+    fn saw_with(&mut self, walked: &[PathBuf], depth: WatchDepth) -> Result<(), WatchError> {
         self.walked.extend(walked.iter().cloned());
-        if self.watcher.recursive() {
-            return Ok(());
-        }
-        let mut directories = walked.to_vec();
-        directories.extend(walked.iter().flat_map(|directory| refs(directory)));
+        let directories = additional_watches(depth, walked);
         self.follow(&directories)
     }
 
@@ -935,6 +962,7 @@ mod tests {
         let scout = Scout::with(testkit::open_protection()).confined(vec![base]);
         let (mut session, _receiver) = open(&scout, &policy, &hooks).unwrap();
         session.start().unwrap();
+        assert!(session.dirty.is_empty());
         check(&mut session, &root, &records);
     }
 
@@ -986,6 +1014,70 @@ mod tests {
         old
     }
 
+    #[test]
+    fn watcher_helpers_distinguish_repositories_bookkeeping_and_writer_profiles() {
+        let temp = testkit::tempdir("watch-unit-helpers");
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let file = root.join("file");
+        write_sized(&file, 1);
+        assert!(!is_directory(&file));
+        assert!(!is_directory(&root.join("missing")));
+        assert!(is_directory(&root));
+        assert!(refs(&root).is_empty());
+
+        testkit::make_dir(&root.join(".git/refs/heads/nested"));
+        testkit::make_dir(&root.join(".git/worktrees/one"));
+        assert_eq!(
+            refs(&root).into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                root.join(".git"),
+                root.join(".git/refs"),
+                root.join(".git/refs/heads"),
+                root.join(".git/refs/heads/nested"),
+                root.join(".git/worktrees"),
+                root.join(".git/worktrees/one"),
+            ])
+        );
+        assert!(additional_watches(WatchDepth::Recursive, std::slice::from_ref(&root)).is_empty());
+        assert_eq!(
+            additional_watches(WatchDepth::Named, std::slice::from_ref(&root))
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                root.clone(),
+                root.join(".git"),
+                root.join(".git/refs"),
+                root.join(".git/refs/heads"),
+                root.join(".git/refs/heads/nested"),
+                root.join(".git/worktrees"),
+                root.join(".git/worktrees/one"),
+            ])
+        );
+        assert!(complete(Coverage::Complete));
+        assert!(!complete(Coverage::Partial));
+
+        assert!(bookkeeping(Path::new("owner.json")));
+        assert!(bookkeeping(Path::new("debug/.cargo-lock")));
+        assert!(!bookkeeping(Path::new("notes.txt")));
+        assert!(!bookkeeping(Path::new("")));
+
+        let debug = profile(&root, "app");
+        let target = debug.parent().unwrap();
+        let survey = surveyed(target).unwrap();
+        assert_eq!(
+            super::watched(target, Some(&survey)),
+            [
+                target.to_path_buf(),
+                target.parent().unwrap().to_path_buf(),
+                debug.clone(),
+                debug.join("deps"),
+                debug.join("incremental"),
+                debug.join("build"),
+                debug.join("examples"),
+            ]
+        );
+    }
+
     fn last_cause(state: &Path) -> Option<String> {
         let last = fs::read_dir(state)
             .unwrap()
@@ -1010,6 +1102,15 @@ mod tests {
             .iter()
             .filter_map(|record| record.reap.as_ref())
             .map(|summary| summary.outcomes.len())
+            .sum()
+    }
+
+    fn shared_so_far(records: &Records) -> u64 {
+        records
+            .borrow()
+            .iter()
+            .filter_map(|record| record.dedupe.as_ref())
+            .map(|run| run.totals.shared.files)
             .sum()
     }
 
@@ -1074,6 +1175,29 @@ mod tests {
                 testkit::assert_absent(&busy);
                 testkit::assert_present(&untouched);
                 assert!(!session.waiting.contains_key(&target));
+            },
+        );
+    }
+
+    #[test]
+    fn named_watchers_follow_walked_directories_and_recursive_watchers_do_not_add_them() {
+        watched(
+            "watch-unit-follow-walked",
+            |_| {},
+            |session, root, _records| {
+                let named = root.join("named");
+                let recursive = root.join("recursive");
+                testkit::make_dir(&named.join(".git/refs/heads"));
+                testkit::make_dir(&recursive);
+                session
+                    .saw_with(std::slice::from_ref(&named), WatchDepth::Named)
+                    .unwrap();
+                session
+                    .saw_with(std::slice::from_ref(&recursive), WatchDepth::Recursive)
+                    .unwrap();
+                assert!(session.covered);
+                assert!(session.walked.contains(&named));
+                assert!(session.walked.contains(&recursive));
             },
         );
     }
@@ -1162,6 +1286,82 @@ mod tests {
     }
 
     #[test]
+    fn an_unsure_directory_only_examines_new_children_and_new_evidence() {
+        watched(
+            "watch-unit-unsure",
+            |root| {
+                testkit::make_dir(&root.join("known"));
+            },
+            |session, root, _records| {
+                let known = root.join("known");
+                assert!(session.walked.contains(&known));
+                write_sized(&known.join("notes.txt"), 1);
+                assert!(
+                    session
+                        .targets(&BTreeSet::new(), &BTreeSet::from([known.clone()]))
+                        .is_empty()
+                );
+
+                let first = root.join("first");
+                let second = root.join("second");
+                let missing = root.join("missing");
+                testkit::make_dir(&first);
+                testkit::make_dir(&second);
+                assert_eq!(
+                    session.targets(
+                        &BTreeSet::new(),
+                        &BTreeSet::from([first.clone(), missing, second.clone()])
+                    ),
+                    BTreeMap::from([
+                        (first.clone(), Reach::Everything),
+                        (second.clone(), Reach::Everything)
+                    ])
+                );
+
+                let plain = root.join("plain.txt");
+                write_sized(&plain, 1);
+                assert!(
+                    session
+                        .targets(&BTreeSet::from([plain]), &BTreeSet::new())
+                        .is_empty()
+                );
+                let new = root.join("new");
+                let _debug = profile(root, "new");
+                assert_eq!(
+                    session.targets(&BTreeSet::new(), &BTreeSet::from([root.to_path_buf()])),
+                    BTreeMap::from([
+                        (first, Reach::Everything),
+                        (new.clone(), Reach::Everything),
+                        (second, Reach::Everything)
+                    ])
+                );
+                session.turn(vec![entry(root, Event::Unsure)]).unwrap();
+                assert!(session.world.contains_key(&new.join("target")));
+                assert!(session.walked.contains(&new));
+                assert!(
+                    session
+                        .targets(&BTreeSet::new(), &BTreeSet::from([root.to_path_buf()]))
+                        .is_empty()
+                );
+
+                write_sized(&known.join("Cargo.toml"), 1);
+                assert_eq!(
+                    session.targets(&BTreeSet::new(), &BTreeSet::from([known.clone()])),
+                    BTreeMap::from([(known, Reach::Children)])
+                );
+
+                let parent = root.join("parent");
+                let child = parent.join("child");
+                testkit::make_dir(&child);
+                assert_eq!(
+                    session.targets(&BTreeSet::from([parent.clone(), child]), &BTreeSet::new()),
+                    BTreeMap::from([(parent, Reach::Everything)])
+                );
+            },
+        );
+    }
+
+    #[test]
     fn an_owner_that_lets_go_is_reaped_and_a_vanished_candidate_is_forgotten() {
         watched(
             "watch-unit-owner",
@@ -1227,6 +1427,173 @@ mod tests {
                 testkit::remove_tree(&target);
                 session.turn(vec![entry(&target, Event::Vanished)]).unwrap();
                 assert!(!session.world.contains_key(&target));
+            },
+        );
+    }
+
+    #[test]
+    fn lost_and_direct_changes_refresh_only_writer_candidates() {
+        watched(
+            "watch-unit-change-scope",
+            |root| {
+                let _debug = profile(root, "app");
+                write_sized(&root.join("tool/tool.py"), 1);
+                write_sized(&root.join("tool/__pycache__/tool.cpython-312.pyc"), 64);
+            },
+            |session, root, _records| {
+                let target = root.join("app/target");
+                let cache = root.join("tool/__pycache__");
+                assert!(session.written(&target));
+                assert!(!session.written(&cache));
+
+                session
+                    .waiting
+                    .insert(cache.clone(), std::thread::spawn(|| {}));
+                session
+                    .turn(vec![written(&cache.join("tool.cpython-312.pyc"))])
+                    .unwrap();
+                assert!(session.dirty.is_empty());
+                assert!(session.world.get(&cache).unwrap().changed.is_empty());
+                session.waiting.remove(&cache).unwrap().join().unwrap();
+
+                session.lost_track(&cache);
+                assert!(session.dirty.is_empty());
+                assert!(!session.world.get(&cache).unwrap().resurvey);
+
+                session.lost_track(&target);
+                assert_eq!(session.dirty, BTreeSet::from([target.clone()]));
+                let lost_watched = session.world.get(&target).unwrap();
+                assert!(lost_watched.resurvey);
+                assert_eq!(
+                    lost_watched
+                        .changed
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                    PROFILE_PARTS
+                        .iter()
+                        .map(|part| target.join("debug").join(part))
+                        .collect::<BTreeSet<_>>()
+                );
+
+                let cases = [
+                    (target.clone(), Event::Appeared, true),
+                    (target.join("direct"), Event::Appeared, true),
+                    (target.clone(), Event::Written, false),
+                    (target.join("deep/file"), Event::Appeared, false),
+                    (target.join("deep/owner.json"), Event::Written, true),
+                ];
+                for (path, event, expected) in cases {
+                    session.dirty.clear();
+                    let pending = session.world.get_mut(&target).unwrap();
+                    pending.changed.clear();
+                    pending.resurvey = false;
+                    session.changed_within(target.clone(), path.clone(), event);
+                    let changed = session.world.get(&target).unwrap();
+                    assert_eq!(changed.resurvey, expected, "{}", path.display());
+                    assert_eq!(changed.changed.get(&path), Some(&event));
+                    assert_eq!(session.dirty, BTreeSet::from([target.clone()]));
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn processing_refreshes_a_survey_only_when_the_change_requires_it() {
+        watched(
+            "watch-unit-survey-refresh",
+            |root| {
+                let _debug = profile(root, "app");
+            },
+            |session, root, _records| {
+                let target = root.join("app/target");
+                assert_eq!(
+                    session.world[&target].survey.as_ref().unwrap().locks.len(),
+                    1
+                );
+                let release = target.join("release");
+                write_sized(&release.join(".cargo-lock"), 0);
+                testkit::make_dir(&release.join(".fingerprint"));
+                write_sized(&target.join("debug/deps/changed.rlib"), 64);
+                session
+                    .turn(vec![written(&target.join("debug/deps/changed.rlib"))])
+                    .unwrap();
+                assert_eq!(
+                    session.world[&target].survey.as_ref().unwrap().locks.len(),
+                    1
+                );
+
+                session
+                    .turn(vec![appeared(&target.join("release"))])
+                    .unwrap();
+                assert_eq!(
+                    session.world[&target].survey.as_ref().unwrap().locks.len(),
+                    2
+                );
+                assert!(!session.world[&target].resurvey);
+
+                let custom = target.join("custom");
+                write_sized(&custom.join(".cargo-lock"), 0);
+                testkit::make_dir(&custom.join(".fingerprint"));
+                session.world.get_mut(&target).unwrap().whole = true;
+                session.dirty.insert(target.clone());
+                session.process(&target).unwrap();
+                assert_eq!(
+                    session.world[&target].survey.as_ref().unwrap().locks.len(),
+                    3
+                );
+                assert!(!session.world[&target].whole);
+            },
+        );
+    }
+
+    #[test]
+    fn whole_processing_inventories_files_beyond_the_named_changes() {
+        watched(
+            "watch-unit-whole-stock",
+            |root| {
+                let _one = profile(root, "one");
+                let _two = profile(root, "two");
+            },
+            |session, root, records| {
+                let one = root.join("one/target");
+                let two = root.join("two/target");
+                let first = one.join("debug/deps/libsame.rlib");
+                let second = two.join("debug/deps/libsame.rlib");
+                let first_hidden = one.join("debug/deps/libhidden.rlib");
+                let second_hidden = two.join("debug/deps/libhidden.rlib");
+                testkit::write_patterned(&first, 256 * 1024, 7);
+                testkit::write_patterned(&second, 256 * 1024, 7);
+                testkit::write_patterned(&first_hidden, 256 * 1024, 8);
+                testkit::write_patterned(&second_hidden, 256 * 1024, 8);
+                session.world.get_mut(&one).unwrap().whole = true;
+                session.dirty.insert(one.clone());
+                session.process(&one).unwrap();
+                assert_eq!(shared_so_far(records), 0);
+
+                session.turn(vec![written(&second)]).unwrap();
+                assert_eq!(shared_so_far(records), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn a_partial_coverage_hook_resights_without_treating_kept_events_as_lost() {
+        watched(
+            "watch-unit-hook-resight",
+            |root| {
+                let _debug = profile(root, "app");
+            },
+            |session, root, records| {
+                let target = root.join("app/target");
+                let old = build(&target.join("debug"), "one");
+                session.covered = false;
+                session.hooks.station.raise_for(None).unwrap();
+                session.turn(Vec::new()).unwrap();
+                assert!(session.dirty.is_empty());
+                assert!(!session.world.get(&target).unwrap().resurvey);
+                assert_eq!(pruned_so_far(records), 0);
+                testkit::assert_present(old);
             },
         );
     }
@@ -1319,6 +1686,86 @@ mod tests {
                 assert_eq!(pruned_so_far(records), 2);
                 testkit::assert_absent(&unannounced);
                 testkit::assert_absent(&waste);
+            },
+        );
+    }
+
+    #[test]
+    fn a_hook_only_rechecks_its_repository_unless_its_origin_is_unknown() {
+        watched(
+            "watch-unit-hook-scope",
+            |root| {
+                for name in ["one", "two"] {
+                    testkit::make_dir(&root.join(name).join(".git"));
+                    let key = root.join(format!("key-{name}"));
+                    testkit::make_dir(&key);
+                    testkit::write_owner_marker(
+                        &root.join(name).join("cache"),
+                        MarkerRole::Cache,
+                        MarkerKeep::Released,
+                        Some(&key),
+                    );
+                }
+            },
+            |session, root, records| {
+                assert!(session.world.contains_key(&root.join("one/cache")));
+                assert!(session.world.contains_key(&root.join("two/cache")));
+                testkit::remove_tree(&root.join("key-one"));
+                testkit::remove_tree(&root.join("key-two"));
+
+                session
+                    .hooks
+                    .station
+                    .raise_for(Some(&root.join("one/.git")))
+                    .unwrap();
+                session.turn(Vec::new()).unwrap();
+                assert_eq!(reaped(records), 1);
+                testkit::assert_absent(root.join("one/cache"));
+                testkit::assert_present(root.join("two/cache"));
+
+                session.hooks.station.raise_for(None).unwrap();
+                session.turn(Vec::new()).unwrap();
+                assert_eq!(reaped(records), 2);
+                testkit::assert_absent(root.join("two/cache"));
+            },
+        );
+    }
+
+    #[test]
+    fn batched_ref_candidate_and_evidence_events_keep_their_own_scopes() {
+        watched(
+            "watch-unit-event-scope",
+            |root| {
+                let _debug = profile(root, "app");
+                testkit::make_dir(&root.join("repo/.git/refs"));
+            },
+            |session, root, records| {
+                let target = root.join("app/target");
+                let nested = target.join("debug/deps/gone.rlib");
+                write_sized(&nested, 64);
+                testkit::remove_file(&nested);
+                session.turn(vec![entry(&nested, Event::Vanished)]).unwrap();
+                assert!(session.world.contains_key(&target));
+
+                let old = build(&target.join("debug"), "ref-batch");
+                session
+                    .turn(vec![
+                        written(&root.join("repo/.git/refs/heads/main")),
+                        appeared(&target.join("debug/incremental/ref-batch")),
+                    ])
+                    .unwrap();
+                assert_eq!(pruned_so_far(records), 1);
+                testkit::assert_absent(old);
+
+                let late = profile(root, "late");
+                session
+                    .turn(vec![written(&root.join("late/Cargo.toml"))])
+                    .unwrap();
+                assert!(
+                    session
+                        .world
+                        .contains_key(&late.parent().unwrap().to_path_buf())
+                );
             },
         );
     }
