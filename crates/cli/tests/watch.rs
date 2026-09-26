@@ -224,6 +224,7 @@ fn a_cache_whose_key_is_gone_is_reaped_as_soon_as_a_hook_says_so() {
         ])
         .env("GIT_CEILING_DIRECTORIES", &watching.ceiling)
         .env("STORAGE_SCOUT_STATE_DIR", &watching.state)
+        .current_dir(&watching.root)
         .output()
         .unwrap();
     assert!(

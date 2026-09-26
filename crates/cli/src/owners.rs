@@ -116,6 +116,10 @@ pub(crate) fn repository(path: &Path) -> Option<PathBuf> {
                 .map(Path::to_path_buf),
             Dot::Absent | Dot::Unreadable => None,
         })
+        .map(|repository| match fs::canonicalize(&repository) {
+            Ok(canonical) => canonical,
+            Err(_unresolvable) => repository,
+        })
 }
 
 impl Owners {
@@ -285,5 +289,21 @@ mod tests {
             gitdir(&file),
             Some(temp.path().join("../repository/.git/worktrees/linked"))
         );
+    }
+
+    #[test]
+    fn a_repository_has_one_canonical_name() {
+        let temp = testkit::tempdir("owners-repository-name");
+        let primary = temp.path().join("repository");
+        let common = primary.join(".git");
+        testkit::make_dir(&common.join("worktrees/linked"));
+        let linked = temp.path().join("linked");
+        testkit::write_bytes(
+            &linked.join(".git"),
+            b"gitdir: ../repository/.git/worktrees/linked\n",
+        );
+        let expected = fs::canonicalize(&common).unwrap();
+        assert_eq!(repository(&primary.join("target")), Some(expected.clone()));
+        assert_eq!(repository(&linked.join("target")), Some(expected));
     }
 }

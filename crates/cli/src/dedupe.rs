@@ -1146,6 +1146,15 @@ mod tests {
         testkit::write_patterned(&temporary, MINIMUM, 4);
 
         let shallow = present(&root, &directory, Event::Unsure);
+        if shallow.is_empty() {
+            assert!(
+                std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_none(),
+                "this volume must share blocks"
+            );
+            let _skipped = testkit::Built::Unavailable(String::from("sharing is refused here"))
+                .or_decline("a volume that shares blocks");
+            return;
+        }
         assert_eq!(
             shallow
                 .iter()

@@ -1679,7 +1679,7 @@ mod tests {
                 assert_eq!(reaped(records), 0);
                 let unannounced = build(&root.join("app/target/debug"), "one");
                 let fresh = profile(root, "fresh");
-                session.hooks.station.raise().unwrap();
+                session.hooks.station.raise_for(None).unwrap();
                 session.turn(vec![]).unwrap();
                 assert_eq!(reaped(records), 1);
                 assert_eq!(records.borrow().last().unwrap().cause, Cause::Hook);
