@@ -79,11 +79,18 @@ enum Dot {
     Unreadable,
 }
 
+fn dot_failure(kind: io::ErrorKind) -> Dot {
+    if kind == io::ErrorKind::NotFound {
+        Dot::Absent
+    } else {
+        Dot::Unreadable
+    }
+}
+
 fn dot_git(directory: &Path) -> Dot {
     let path = directory.join(".git");
     match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Dot::Absent,
-        Err(_unreadable) => Dot::Unreadable,
+        Err(error) => dot_failure(error.kind()),
         Ok(metadata) if metadata.file_type().is_dir() => Dot::Directory,
         Ok(metadata) if metadata.file_type().is_file() => Dot::File(path),
         Ok(_other) => Dot::Unreadable,
@@ -296,6 +303,15 @@ mod tests {
             gitdir(&file),
             Some(temp.path().join("../repository/.git/worktrees/linked"))
         );
+    }
+
+    #[test]
+    fn only_a_missing_dot_git_is_absent() {
+        assert!(matches!(dot_failure(io::ErrorKind::NotFound), Dot::Absent));
+        assert!(matches!(
+            dot_failure(io::ErrorKind::PermissionDenied),
+            Dot::Unreadable
+        ));
     }
 
     #[test]

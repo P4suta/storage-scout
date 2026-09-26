@@ -414,7 +414,7 @@ path = "crates/cli/src/watch.rs"
 item = "Session::process"
 rule = "negate-condition"
 original = "fresh_survey"
-line = 641
+line = 642
 reason = "re-registering the same directories changes only watcher syscall cost, while missing a new directory shows only in later filesystem events left out of measurement"
 outcome = "survived"
 
@@ -423,7 +423,7 @@ path = "crates/cli/src/watch.rs"
 item = "Session::process"
 rule = "condition-to-true"
 original = "fresh_survey"
-line = 641
+line = 642
 reason = "re-registering the same directories changes only watcher syscall cost, while missing a new directory shows only in later filesystem events left out of measurement"
 outcome = "survived"
 
@@ -432,7 +432,7 @@ path = "crates/cli/src/watch.rs"
 item = "Session::process"
 rule = "condition-to-false"
 original = "fresh_survey"
-line = 641
+line = 642
 reason = "re-registering the same directories changes only watcher syscall cost, while missing a new directory shows only in later filesystem events left out of measurement"
 outcome = "survived"
 

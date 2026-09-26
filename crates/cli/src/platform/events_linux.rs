@@ -82,11 +82,7 @@ fn dispatch(bytes: &[u8], watches: &Watches, deliver: &Deliver) {
         drop(known);
         if let Some(directory) = directory {
             let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
-            let path = if name.is_empty() {
-                directory
-            } else {
-                directory.join(OsStr::from_bytes(name))
-            };
+            let path = directory.join(OsStr::from_bytes(name));
             deliver(Change::Entry {
                 path,
                 event: event(mask),
