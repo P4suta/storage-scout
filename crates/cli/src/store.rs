@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+const GLOBAL_REQUEST: &[u8] = b"\0";
+
 #[expect(
     clippy::disallowed_methods,
     reason = "the store is the one module that writes files storage-scout owns"
@@ -52,6 +54,7 @@ fn create(directory: &Path) -> io::Result<()> {
 #[derive(Debug, Clone)]
 pub(crate) struct Station {
     lock: PathBuf,
+    requests: PathBuf,
     signal: PathBuf,
     flag: PathBuf,
     last: PathBuf,
@@ -73,6 +76,7 @@ impl Station {
         let signal = state.join(format!("auto-{key}.signal"));
         Self {
             lock: state.join(format!("auto-{key}.lock")),
+            requests: state.join(format!("auto-{key}.requests.lock")),
             flag: signal.join("pending"),
             signal,
             last: state.join(format!("auto-{key}.last.json")),
@@ -90,11 +94,7 @@ impl Station {
     }
 
     pub(crate) fn raise(&self) -> io::Result<()> {
-        let repository = match std::env::current_dir() {
-            Ok(directory) => crate::owners::Owners::detect().repository(&directory),
-            Err(_unknown) => None,
-        };
-        self.raise_from(repository.as_deref())
+        self.raise_for(None)
     }
 
     #[expect(
@@ -102,25 +102,27 @@ impl Station {
         reason = "the store is the one module that writes files storage-scout owns"
     )]
     fn raise_from(&self, repository: Option<&Path>) -> io::Result<()> {
-        create(&self.signal)?;
-        let mut flag = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.flag)?;
-        let written = match repository {
-            Some(repository) => {
-                let mut line = repository.as_os_str().as_encoded_bytes().to_vec();
+        {
+            let _held = self.serialize_requests()?;
+            create(&self.signal)?;
+            let mut flag = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.flag)?;
+            let mut line = match repository {
+                Some(repository) => repository.as_os_str().as_encoded_bytes().to_vec(),
+                None => GLOBAL_REQUEST.to_vec(),
+            };
+            let written = {
                 line.push(b'\n');
                 flag.write_all(&line)
-            },
-            None => Ok(()),
-        };
-        drop(flag);
-        written?;
+            };
+            drop(flag);
+            written?;
+        }
         crate::platform::wake(&self.notification)
     }
 
-    #[cfg(test)]
     pub(crate) fn raise_for(&self, repository: Option<&Path>) -> io::Result<()> {
         self.raise_from(repository)
     }
@@ -130,6 +132,7 @@ impl Station {
         reason = "the pending flag is the store's own file"
     )]
     pub(crate) fn take(&self) -> io::Result<Option<BTreeSet<PathBuf>>> {
+        let _held = self.serialize_requests()?;
         let taken = self.flag.with_extension("taken");
         match fs::rename(&self.flag, &taken) {
             Ok(()) => {},
@@ -138,14 +141,21 @@ impl Station {
         }
         let bytes = fs::read(&taken)?;
         fs::remove_file(&taken)?;
-        let named = bytes
+        let named = if bytes
             .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| match std::str::from_utf8(line) {
-                Ok(text) => Some(PathBuf::from(text)),
-                Err(_foreign) => None,
-            })
-            .collect::<Option<BTreeSet<_>>>();
+            .any(|line| line == GLOBAL_REQUEST)
+        {
+            Some(BTreeSet::new())
+        } else {
+            bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| match std::str::from_utf8(line) {
+                    Ok(text) => Some(PathBuf::from(text)),
+                    Err(_foreign) => None,
+                })
+                .collect::<Option<BTreeSet<_>>>()
+        };
         Ok(Some(named.unwrap_or_default()))
     }
 
@@ -154,6 +164,7 @@ impl Station {
         reason = "the pending flag is the store's own file"
     )]
     pub(crate) fn lower(&self) -> io::Result<bool> {
+        let _held = self.serialize_requests()?;
         match fs::remove_file(&self.flag) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -162,6 +173,7 @@ impl Station {
     }
 
     pub(crate) fn raised(&self) -> io::Result<bool> {
+        let _held = self.serialize_requests()?;
         match fs::symlink_metadata(&self.flag) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -184,6 +196,20 @@ impl Station {
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(error),
         }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the run station is the one module that creates its request lock"
+    )]
+    fn serialize_requests(&self) -> io::Result<Held> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.requests)?;
+        file.lock()?;
+        Ok(Held { _lock: file })
     }
 
     #[expect(

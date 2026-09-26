@@ -252,10 +252,14 @@ impl Source {
     }
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the durable flag remains authoritative if the supplemental event is unavailable"
-)]
+fn signaled(result: i32) -> io::Result<()> {
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn wake(notification: &str) -> io::Result<()> {
     let name = wide(std::ffi::OsStr::new(notification));
     // SAFETY: the name is NUL-terminated and the requested access can only signal the event.
@@ -266,8 +270,7 @@ pub(super) fn wake(notification: &str) -> io::Result<()> {
     // SAFETY: `OpenEventW` returned this handle and nothing else owns it.
     let event = unsafe { OwnedHandle::from_raw_handle(handle) };
     // SAFETY: the handle names an event opened with permission to signal it.
-    let _signaled = unsafe { SetEvent(event.as_raw_handle()) };
-    Ok(())
+    signaled(unsafe { SetEvent(event.as_raw_handle()) })
 }
 
 pub(super) fn background() {
@@ -320,5 +323,11 @@ mod tests {
         .unwrap();
         wake(&name).unwrap();
         assert_eq!(receiver.recv().unwrap(), Change::Wake);
+    }
+
+    #[test]
+    fn only_a_signaled_event_is_successful() {
+        let _failed = signaled(0).unwrap_err();
+        signaled(1).unwrap();
     }
 }

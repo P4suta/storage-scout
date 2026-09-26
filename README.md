@@ -112,6 +112,7 @@ storage-scout auto --execute --detach --event reference-transaction -- "$@"   # 
 Irrelevant events exit at once.
 When a watcher is running, a hook records its repository and raises the flag, so only that repository's candidates are re-checked; a hook whose repository is unknown safely re-checks every candidate.
 Without a watcher the hook starts one full `auto` run, and concurrent runs coalesce into one.
+A manual `auto --execute` request always re-checks the whole policy, including when it hands work to a running watcher.
 
 ## Safety
 

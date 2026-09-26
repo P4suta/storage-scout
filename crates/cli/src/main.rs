@@ -509,17 +509,21 @@ fn watch(scout: &Scout, args: WatchArgs) -> Result<ExitCode> {
 
 fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
     let config = policy_path(args.config)?;
-    if let Some(event) = args.event {
-        let event = event.event();
-        let mut input = Vec::new();
-        if event.reads_updates() {
-            io::Read::read_to_end(&mut io::stdin().lock(), &mut input)?;
-        }
-        let repository = std::env::current_dir()?;
-        if !storage_scout::hook::relevant(event, &args.hook, &input, &repository) {
-            return Ok(ExitCode::SUCCESS);
-        }
-    }
+    let hook_directory = match args.event {
+        Some(event) => {
+            let event = event.event();
+            let mut input = Vec::new();
+            if event.reads_updates() {
+                io::Read::read_to_end(&mut io::stdin().lock(), &mut input)?;
+            }
+            let directory = std::env::current_dir()?;
+            if !storage_scout::hook::relevant(event, &args.hook, &input, &directory) {
+                return Ok(ExitCode::SUCCESS);
+            }
+            Some(directory)
+        },
+        None => None,
+    };
     let config = fs::canonicalize(&config)
         .with_context(|| format!("cannot resolve policy {}", config.display()))?;
     if args.detach {
@@ -529,8 +533,11 @@ fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
             config.clone().into_os_string(),
             OsString::from("--execute"),
         ];
-        let detached = storage_scout::hook::detach(&config, &forwarded)
-            .context("cannot start the background run")?;
+        let detached = match hook_directory.as_deref() {
+            Some(directory) => storage_scout::hook::detach_hook(&config, &forwarded, directory),
+            None => storage_scout::hook::detach(&config, &forwarded),
+        }
+        .context("cannot start the background run")?;
         if args.output.format() == Format::Json {
             render_json(&detached, &mut io::stdout().lock())?;
         }
@@ -556,26 +563,30 @@ fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
             failed = run.failed();
         },
         Mode::Execute => {
-            let coalescing =
-                storage_scout::hook::coalesced(&config, || -> Result<storage_scout::AutoRun> {
-                    let run = scout
-                        .auto(&policy, Mode::Execute)
-                        .map_err(|rejection| anyhow!("{rejection}"))?;
-                    show(&run)?;
-                    if let Some(log_file) = &policy.log_file {
-                        storage_scout::append_log(log_file, &run).with_context(|| {
-                            format!("cannot append to log {}", log_file.display())
-                        })?;
-                    }
-                    failed |= run.failed();
-                    Ok(run)
-                })
-                .map_err(|error| match error {
-                    storage_scout::hook::CoalesceError::Station(error) => {
-                        anyhow!(error).context("cannot coordinate with other runs")
-                    },
-                    storage_scout::hook::CoalesceError::Run(error) => error,
-                })?;
+            let mut execute = || -> Result<storage_scout::AutoRun> {
+                let run = scout
+                    .auto(&policy, Mode::Execute)
+                    .map_err(|rejection| anyhow!("{rejection}"))?;
+                show(&run)?;
+                if let Some(log_file) = &policy.log_file {
+                    storage_scout::append_log(log_file, &run)
+                        .with_context(|| format!("cannot append to log {}", log_file.display()))?;
+                }
+                failed |= run.failed();
+                Ok(run)
+            };
+            let coalescing = match hook_directory.as_deref() {
+                Some(directory) => {
+                    storage_scout::hook::coalesced_hook(&config, directory, &mut execute)
+                },
+                None => storage_scout::hook::coalesced(&config, &mut execute),
+            }
+            .map_err(|error| match error {
+                storage_scout::hook::CoalesceError::Station(error) => {
+                    anyhow!(error).context("cannot coordinate with other runs")
+                },
+                storage_scout::hook::CoalesceError::Run(error) => error,
+            })?;
             match coalescing {
                 storage_scout::hook::Coalescing::Ran { .. } => {},
                 storage_scout::hook::Coalescing::Handed => writeln!(
