@@ -1,7 +1,8 @@
 # Handoff: the resident watcher's CPU cost
 
 Written 2026-09-26 when work stopped on branch `perf/work-follows-change`.
-Everything still to do is in this file; nothing lives in agent memory.
+Updated 2026-09-27 after PR #11 merged and macOS restart state was implemented on `perf/persistent-watch-state`.
+The completion update below supersedes the original remaining-work list, while the investigation is retained as history.
 
 ## Why this branch exists
 
@@ -82,9 +83,9 @@ Status of checks for the final code:
 - Linux: the suite passed on an earlier revision of this branch, not yet on the final code.
 - Windows: an earlier revision hung in the watch integration test `a_cache_whose_key_is_gone_is_reaped_as_soon_as_a_hook_says_so`, and the final code has not been run there.
 
-## Production state when work stopped
+## Last known production state
 
-Everything is stopped and will not restart by itself.
+Everything was stopped when this work began and was not reverified or changed during the repository work.
 
 | Machine | Watcher | Policy | Installed binary |
 |---|---|---|---|
@@ -102,39 +103,34 @@ To resume, once a validated build is installed:
 - Install: `cargo install --locked --path crates/cli` on each machine.
   On Windows, stop the task and `storage-scout.exe` first, because the running exe is locked.
 
-## Remaining work, in order
+## Completion update
 
-1. Verify the final code on all three machines.
-   - Run `domyjob run linux,win -- cargo test --workspace --locked`.
-   - Investigate the Windows hang in `a_cache_whose_key_is_gone_is_reaped_as_soon_as_a_hook_says_so` (`crates/cli/tests/watch.rs`) if it recurs.
-   - Hooks now carry a repository.
-     - In a domyjob workspace there is no `.git`, so the flag is empty and the watcher re-checks every candidate.
-     - When the flag carries a repository, candidates outside it are not re-checked.
-2. Add unit tests for the directory-level (`Unsure`) path, which is what macOS delivers: `Session::targets` diffing against `walked`, evidence re-checks, and `Pool::note` with an `Unsure` directory whose subdirectory vanished.
-   The current watch unit tests mostly drive entry-level events.
-3. Measure steady-state CPU again on all three machines, and profile the remaining bursts.
-   - On the Mac, build with `CARGO_PROFILE_RELEASE_STRIP=none` and resolve `sample` addresses with `atos`.
-   - On Linux, `perf` and ptrace are blocked (`perf_event_paranoid=4`, `ptrace_scope=1`), so use the debug trace.
-   - Likely remaining costs:
-     - hashing new duplicate candidates;
-     - shallow re-listing of large `deps` directories on every change in them;
-     - examining new directories inside rust-mutants scratch targets (`…/rust-mutants-target-*/pristine`), which are not recognised as Cargo targets and so are walked as ordinary directories.
-4. On Windows, check Defender's CPU with the new build, which runs at thread background mode and no longer opens every file during sightings.
-5. Decide on the FSEvents coalescing latency.
-   - `COALESCED = 1.0` seconds is an OS batching parameter.
-     It decides nothing, but AGENTS.md says nothing waits on a clock.
-   - Either document why it is allowed, or find another way to stop `UserDropped` under load (the background priority split alone did not stop it).
-6. Startup still pays a full inventory of every target (4 to 6 CPU-min on the Mac) on every watcher start.
-   - macOS: FSEvents can replay events since a stored event id.
-   - Windows: the USN journal can do the same.
-   - Persisting the pool with the last event id would make a restart proportional to what changed while it was down.
-     Linux has no such history.
-7. Mutation-testing configuration (`.rust-mutants.toml`) is stale for the rewritten code.
-   - Line skips: `watch.rs` 344 (refresh no longer exists), `dedupe.rs` 369, `unix.rs` 232/260–264/268/446/561/568, and `events_linux.rs` 130.
-   - Claims about `Session::lets_go`, `Session::refresh`, `Session::written`, `Session::appear`, `Session::turn`, `Session::follow`, `remember_hosts` and `follow_hosts` refer to functions that were renamed or removed.
-   - Run `rust-mutants run --changed-from origin/main` on the Mac (with `STORAGE_SCOUT_REQUIRE_SHARING=1`) and on Linux (from the pinned `NJUTEST_REV` build), then re-anchor.
-8. Update README and AGENTS.md: entry-level events, directory-level FSEvents with coalescing, background priority, repository-scoped ownership refresh, and hooks carrying their repository.
-9. Commit in reviewable pieces if possible, open a PR, let CI (including btrfs mutation testing) pass, merge, reinstall on all three machines, and resume as above.
+PR #11 merged the event-scoped watcher as `2fff2e7`.
+Its CI passed the macOS, Linux, Windows, mutation, and CodeQL jobs, including the Windows watch test that had previously hung.
+It added the directory-level `Unsure` tests, refreshed mutation claims, documented the one-second FSEvents transport batching, and updated the watcher documentation.
+
+The macOS restart work on `perf/persistent-watch-state` adds a durable redb inventory paired atomically with the last processed FSEvents ID.
+A warm restart restores only candidates whose current root identity still matches, replays historical events before normal processing, and inventories only new or replaced candidates.
+`MustScanSubDirs`, dropped events, wrapped IDs, and changed roots discard the cache and establish a fresh pre-scan event boundary, while malformed or damaged state is rebuilt automatically.
+Restored paths and file facts are decoded strictly, and every later sharing operation still re-identifies and compares the files at the moment of replacement.
+
+The final local checks on the Mac passed:
+
+- `mise run check`: 301 of 301 tests, formatting, Clippy, structural gates, bare-metal core, and documentation tests.
+- `mise run cross`: Windows, macOS arm64, and Linux x86_64/arm64 Clippy checks.
+- `cargo deny --offline check`: advisories, bans, licenses, and sources.
+- CI-pinned `rust-mutants`: 298 changed-file mutants, 284 killed, 14 reasoned expectations, zero unexplained survivors, zero waits, and zero unreached mutants.
+
+## Remaining external work
+
+The required `domyjob` and `multi-machine` skills were unavailable in the working environment, so no direct SSH substitute was used and production remained untouched.
+Once those skills are available:
+
+1. Reverify that all three production watchers and policies are still stopped as recorded above.
+2. After the persistence branch is merged, install the merged build on all three machines, restore each policy, and resume each watcher together.
+3. Measure steady-state CPU on all three machines and Defender CPU on Windows with the merged build.
+4. Profile any remaining bursts: new-duplicate hashing, shallow listing of large `deps` directories, and ordinary walks through rust-mutants scratch targets are the likely sources.
+5. If Windows restart cost remains material, implement USN-journal-backed inventory persistence as a separately tested Windows change; Linux has no equivalent history.
 
 ## Related, outside this repository
 
