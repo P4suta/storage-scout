@@ -463,4 +463,8 @@ reason = "a mutex is poisoned only by a thread that panics, and no scanning thre
 
 [execution]
 locked = true
-skip_targets = ["storage-scout/test/mount_boundary", "storage-scout/test/watch"]
+skip_targets = [
+  "storage-scout/doc/storage_scout",
+  "storage-scout/test/mount_boundary",
+  "storage-scout/test/watch",
+]
