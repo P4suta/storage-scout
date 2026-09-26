@@ -19,6 +19,7 @@ impl Source {
     pub(super) fn start(
         _paths: &[PathBuf],
         _notification: &str,
+        _checkpoint: Option<u64>,
         _deliver: Deliver,
     ) -> io::Result<Self> {
         Err(io::Error::from(io::ErrorKind::Unsupported))

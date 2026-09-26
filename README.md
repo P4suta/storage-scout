@@ -99,6 +99,8 @@ Filesystem events come from FSEvents on macOS, `ReadDirectoryChangesW` on Window
 Windows and Linux name the entry that appeared, vanished, or was written.
 FSEvents names the changed directory, so macOS re-lists that directory shallowly; the operating system coalesces notifications for one second with `NoDefer` to keep the event stream responsive under build bursts.
 That second is transport batching only: it neither makes a cleanup decision nor causes storage-scout to poll or wait before deciding.
+On macOS, `watch` stores its sharing inventory and the last processed FSEvents ID in one durable transaction.
+After a restart it replays intervening events and inventories only new or replaced candidates; missing history or malformed state is discarded and rebuilt automatically.
 macOS and Windows observe every directory below their roots, while Linux registers every directory it walks and each repository's ref tree individually.
 A ref update under `.git/refs`, `packed-refs`, `HEAD`, or `worktrees` invalidates only that repository's cached ownership answers.
 Linux also uses git hooks for ownership changes known only to git:

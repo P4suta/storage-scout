@@ -38,6 +38,8 @@ pub(crate) enum Change {
         event: Event,
     },
     Lost,
+    #[cfg(target_os = "macos")]
+    Checkpoint(u64),
     #[cfg_attr(
         not(windows),
         expect(dead_code, reason = "only Windows uses a named wake event")
@@ -90,9 +92,20 @@ impl Watcher {
     pub(crate) fn start(
         paths: &[PathBuf],
         notification: &str,
+        checkpoint: Option<u64>,
         deliver: impl Fn(Change) + Send + Sync + 'static,
     ) -> io::Result<Self> {
-        events::Source::start(paths, notification, Box::new(deliver)).map(Self)
+        events::Source::start(paths, notification, checkpoint, Box::new(deliver)).map(Self)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) const fn checkpoint(&self) -> Option<u64> {
+        self.0.checkpoint()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn current_checkpoint(&self) -> u64 {
+        self.0.current_checkpoint()
     }
 
     #[cfg_attr(

@@ -214,6 +214,7 @@ impl Source {
     pub(super) fn start(
         paths: &[PathBuf],
         notification: &str,
+        _checkpoint: Option<u64>,
         deliver: Deliver,
     ) -> io::Result<Self> {
         let deliver = Arc::new(deliver);
@@ -294,6 +295,7 @@ mod tests {
         let _source = Source::start(
             std::slice::from_ref(&root),
             &format!("Local\\storage-scout-test-{}-files", std::process::id()),
+            None,
             Box::new(move |change| {
                 let _sent = sender.send(change);
             }),
@@ -316,6 +318,7 @@ mod tests {
         let _source = Source::start(
             &[],
             &name,
+            None,
             Box::new(move |change| {
                 let _sent = sender.send(change);
             }),

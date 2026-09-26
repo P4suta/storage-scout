@@ -373,8 +373,16 @@ outcome = "survived"
 path = "crates/cli/src/platform/events_macos.rs"
 item = "Source::start"
 rule = "condition-to-false"
-original = "unsafe { FSEventStreamStart(stream) } == 0"
+original = "started == 0"
 reason = "FSEvents refusing to start a valid stream is an operating-system failure no test can stage"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/cli/src/platform/events_macos.rs"
+item = "Source::start"
+rule = "condition-to-false"
+original = "ready.recv().is_err()"
+reason = "the history sender stays owned by the live stream, so it cannot disconnect before history completion"
 outcome = "survived"
 
 [[mutation.expect]]
@@ -414,7 +422,7 @@ path = "crates/cli/src/watch.rs"
 item = "Session::process"
 rule = "negate-condition"
 original = "fresh_survey"
-line = 642
+line = 756
 reason = "re-registering the same directories changes only watcher syscall cost, while missing a new directory shows only in later filesystem events left out of measurement"
 outcome = "survived"
 
@@ -423,7 +431,7 @@ path = "crates/cli/src/watch.rs"
 item = "Session::process"
 rule = "condition-to-true"
 original = "fresh_survey"
-line = 642
+line = 756
 reason = "re-registering the same directories changes only watcher syscall cost, while missing a new directory shows only in later filesystem events left out of measurement"
 outcome = "survived"
 
@@ -432,7 +440,7 @@ path = "crates/cli/src/watch.rs"
 item = "Session::process"
 rule = "condition-to-false"
 original = "fresh_survey"
-line = 642
+line = 756
 reason = "re-registering the same directories changes only watcher syscall cost, while missing a new directory shows only in later filesystem events left out of measurement"
 outcome = "survived"
 

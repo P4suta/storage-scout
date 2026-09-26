@@ -123,6 +123,7 @@ impl Source {
     pub(super) fn start(
         paths: &[PathBuf],
         _notification: &str,
+        _checkpoint: Option<u64>,
         deliver: Deliver,
     ) -> io::Result<Self> {
         // SAFETY: `inotify_init1` takes only flags.
@@ -296,7 +297,7 @@ mod tests {
         let there = temp.path().join("there");
         testkit::write_sized(&there.join("file"), 1);
         let missing = temp.path().join("missing");
-        let source = Source::start(&[], "", Box::new(|_| {})).unwrap();
+        let source = Source::start(&[], "", None, Box::new(|_| {})).unwrap();
         source
             .watch(&[there.as_path(), missing.as_path(), temp.path()])
             .unwrap();

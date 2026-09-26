@@ -4,6 +4,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use super::{Change, Coverage, Event, WatchDepth};
 
@@ -65,6 +66,7 @@ unsafe extern "C" {
     fn FSEventStreamStop(stream: *mut c_void);
     fn FSEventStreamInvalidate(stream: *mut c_void);
     fn FSEventStreamRelease(stream: *mut c_void);
+    fn FSEventsGetCurrentEventId() -> u64;
 }
 
 unsafe extern "C" {
@@ -78,12 +80,23 @@ unsafe extern "C" {
 }
 
 const UTF8: u32 = 0x0800_0100;
-const SINCE_NOW: u64 = u64::MAX;
 const NO_DEFER: u32 = 0x02;
 const WATCH_ROOT: u32 = 0x04;
 const IGNORE_SELF: u32 = 0x08;
+const FULL_HISTORY: u32 = 0x80;
 const COALESCED: f64 = 1.0;
-const LOST: u32 = 0x02 | 0x04 | 0x20;
+const MUST_SCAN: u32 = 0x01;
+const USER_DROPPED: u32 = 0x02;
+const KERNEL_DROPPED: u32 = 0x04;
+const IDS_WRAPPED: u32 = 0x08;
+const HISTORY_DONE: u32 = 0x10;
+const ROOT_CHANGED: u32 = 0x20;
+const LOST: u32 = MUST_SCAN | USER_DROPPED | KERNEL_DROPPED | IDS_WRAPPED | ROOT_CHANGED;
+
+struct Sink {
+    deliver: Deliver,
+    history: mpsc::SyncSender<()>,
+}
 
 fn change(bytes: &[u8], flag: u32) -> Change {
     if flag & LOST != 0 {
@@ -104,19 +117,39 @@ extern "C" fn delivered(
     count: usize,
     paths: *mut c_void,
     flags: *const u32,
-    _ids: *const u64,
+    ids: *const u64,
 ) {
-    // SAFETY: `info` is the `Deliver` registered in `start`, alive until the stream is released.
-    let deliver = unsafe { &*info.cast_const().cast::<Deliver>() };
+    // SAFETY: `info` is the `Sink` registered in `start`, alive until the stream is released.
+    let sink = unsafe { &*info.cast_const().cast::<Sink>() };
     // SAFETY: without the CF-types flag FSEvents passes `count` C strings.
     let paths =
         unsafe { std::slice::from_raw_parts(paths.cast_const().cast::<*const c_char>(), count) };
     // SAFETY: FSEvents passes one flag word per path.
     let flags = unsafe { std::slice::from_raw_parts(flags, count) };
-    for (path, flag) in paths.iter().zip(flags) {
-        // SAFETY: each path is a NUL-terminated string owned by FSEvents for this call.
-        let bytes = unsafe { CStr::from_ptr(*path) }.to_bytes();
-        deliver(change(bytes, *flag));
+    // SAFETY: FSEvents passes one event ID per path.
+    let ids = unsafe { std::slice::from_raw_parts(ids, count) };
+    let mut latest: Option<u64> = None;
+    let mut history_done = false;
+    for ((path, flag), id) in paths.iter().zip(flags).zip(ids) {
+        if flag & HISTORY_DONE != 0 {
+            history_done = true;
+        } else {
+            // SAFETY: each path is a NUL-terminated string owned by FSEvents for this call.
+            let bytes = unsafe { CStr::from_ptr(*path) }.to_bytes();
+            (sink.deliver)(change(bytes, *flag));
+            if *id != 0 {
+                latest = Some(match latest {
+                    Some(known) => known.max(*id),
+                    None => *id,
+                });
+            }
+        }
+    }
+    if let Some(checkpoint) = latest {
+        (sink.deliver)(Change::Checkpoint(checkpoint));
+    }
+    if history_done {
+        let _sent = sink.history.try_send(());
     }
 }
 
@@ -151,7 +184,8 @@ fn strings(paths: &[PathBuf]) -> io::Result<Strings> {
 pub(super) struct Source {
     stream: *mut c_void,
     queue: *mut c_void,
-    deliver: *mut Deliver,
+    sink: *mut Sink,
+    checkpoint: u64,
 }
 
 impl Drop for Source {
@@ -173,7 +207,7 @@ impl Drop for Source {
             dispatch_release(self.queue);
         }
         // SAFETY: the stream no longer calls back, so the boxed sink can be reclaimed.
-        drop(unsafe { Box::from_raw(self.deliver) });
+        drop(unsafe { Box::from_raw(self.sink) });
     }
 }
 
@@ -181,6 +215,7 @@ impl Source {
     pub(super) fn start(
         paths: &[PathBuf],
         _notification: &str,
+        checkpoint: Option<u64>,
         deliver: Deliver,
     ) -> io::Result<Self> {
         let strings = strings(paths)?;
@@ -198,10 +233,16 @@ impl Source {
         if array.is_null() {
             return Err(io::Error::from(io::ErrorKind::OutOfMemory));
         }
-        let deliver = Box::into_raw(Box::new(deliver));
+        let checkpoint = match checkpoint {
+            Some(checkpoint) => checkpoint,
+            // SAFETY: this function takes no arguments and returns the system-wide event ID.
+            None => unsafe { FSEventsGetCurrentEventId() },
+        };
+        let (history, ready) = mpsc::sync_channel(1);
+        let sink = Box::into_raw(Box::new(Sink { deliver, history }));
         let context = Context {
             version: 0,
-            info: deliver.cast::<c_void>(),
+            info: sink.cast::<c_void>(),
             retain: std::ptr::null(),
             release: std::ptr::null(),
             copy_description: std::ptr::null(),
@@ -213,9 +254,9 @@ impl Source {
                 delivered,
                 &raw const context,
                 array,
-                SINCE_NOW,
+                checkpoint,
                 COALESCED,
-                NO_DEFER | WATCH_ROOT | IGNORE_SELF,
+                NO_DEFER | WATCH_ROOT | IGNORE_SELF | FULL_HISTORY,
             )
         };
         // SAFETY: the array was created above and the stream holds its own reference.
@@ -223,7 +264,7 @@ impl Source {
         drop(strings);
         if stream.is_null() {
             // SAFETY: no stream took ownership of the boxed sink.
-            drop(unsafe { Box::from_raw(deliver) });
+            drop(unsafe { Box::from_raw(sink) });
             return Err(io::Error::other("FSEvents refused the stream"));
         }
         // SAFETY: a null attribute is the serial queue attribute the QoS class is added to.
@@ -239,7 +280,8 @@ impl Source {
         // SAFETY: the stream is live and the queue outlives it.
         unsafe { FSEventStreamSetDispatchQueue(stream, queue) };
         // SAFETY: the stream is scheduled on a queue, so it may start.
-        if unsafe { FSEventStreamStart(stream) } == 0 {
+        let started = unsafe { FSEventStreamStart(stream) };
+        if started == 0 {
             // SAFETY: a stream that never started may be invalidated.
             unsafe { FSEventStreamInvalidate(stream) };
             // SAFETY: the stream is released exactly once.
@@ -247,14 +289,45 @@ impl Source {
             // SAFETY: the queue came from `dispatch_queue_create` and is released once.
             unsafe { dispatch_release(queue) };
             // SAFETY: the released stream no longer holds the boxed sink.
-            drop(unsafe { Box::from_raw(deliver) });
+            drop(unsafe { Box::from_raw(sink) });
             return Err(io::Error::other("FSEvents did not start"));
+        }
+        if ready.recv().is_err() {
+            // SAFETY: the stream was started above and must stop before its queue and sink go away.
+            unsafe { FSEventStreamStop(stream) };
+            // SAFETY: a stopped stream may be invalidated.
+            unsafe { FSEventStreamInvalidate(stream) };
+            // SAFETY: the stream is released exactly once.
+            unsafe { FSEventStreamRelease(stream) };
+            // SAFETY: the queue came from `dispatch_queue_create` and is released once.
+            unsafe { dispatch_release(queue) };
+            // SAFETY: the released stream no longer holds the boxed sink.
+            drop(unsafe { Box::from_raw(sink) });
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
         }
         Ok(Self {
             stream,
             queue,
-            deliver,
+            sink,
+            checkpoint,
         })
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "event history has the same interface on every platform"
+    )]
+    pub(super) const fn checkpoint(&self) -> Option<u64> {
+        Some(self.checkpoint)
+    }
+
+    #[expect(
+        clippy::unused_self,
+        reason = "the current event ID belongs to the live stream's system journal"
+    )]
+    pub(super) fn current_checkpoint(&self) -> u64 {
+        // SAFETY: this function takes no arguments and returns the system-wide event ID.
+        unsafe { FSEventsGetCurrentEventId() }
     }
 
     #[expect(
@@ -291,11 +364,13 @@ pub(super) fn background() {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+
     use super::*;
 
     #[test]
     fn dropped_events_are_lost_and_directories_are_trimmed() {
-        for flag in [0x02, 0x04, 0x20] {
+        for flag in [0x01, 0x02, 0x04, 0x08, 0x20] {
             assert_eq!(change(b"/work/target/", flag), Change::Lost);
         }
         assert_eq!(
@@ -312,5 +387,71 @@ mod tests {
                 event: Event::Unsure,
             }
         );
+    }
+
+    #[test]
+    fn callback_delivers_entries_and_checkpoint_before_history_completion() {
+        let (sent, received) = mpsc::channel();
+        let (history, ready) = mpsc::sync_channel(1);
+        let mut sink = Sink {
+            deliver: Box::new(move |change| sent.send(change).unwrap()),
+            history,
+        };
+        let names = [
+            CString::new("/work/target/").unwrap(),
+            CString::new("/").unwrap(),
+        ];
+        let mut paths = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
+        let flags = [0, HISTORY_DONE];
+        let ids = [71, 0];
+        delivered(
+            std::ptr::null(),
+            std::ptr::from_mut(&mut sink).cast::<c_void>(),
+            paths.len(),
+            paths.as_mut_ptr().cast::<c_void>(),
+            flags.as_ptr(),
+            ids.as_ptr(),
+        );
+        assert_eq!(
+            received.try_recv().unwrap(),
+            Change::Entry {
+                path: PathBuf::from("/work/target"),
+                event: Event::Unsure,
+            }
+        );
+        assert_eq!(received.try_recv().unwrap(), Change::Checkpoint(71));
+        let _empty = received.try_recv().unwrap_err();
+        ready.try_recv().unwrap();
+    }
+
+    #[test]
+    fn callback_does_not_complete_history_or_checkpoint_a_zero_id() {
+        let (sent, received) = mpsc::channel();
+        let (history, ready) = mpsc::sync_channel(1);
+        let mut sink = Sink {
+            deliver: Box::new(move |change| sent.send(change).unwrap()),
+            history,
+        };
+        let names = [CString::new("/work/target/").unwrap()];
+        let mut paths = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
+        let flags = [0];
+        let ids = [0];
+        delivered(
+            std::ptr::null(),
+            std::ptr::from_mut(&mut sink).cast::<c_void>(),
+            paths.len(),
+            paths.as_mut_ptr().cast::<c_void>(),
+            flags.as_ptr(),
+            ids.as_ptr(),
+        );
+        assert_eq!(
+            received.try_recv().unwrap(),
+            Change::Entry {
+                path: PathBuf::from("/work/target"),
+                event: Event::Unsure,
+            }
+        );
+        let _no_checkpoint = received.try_recv().unwrap_err();
+        let _history_is_pending = ready.try_recv().unwrap_err();
     }
 }

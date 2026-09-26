@@ -19,6 +19,8 @@ use crate::platform::{self, Change, Coverage, Event, WatchDepth, Watcher};
 use crate::prune::{self, PruneRun, Scope};
 use crate::scan::{self, Found, Reach, ScanOptions};
 use crate::store::{self, Station};
+#[cfg(target_os = "macos")]
+use crate::store::{CachedPool, WatchCache};
 use crate::{SCHEMA_VERSION, Scout, busy, owners};
 
 const PROFILE_PARTS: [&str; 4] = ["deps", "incremental", "build", "examples"];
@@ -152,6 +154,12 @@ struct Session<'a> {
     watcher: Watcher,
     covered: bool,
     walked: BTreeSet<PathBuf>,
+    #[cfg(target_os = "macos")]
+    cache: Option<WatchCache>,
+    #[cfg(target_os = "macos")]
+    cached: Option<CachedPool>,
+    #[cfg(target_os = "macos")]
+    checkpoint: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,21 +406,72 @@ impl Session<'_> {
             .partition(|found| auto::lets_go(&self.scout, found));
         let reap = auto::reap(&self.scout, &self.policy.selection, &settled, Mode::Execute);
         let remaining = remaining.into_iter().cloned().collect::<Vec<_>>();
+        let mut inventoried = Vec::new();
+        #[cfg(target_os = "macos")]
+        let warm = self.cached.is_some();
+        #[cfg(target_os = "macos")]
+        {
+            let mut cached = self.cached.take();
+            for found in &remaining {
+                let restored = cached
+                    .as_mut()
+                    .and_then(|pool| pool.stocks.remove(found.path()))
+                    .is_some_and(|stock| {
+                        self.pool
+                            .restore(found, stock, &self.excludes, self.scout.protection())
+                    });
+                if !restored {
+                    inventoried.push(found.clone());
+                }
+            }
+            if let Some(cached) = cached {
+                for root in cached.stocks.keys() {
+                    self.pool.forget(root);
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        inventoried.extend(remaining.iter().cloned());
         let pruned = prune::run(
-            &remaining,
+            &inventoried,
             &self.excludes,
             self.scout.protection(),
             self.scout.owners(),
             Mode::Execute,
         );
-        for found in remaining {
+        #[cfg(target_os = "macos")]
+        let mut fresh = BTreeMap::new();
+        #[cfg(target_os = "macos")]
+        let mut fresh_roots = BTreeSet::new();
+        for found in &inventoried {
+            #[cfg(target_os = "macos")]
+            fresh.extend(
+                self.pool
+                    .stock(found, &self.excludes, self.scout.protection()),
+            );
+            #[cfg(target_os = "macos")]
+            fresh_roots.insert(found.path().to_path_buf());
+            #[cfg(not(target_os = "macos"))]
             let _fresh = self
                 .pool
-                .stock(&found, &self.excludes, self.scout.protection());
+                .stock(found, &self.excludes, self.scout.protection());
+        }
+        for found in remaining {
             self.adopt(found, Adopted::Processed)?;
         }
+        #[cfg(target_os = "macos")]
+        let focus = if warm {
+            Focus::Fresh {
+                roots: &fresh_roots,
+                fresh: &fresh,
+            }
+        } else {
+            Focus::Everything
+        };
+        #[cfg(not(target_os = "macos"))]
+        let focus = Focus::Everything;
         let shared = self.pool.share(
-            &Focus::Everything,
+            &focus,
             &self.excludes,
             self.scout.protection(),
             Mode::Execute,
@@ -425,7 +484,62 @@ impl Session<'_> {
             reap,
             prune: Some(pruned.summarized()),
             dedupe: Some(shared.summarized()),
-        })
+        })?;
+        #[cfg(target_os = "macos")]
+        self.persist();
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persist(&mut self) {
+        let changes = self.pool.changes();
+        let saved = match (&self.cache, self.checkpoint) {
+            (Some(cache), Some(checkpoint)) => cache.commit(checkpoint, changes),
+            (Some(_) | None, None) | (None, Some(_)) => return,
+        };
+        if let Err(error) = saved {
+            tracing::debug!(%error, "disable watcher cache");
+            if let Some(cache) = self.cache.take() {
+                let _invalidated = cache.invalidate();
+            }
+            self.checkpoint = None;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cold_after_history_loss(&mut self) {
+        self.cached = None;
+        self.checkpoint = None;
+        let Some(cache) = self.cache.take() else {
+            return;
+        };
+        if cache.invalidate().is_ok() {
+            self.checkpoint = Some(self.watcher.current_checkpoint());
+            self.cache = Some(cache);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn abandon_history(&mut self) {
+        self.cached = None;
+        if let Some(cache) = self.cache.take() {
+            let _invalidated = cache.invalidate();
+        }
+        self.checkpoint = None;
+        let _discarded = self.pool.changes();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_checkpoint(&mut self, checkpoint: Option<u64>) {
+        if let Some(checkpoint) = checkpoint {
+            if self.cache.is_some() {
+                self.checkpoint = Some(
+                    self.checkpoint
+                        .map_or(checkpoint, |known| known.max(checkpoint)),
+                );
+            }
+            self.persist();
+        }
     }
 
     fn reown(&mut self, scope: Option<&BTreeSet<PathBuf>>) -> Result<(), WatchError> {
@@ -767,10 +881,16 @@ impl Session<'_> {
         let mut appeared = BTreeSet::new();
         let mut rescanned = BTreeSet::new();
         let mut follow = Vec::new();
+        #[cfg(target_os = "macos")]
+        let mut checkpoint: Option<u64> = None;
         for signal in signals {
             match signal {
                 Signal::Changed(Change::Lost) => lost = true,
                 Signal::Changed(Change::Wake) => {},
+                #[cfg(target_os = "macos")]
+                Signal::Changed(Change::Checkpoint(found)) => {
+                    checkpoint = Some(checkpoint.map_or(found, |known| known.max(found)));
+                },
                 Signal::Changed(Change::Entry { path, event }) => {
                     if path.starts_with(&self.hooks.state) {
                         continue;
@@ -821,6 +941,8 @@ impl Session<'_> {
             "turn"
         );
         if lost {
+            #[cfg(target_os = "macos")]
+            self.abandon_history();
             self.resight(Loss::Lost)?;
         } else {
             match (hooked, self.covered) {
@@ -838,7 +960,10 @@ impl Session<'_> {
                 self.examine(targets)?;
             }
         }
-        self.settle()
+        self.settle()?;
+        #[cfg(target_os = "macos")]
+        self.finish_checkpoint(checkpoint);
+        Ok(())
     }
 }
 
@@ -852,6 +977,35 @@ enum Adopted {
 enum Loss {
     Lost,
     Kept,
+}
+
+#[cfg(target_os = "macos")]
+fn watch_cache(station: &Station) -> (Option<WatchCache>, Option<CachedPool>) {
+    let cache = match station.watch_cache() {
+        Ok(cache) => cache,
+        Err(error) => {
+            tracing::debug!(%error, "cannot open watcher cache");
+            return (None, None);
+        },
+    };
+    match cache.load() {
+        Ok(Some(cached)) => (Some(cache), Some(cached)),
+        Ok(None) => {
+            if cache.invalidate().is_ok() {
+                (Some(cache), None)
+            } else {
+                (None, None)
+            }
+        },
+        Err(error) => {
+            tracing::debug!(%error, "discard malformed watcher cache");
+            if cache.invalidate().is_ok() {
+                (Some(cache), None)
+            } else {
+                (None, None)
+            }
+        },
+    }
 }
 
 pub(crate) fn watch(
@@ -883,11 +1037,24 @@ fn open<'a>(
         .collect::<Vec<_>>();
     let mut paths = roots.clone();
     paths.push(hooks.signal.clone());
+    #[cfg(target_os = "macos")]
+    let (cache, cached) = watch_cache(&hooks.station);
+    #[cfg(target_os = "macos")]
+    let resume = cached.as_ref().map(|pool| pool.checkpoint);
+    #[cfg(not(target_os = "macos"))]
+    let resume = None;
     let deliver = sender.clone();
-    let watcher = Watcher::start(&paths, hooks.station.notification(), move |change| {
-        let _closed = deliver.send(Signal::Changed(change));
-    })
+    let watcher = Watcher::start(
+        &paths,
+        hooks.station.notification(),
+        resume,
+        move |change| {
+            let _closed = deliver.send(Signal::Changed(change));
+        },
+    )
     .map_err(WatchError::Events)?;
+    #[cfg(target_os = "macos")]
+    let checkpoint = watcher.checkpoint();
     let session = Session {
         scout: scout.refreshed(),
         roots,
@@ -902,6 +1069,12 @@ fn open<'a>(
         watcher,
         covered: true,
         walked: BTreeSet::new(),
+        #[cfg(target_os = "macos")]
+        cache,
+        #[cfg(target_os = "macos")]
+        cached,
+        #[cfg(target_os = "macos")]
+        checkpoint,
     };
     Ok((session, receiver))
 }
@@ -934,7 +1107,20 @@ fn watching(
         Ok(()) | Err(_) => {},
     }
     let _raised = hooks.taken().map_err(WatchError::Station)?;
+    #[cfg(target_os = "macos")]
+    let mut pending = receiver.try_iter().collect::<Vec<_>>();
+    #[cfg(not(target_os = "macos"))]
+    let pending = receiver.try_iter().collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    if pending
+        .iter()
+        .any(|pending_signal| matches!(pending_signal, Signal::Changed(Change::Lost)))
+    {
+        session.cold_after_history_loss();
+        pending.retain(|pending_signal| !matches!(pending_signal, Signal::Changed(Change::Lost)));
+    }
     session.start()?;
+    session.turn(pending)?;
     loop {
         let first = receiver.recv().map_err(|_closed| WatchError::Ended)?;
         let mut signals = vec![first];
@@ -1042,6 +1228,139 @@ mod tests {
             }
         }
         old
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one live stream proves restore, replay, and both loss transitions together"
+    )]
+    fn warm_start_restores_inventory_without_pruning_or_resharing_it() {
+        let temp = testkit::tempdir("watch-unit-warm-start");
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("work");
+        testkit::make_dir(&root);
+        let debug = profile(&root, "app");
+        let old = build(&debug, "unit");
+        let target = debug.parent().unwrap().to_path_buf();
+        let state = base.join("state");
+        testkit::make_dir(&state);
+        let policy = AutoPolicy::parse(&format!(
+            "[select]\nroots = [{:?}]\n",
+            root.to_str().unwrap()
+        ))
+        .unwrap();
+        let records = Records::default();
+        let render = |record: &WatchRecord| {
+            records.borrow_mut().push(record.clone());
+            Ok(())
+        };
+        let station = Station::for_policy(&state, &base.join("auto.toml"));
+        let signal = station.signal().unwrap();
+        let hooks = Hooks {
+            station,
+            state,
+            signal,
+            log: None,
+            render: &render,
+        };
+        let scout = Scout::with(testkit::open_protection()).confined(vec![base]);
+        let (mut session, _receiver) = open(&scout, &policy, &hooks).unwrap();
+        let sighting = session
+            .scout
+            .sighting(&session.policy.selection.options(), Reach::Everything)
+            .unwrap();
+        let found = session
+            .admitted(sighting)
+            .into_iter()
+            .find(|found| found.path() == target)
+            .unwrap();
+        let identity = found.candidate().identity();
+        let checkpoint = session.checkpoint.unwrap();
+        session
+            .cache
+            .as_ref()
+            .unwrap()
+            .commit(
+                checkpoint,
+                store::InventoryChanges {
+                    cleared: Vec::new(),
+                    roots: vec![store::InventoryRoot {
+                        root: target.clone(),
+                        identity,
+                        unreadable: 0,
+                    }],
+                    files: Vec::new(),
+                },
+            )
+            .unwrap();
+        session.cached = Some(CachedPool {
+            checkpoint,
+            stocks: BTreeMap::from([(
+                target.clone(),
+                store::CachedStock {
+                    root: target.clone(),
+                    identity,
+                    unreadable: 0,
+                    files: BTreeMap::new(),
+                },
+            )]),
+        });
+
+        session.start().unwrap();
+        testkit::assert_present(old);
+        assert_eq!(session.pool.file_count(&target), 0);
+        let records = records.borrow();
+        let start = records.last().unwrap();
+        assert_eq!(start.cause, Cause::Start);
+        assert_eq!(start.prune.as_ref().unwrap().totals.files(), 0);
+        assert!(start.dedupe.as_ref().unwrap().subjects.is_empty());
+        drop(records);
+        assert!(
+            session
+                .cache
+                .as_ref()
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap()
+                .stocks
+                .contains_key(&target)
+        );
+
+        let changed = target.join("debug/deps/new.rlib");
+        testkit::write_patterned(&changed, 256 * 1024, 9);
+        let next_checkpoint = checkpoint.saturating_add(1);
+        session
+            .turn(vec![
+                written(&changed),
+                Signal::Changed(Change::Checkpoint(next_checkpoint)),
+            ])
+            .unwrap();
+        let replayed = session.cache.as_ref().unwrap().load().unwrap().unwrap();
+        assert_eq!(replayed.checkpoint, next_checkpoint);
+        assert!(
+            replayed.stocks[&target]
+                .files
+                .contains_key(Path::new("debug/deps/new.rlib"))
+        );
+
+        session.checkpoint = Some(u64::MAX);
+        session.cold_after_history_loss();
+        assert!(session.cached.is_none());
+        assert!(session.cache.as_ref().unwrap().load().unwrap().is_none());
+        assert!(
+            matches!(session.checkpoint, Some(event_id) if event_id != 0 && event_id != u64::MAX)
+        );
+        session
+            .turn(vec![
+                Signal::Changed(Change::Lost),
+                Signal::Changed(Change::Checkpoint(next_checkpoint.saturating_add(1))),
+            ])
+            .unwrap();
+        assert!(session.cache.is_none());
+        assert!(session.checkpoint.is_none());
     }
 
     #[test]
