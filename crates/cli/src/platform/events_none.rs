@@ -16,7 +16,11 @@ impl Source {
         WatchDepth::Named
     }
 
-    pub(super) fn start(_paths: &[PathBuf], _deliver: Deliver) -> io::Result<Self> {
+    pub(super) fn start(
+        _paths: &[PathBuf],
+        _notification: &str,
+        _deliver: Deliver,
+    ) -> io::Result<Self> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
@@ -28,6 +32,14 @@ impl Source {
     pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<Coverage> {
         Ok(Coverage::Complete)
     }
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "raising a station notification has the same interface on every platform"
+)]
+pub(super) const fn wake(_notification: &str) -> io::Result<()> {
+    Ok(())
 }
 
 pub(super) const fn background() {}

@@ -109,7 +109,11 @@ impl Source {
         WatchDepth::Named
     }
 
-    pub(super) fn start(paths: &[PathBuf], deliver: Deliver) -> io::Result<Self> {
+    pub(super) fn start(
+        paths: &[PathBuf],
+        _notification: &str,
+        deliver: Deliver,
+    ) -> io::Result<Self> {
         // SAFETY: `inotify_init1` takes only flags.
         let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
         if raw == -1 {
@@ -169,6 +173,14 @@ impl Source {
         }
         Ok(coverage)
     }
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "raising a station notification has the same interface on every platform"
+)]
+pub(super) const fn wake(_notification: &str) -> io::Result<()> {
+    Ok(())
 }
 
 pub(super) fn background() {
@@ -275,7 +287,7 @@ mod tests {
         let there = temp.path().join("there");
         testkit::write_sized(&there.join("file"), 1);
         let missing = temp.path().join("missing");
-        let source = Source::start(&[], Box::new(|_| {})).unwrap();
+        let source = Source::start(&[], "", Box::new(|_| {})).unwrap();
         source
             .watch(&[there.as_path(), missing.as_path(), temp.path()])
             .unwrap();

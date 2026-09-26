@@ -178,7 +178,11 @@ impl Drop for Source {
 }
 
 impl Source {
-    pub(super) fn start(paths: &[PathBuf], deliver: Deliver) -> io::Result<Self> {
+    pub(super) fn start(
+        paths: &[PathBuf],
+        _notification: &str,
+        deliver: Deliver,
+    ) -> io::Result<Self> {
         let strings = strings(paths)?;
         let count = isize::try_from(strings.0.len())
             .map_err(|_long| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -269,6 +273,14 @@ impl Source {
     pub(super) const fn watch(&self, _directories: &[&Path]) -> io::Result<Coverage> {
         Ok(Coverage::Complete)
     }
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "raising a station notification has the same interface on every platform"
+)]
+pub(super) const fn wake(_notification: &str) -> io::Result<()> {
+    Ok(())
 }
 
 pub(super) fn background() {

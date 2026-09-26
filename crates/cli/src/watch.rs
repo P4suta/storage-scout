@@ -770,6 +770,7 @@ impl Session<'_> {
         for signal in signals {
             match signal {
                 Signal::Changed(Change::Lost) => lost = true,
+                Signal::Changed(Change::Wake) => {},
                 Signal::Changed(Change::Entry { path, event }) => {
                     if path.starts_with(&self.hooks.state) {
                         continue;
@@ -883,7 +884,7 @@ fn open<'a>(
     let mut paths = roots.clone();
     paths.push(hooks.signal.clone());
     let deliver = sender.clone();
-    let watcher = Watcher::start(&paths, move |change| {
+    let watcher = Watcher::start(&paths, hooks.station.notification(), move |change| {
         let _closed = deliver.send(Signal::Changed(change));
     })
     .map_err(WatchError::Events)?;

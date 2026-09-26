@@ -33,8 +33,16 @@ pub(crate) mod spawn;
     expect(dead_code, reason = "nothing is watched on this platform")
 )]
 pub(crate) enum Change {
-    Entry { path: PathBuf, event: Event },
+    Entry {
+        path: PathBuf,
+        event: Event,
+    },
     Lost,
+    #[cfg_attr(
+        not(windows),
+        expect(dead_code, reason = "only Windows uses a named wake event")
+    )]
+    Wake,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,9 +89,10 @@ pub(crate) struct Watcher(events::Source);
 impl Watcher {
     pub(crate) fn start(
         paths: &[PathBuf],
+        notification: &str,
         deliver: impl Fn(Change) + Send + Sync + 'static,
     ) -> io::Result<Self> {
-        events::Source::start(paths, Box::new(deliver)).map(Self)
+        events::Source::start(paths, notification, Box::new(deliver)).map(Self)
     }
 
     #[cfg_attr(
@@ -100,6 +109,17 @@ impl Watcher {
     pub(crate) const fn depth(&self) -> WatchDepth {
         self.0.depth()
     }
+}
+
+#[cfg_attr(
+    not(windows),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "Windows signals a named event while other platforms do nothing"
+    )
+)]
+pub(crate) fn wake(notification: &str) -> io::Result<()> {
+    events::wake(notification)
 }
 
 #[derive(Debug, Clone, Copy)]

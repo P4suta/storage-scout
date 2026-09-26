@@ -55,6 +55,7 @@ pub(crate) struct Station {
     signal: PathBuf,
     flag: PathBuf,
     last: PathBuf,
+    notification: String,
 }
 
 #[derive(Debug)]
@@ -75,7 +76,12 @@ impl Station {
             flag: signal.join("pending"),
             signal,
             last: state.join(format!("auto-{key}.last.json")),
+            notification: format!("Local\\storage-scout-{key}"),
         }
+    }
+
+    pub(crate) fn notification(&self) -> &str {
+        &self.notification
     }
 
     pub(crate) fn signal(&self) -> io::Result<PathBuf> {
@@ -101,14 +107,17 @@ impl Station {
             .create(true)
             .append(true)
             .open(&self.flag)?;
-        match repository {
+        let written = match repository {
             Some(repository) => {
                 let mut line = repository.as_os_str().as_encoded_bytes().to_vec();
                 line.push(b'\n');
                 flag.write_all(&line)
             },
             None => Ok(()),
-        }
+        };
+        drop(flag);
+        written?;
+        crate::platform::wake(&self.notification)
     }
 
     #[cfg(test)]
