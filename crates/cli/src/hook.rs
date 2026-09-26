@@ -150,6 +150,7 @@ impl Rendezvous for Request<'_> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
 
     use super::*;
 
@@ -184,9 +185,7 @@ mod tests {
         assert!(!manual.lower().unwrap());
 
         hook.raise().unwrap();
-        assert_eq!(
-            station.take().unwrap(),
-            Some(BTreeSet::from([repository.join(".git")]))
-        );
+        let repository = fs::canonicalize(repository.join(".git")).unwrap();
+        assert_eq!(station.take().unwrap(), Some(BTreeSet::from([repository])));
     }
 }

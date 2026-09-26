@@ -1,5 +1,6 @@
 #![expect(
     clippy::disallowed_methods,
+    clippy::print_stderr,
     clippy::unwrap_used,
     clippy::unwrap_in_result,
     reason = "tests drive a real watcher over real trees"
@@ -9,11 +10,13 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Lines};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread::JoinHandle;
 
 use testkit::{Built, MarkerKeep, MarkerRole, Scratch, tempdir, write_sized};
 
 struct Watching {
     child: Child,
+    diagnostics: Option<JoinHandle<()>>,
     lines: Lines<BufReader<ChildStdout>>,
     _temp: Scratch,
     root: PathBuf,
@@ -26,6 +29,9 @@ impl Drop for Watching {
     fn drop(&mut self) {
         let _killed = self.child.kill();
         let _reaped = self.child.wait();
+        if let Some(diagnostics) = self.diagnostics.take() {
+            let _joined = diagnostics.join();
+        }
     }
 }
 
@@ -44,17 +50,34 @@ impl Watching {
         )
         .unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_storage-scout"))
-            .args(["watch", "--config", config.to_str().unwrap()])
+            .args(["-vv", "watch", "--config", config.to_str().unwrap()])
             .env("GIT_CEILING_DIRECTORIES", temp.path())
             .env("STORAGE_SCOUT_STATE_DIR", &state)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (reported, reports) = std::sync::mpsc::channel();
+        let diagnostics = std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                match line {
+                    Ok(line) => {
+                        eprintln!("watcher: {line}");
+                        let _sent = reported.send(line);
+                    },
+                    Err(error) => {
+                        eprintln!("watcher stderr: {error}");
+                        break;
+                    },
+                }
+            }
+        });
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
         let Some(started) = lines.next() else {
-            let output = child.wait_with_output().unwrap();
-            let complaint = String::from_utf8_lossy(&output.stderr).into_owned();
+            let _status = child.wait().unwrap();
+            diagnostics.join().unwrap();
+            let complaint = reports.try_iter().collect::<Vec<_>>().join("\n");
             assert!(
                 complaint.contains("cannot watch for changes here"),
                 "{complaint}"
@@ -62,10 +85,12 @@ impl Watching {
             let _skipped = Built::Unavailable(complaint).or_decline("a filesystem watcher");
             return None;
         };
+        drop(reports);
         let started = started.unwrap();
         assert!(started.starts_with("start: watching"), "{started}");
         Some(Self {
             child,
+            diagnostics: Some(diagnostics),
             lines,
             ceiling: temp.path().to_path_buf(),
             _temp: temp,
@@ -229,12 +254,14 @@ fn a_cache_whose_key_is_gone_is_reaped_as_soon_as_a_hook_says_so() {
         .current_dir(&watching.root)
         .output()
         .unwrap();
+    eprintln!("handoff: {poked:#?}");
     assert!(
         String::from_utf8_lossy(&poked.stdout).contains("handed"),
         "{poked:#?}"
     );
     loop {
         let line = watching.next();
+        eprintln!("watch record: {line}");
         assert!(!line.contains("FAILURES"), "{line}");
         if line.starts_with("hook:") && line.contains("reaped 1") {
             break;
