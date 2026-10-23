@@ -1,4 +1,7 @@
 /target
 /reports/
-/.njutest/
+/mutants.out*/
 .storage-scout-*/
+/_apalache-out/
+/fuzz/target/
+/fuzz/artifacts/

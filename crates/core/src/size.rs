@@ -1,4 +1,7 @@
 use core::fmt;
+
+const DECIMAL_RADIX: u128 = 10;
+const BINARY_SCALE: u128 = 1024;
 use core::str::FromStr;
 
 use serde::Serialize;
@@ -6,6 +9,49 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize)]
 #[serde(transparent)]
 pub struct Bytes(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reclamation {
+    Unchanged,
+    Unattributable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Reconciliation {
+    pub used: Bytes,
+    pub measured: Bytes,
+    pub attributed: Bytes,
+    pub unattributed: Bytes,
+    pub overcount: Bytes,
+}
+
+impl Reconciliation {
+    #[must_use]
+    pub const fn new(used: Bytes, measured: Bytes) -> Self {
+        let attributed = if measured.get() < used.get() {
+            measured
+        } else {
+            used
+        };
+        Self {
+            used,
+            measured,
+            attributed,
+            unattributed: used.saturating_sub(attributed),
+            overcount: measured.saturating_sub(attributed),
+        }
+    }
+}
+
+impl Reclamation {
+    #[must_use]
+    pub const fn observed(self) -> Option<Bytes> {
+        match self {
+            Self::Unchanged => Some(Bytes::ZERO),
+            Self::Unattributable => None,
+        }
+    }
+}
 
 impl Bytes {
     pub const ZERO: Self = Self(0);
@@ -96,7 +142,7 @@ impl FromStr for Bytes {
         let fraction_value = digits(fraction)?;
         let scale = fraction
             .bytes()
-            .try_fold(1u128, |scale, _| scale.checked_mul(10))
+            .try_fold(1u128, |scale, _| scale.checked_mul(DECIMAL_RADIX))
             .ok_or(SizeError::Overflow)?;
         let value = whole_value
             .checked_mul(multiplier)
@@ -116,7 +162,7 @@ impl FromStr for Bytes {
 fn digits(text: &str) -> Result<u128, SizeError> {
     text.bytes().try_fold(0u128, |total, digit| {
         total
-            .checked_mul(10)
+            .checked_mul(DECIMAL_RADIX)
             .and_then(|total| total.checked_add(u128::from(digit.wrapping_sub(b'0'))))
             .ok_or(SizeError::Overflow)
     })
@@ -128,20 +174,26 @@ impl fmt::Display for Bytes {
         let value = u128::from(self.0);
         let mut unit = 0usize;
         let mut divisor = 1u128;
-        while unit < 5 && value >= divisor.saturating_mul(1024) {
+        while unit < NAMES.len().saturating_sub(1) && value >= divisor.saturating_mul(BINARY_SCALE)
+        {
             unit = unit.saturating_add(1);
-            divisor = divisor.saturating_mul(1024);
+            divisor = divisor.saturating_mul(BINARY_SCALE);
         }
         let name = NAMES.get(unit).copied().unwrap_or("B");
         if unit == 0 {
             return write!(f, "{value} {name}");
         }
         let tenths = value
-            .saturating_mul(10)
+            .saturating_mul(DECIMAL_RADIX)
             .saturating_add(divisor / 2)
             .checked_div(divisor)
             .unwrap_or(0);
-        write!(f, "{}.{} {name}", tenths / 10, tenths % 10)
+        write!(
+            f,
+            "{}.{} {name}",
+            tenths / DECIMAL_RADIX,
+            tenths % DECIMAL_RADIX
+        )
     }
 }
 

@@ -1,0 +1,183 @@
+harnesses = [
+  "proofs::managed_removal_requires_current_complete_unreferenced_reinstallable_evidence",
+  "proofs::concrete_version_requests_preserve_their_exact_installation",
+  "proofs::version_normalization_removes_only_one_optional_ascii_prefix",
+  "proofs::session_locks_are_single_components_or_are_refused",
+  "proofs::source_checkouts_are_disposable_only_within_the_producers_contract",
+  "proofs::checkout_release_requires_a_live_unchanged_unlocked_witness",
+  "proofs::release_records_round_trip_and_reject_truncated_or_extended_inputs",
+  "proofs::volume_attribution_accounts_for_every_used_byte",
+  "proofs::an_incomplete_measurement_never_grants_reclamation",
+  "proofs::reclamation_never_attributes_volume_counters",
+  "gate::proofs::pipeline_never_ignores_a_refusal",
+  "gate::proofs::tier_grants_preserve_previous_permissions_and_add_only_the_requested_cost",
+  "gate::proofs::pipeline_requires_identification_and_accepts_abstentions",
+  "proofs::settled_admission_is_exact",
+  "proofs::deletion_never_accepts_an_unsettled_owner",
+  "proofs::marker_release_requires_owner_clearance",
+  "proofs::sharing_preserves_identity_ownership_and_replacement_attributes",
+  "proofs::pruning_preserves_every_newest_finalized_session",
+  "proofs::byte_arithmetic_matches_mathematical_clamping",
+  "proofs::byte_total_is_associative_and_saturating",
+  "proofs::worktree_landing_requires_clean_and_upstream_evidence",
+  "proofs::nested_markers_protect_but_never_release_their_parent",
+  "proofs::reaping_projects_only_settled_candidate_ids",
+  "proofs::owner_locks_require_presence",
+  "ownership::proofs::strongest_ownership_protection_is_ordered",
+]
+
+[[modules]]
+path = "crates/core/src/managed.rs"
+symbols = ["Clearance::id", "Clearance::resource", "clear", "version_reference"]
+harnesses = [
+  "proofs::managed_removal_requires_current_complete_unreferenced_reinstallable_evidence",
+  "proofs::concrete_version_requests_preserve_their_exact_installation",
+  "proofs::version_normalization_removes_only_one_optional_ascii_prefix",
+]
+domain = "All managed resource, reference, completeness, tier, and review states. Reflexivity covers every 16-byte sequence in the production matcher. A separate production-normalizer proof covers every 17-byte sequence, including an optional ASCII v plus 16 payload bytes. The UTF-8 API delegates to these functions. Grammar and version-prefix matching additionally require corpus replay and bounded fuzzing. Native manager and engine APIs remain external trust assumptions checked by adapter tests."
+
+[[modules]]
+path = "crates/core/src/artifact.rs"
+symbols = [
+  "Entries::dir",
+  "Entries::file",
+  "Entries::has_file",
+  "Kind::as_str",
+  "Kind::contents",
+  "Kind::label",
+  "Kind::protocol",
+  "Kind::tier",
+  "Listing::identify",
+  "Listing::new",
+  "Listing::tags",
+  "Provenance::as_str",
+  "SourceArea::of",
+  "Tags::cache",
+  "Tier::as_str",
+  "TreeContents::git",
+]
+harnesses = ["proofs::source_checkouts_are_disposable_only_within_the_producers_contract"]
+domain = "Every artifact kind, top-level source area, and Git entry shape. Producer-owned source copies require the normal ownership gates. SourceArea parsing and manifest recognition additionally require native corpus and layout tests."
+
+[[modules]]
+path = "crates/core/src/size.rs"
+symbols = [
+  "Reconciliation::new",
+  "Reclamation::observed",
+  "Bytes::new",
+  "Bytes::get",
+  "Bytes::saturating_add",
+  "Bytes::saturating_sub",
+  "Bytes::total",
+]
+harnesses = [
+  "proofs::volume_attribution_accounts_for_every_used_byte",
+  "proofs::reclamation_never_attributes_volume_counters",
+  "proofs::byte_arithmetic_matches_mathematical_clamping",
+  "proofs::byte_total_is_associative_and_saturating",
+]
+domain = "Both reclamation states and full-width byte arithmetic. Filesystem mutations cannot isolate physical block release, so only an unchanged execution reports a known zero. Size parsing additionally requires the native parser corpus and fuzz target."
+
+[[modules]]
+path = "crates/core/src/lock.rs"
+symbols = ["Protocol::label", "Protocol::presence", "Protocol::of"]
+harnesses = ["proofs::owner_locks_require_presence"]
+domain = "Every lock protocol's presence requirement; recognizing lock names additionally requires native core tests."
+
+[[modules]]
+path = "crates/core/src/gate.rs"
+symbols = [
+  "Gate::name",
+  "Gate::purpose",
+  "TierGrant::with",
+  "TierGrant::of",
+  "TierGrant::admits",
+  "Admission::kind",
+  "admit",
+  "recheck",
+  "Clearance::location",
+  "Clearance::identity",
+  "Clearance::identification",
+  "clear",
+  "ShareClearance::location",
+  "ShareClearance::identity",
+  "ShareClearance::method",
+  "clear_share",
+  "PruneClearance::location",
+  "PruneClearance::identity",
+  "clear_prune",
+  "inspect",
+  "inspect_verified",
+]
+harnesses = [
+  "gate::proofs::pipeline_never_ignores_a_refusal",
+  "gate::proofs::tier_grants_preserve_previous_permissions_and_add_only_the_requested_cost",
+  "gate::proofs::pipeline_requires_identification_and_accepts_abstentions",
+  "proofs::deletion_never_accepts_an_unsettled_owner",
+]
+domain = "Pipeline composition over every refusal mask and identification presence; ownership over all settlements and mandates; every previous tier grant and requested cost. Path, I/O, freshness, inspection, and tier gate behavior additionally require native tests and Quint replay; this is not an all-input proof of these leaf gates."
+
+[[modules]]
+path = "crates/core/src/ownership.rs"
+symbols = [
+  "ReleaseEvidence::settlement",
+  "ReleaseRecord::encode",
+  "ReleaseRecord::decode",
+  "Settlement::as_str",
+  "Marker::settlement",
+  "Worktree::settlement",
+  "Ownership::resolve",
+  "Ownership::settlement",
+  "Admits::deletion",
+  "Admits::admits",
+]
+harnesses = [
+  "proofs::checkout_release_requires_a_live_unchanged_unlocked_witness",
+  "proofs::release_records_round_trip_and_reject_truncated_or_extended_inputs",
+  "proofs::settled_admission_is_exact",
+  "proofs::deletion_never_accepts_an_unsettled_owner",
+  "proofs::marker_release_requires_owner_clearance",
+  "proofs::worktree_landing_requires_clean_and_upstream_evidence",
+  "proofs::nested_markers_protect_but_never_release_their_parent",
+  "ownership::proofs::strongest_ownership_protection_is_ordered",
+]
+domain = "Every marker enum combination, linked worktree evidence variant, settlement/mandate pair, and pair of ownership protection priorities; one nested scratch marker with every keep/lock combination. Larger ownership stocks require the native ownership tests."
+
+[[modules]]
+path = "crates/core/src/share.rs"
+symbols = [
+  "Capability::of",
+  "Refusal::summary",
+  "pair",
+  "groups",
+  "split",
+  "keeper",
+  "plan",
+  "Failure::overtaken",
+]
+harnesses = ["proofs::sharing_preserves_identity_ownership_and_replacement_attributes"]
+domain = "Every pair metadata value: full-width identities, lengths, links, clusters and attributes, and all method/owner/mode/extras variants. Grouping and planning require native tests; byte equality and OS replacement remain native boundaries."
+
+[[modules]]
+path = "crates/core/src/prune.rs"
+symbols = [
+  "Rule::purpose",
+  "Object::parse",
+  "mixed",
+  "images",
+  "stale",
+  "Session::parse",
+  "Session::lock_name",
+  "doomed",
+]
+harnesses = [
+  "proofs::pruning_preserves_every_newest_finalized_session",
+  "proofs::session_locks_are_single_components_or_are_refused",
+]
+domain = "Three sessions, all finalized/working combinations and full-width u128 stamps, including ties; every 16-byte sequence in the production lock-name helper produces a single path component or a refusal. The UTF-8 API delegates to that helper. Object decisions, longer names, and larger stocks require native tests and corpus replay."
+
+[[modules]]
+path = "crates/core/src/select.rs"
+symbols = ["reap"]
+harnesses = ["proofs::reaping_projects_only_settled_candidate_ids"]
+domain = "The generic eligibility projection over every settlement and full-width u64 labels, including reference identity. Candidate ID cloning and iterator composition additionally require native unit and property tests."

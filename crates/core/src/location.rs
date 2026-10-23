@@ -79,11 +79,6 @@ impl Name {
     }
 
     #[must_use]
-    pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0).into_owned()
-    }
-
-    #[must_use]
     pub fn folded(&self, case: Case) -> Vec<u8> {
         fold(&self.0, case)
     }
@@ -91,6 +86,12 @@ impl Name {
     #[must_use]
     pub fn matches(&self, literal: &str, case: Case) -> bool {
         self.folded(case) == fold(literal.as_bytes(), case)
+    }
+}
+
+impl fmt::Display for Name {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&String::from_utf8_lossy(&self.0))
     }
 }
 
@@ -262,7 +263,7 @@ impl fmt::Display for Location {
             Root::Unix => f.write_str("/")?,
             Root::Drive(letter) => write!(f, "{}:\\", char::from(*letter))?,
             Root::Unc { server, share } => {
-                write!(f, "\\\\{}\\{}", server.text(), share.text())?;
+                write!(f, "\\\\{server}\\{share}")?;
                 if !self.0.names.is_empty() {
                     write!(f, "{separator}")?;
                 }
@@ -272,7 +273,7 @@ impl fmt::Display for Location {
             if index > 0 {
                 write!(f, "{separator}")?;
             }
-            f.write_str(&name.text())?;
+            write!(f, "{name}")?;
         }
         Ok(())
     }

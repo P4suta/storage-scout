@@ -12,11 +12,13 @@ use crate::observe::git;
 use crate::{busy, host};
 
 pub(crate) const MARKER_NAME: &str = "owner.json";
+const GITDIR_READ_LIMIT: u64 = 4096;
 
 #[derive(Debug, Default)]
 pub(crate) struct Owners {
     ceilings: Vec<PathBuf>,
     worktrees: Mutex<BTreeMap<PathBuf, Worktree>>,
+    release_state: Option<PathBuf>,
 }
 
 impl Clone for Owners {
@@ -24,6 +26,7 @@ impl Clone for Owners {
         Self {
             ceilings: self.ceilings.clone(),
             worktrees: Mutex::new(BTreeMap::new()),
+            release_state: self.release_state.clone(),
         }
     }
 }
@@ -99,7 +102,9 @@ fn dot_git(directory: &Path) -> Dot {
 
 fn gitdir(file: &Path) -> Option<PathBuf> {
     let mut text = String::new();
-    match File::open(file).and_then(|opened| opened.take(4096).read_to_string(&mut text)) {
+    match File::open(file)
+        .and_then(|opened| opened.take(GITDIR_READ_LIMIT).read_to_string(&mut text))
+    {
         Ok(_) => {},
         Err(_unreadable) => return None,
     }
@@ -113,6 +118,47 @@ fn gitdir(file: &Path) -> Option<PathBuf> {
 }
 
 impl Owners {
+    pub(crate) fn with_state(mut self, state: PathBuf) -> Self {
+        self.release_state = Some(state);
+        self
+    }
+
+    pub(crate) fn release(&self, root: &Path) -> io::Result<crate::CheckoutRelease> {
+        let state = self
+            .release_state
+            .as_deref()
+            .ok_or_else(|| io::Error::other("no release state directory is configured"))?;
+        crate::release::release(root, state)
+    }
+
+    pub(crate) fn recheck(&self, path: &Path, nested: &[PathBuf]) -> Ownership {
+        self.clone().of(path, nested)
+    }
+
+    pub(crate) fn survey(
+        &self,
+        path: &Path,
+    ) -> Result<busy::Survey, storage_scout_core::reject::Rejection> {
+        self.complete_survey(path, busy::survey(path)?)
+    }
+
+    pub(crate) fn complete_survey(
+        &self,
+        path: &Path,
+        mut survey: busy::Survey,
+    ) -> Result<busy::Survey, storage_scout_core::reject::Rejection> {
+        for directory in path
+            .ancestors()
+            .take_while(|directory| !self.ceiling(directory))
+        {
+            if declaration(directory).is_some() {
+                survey.owner(directory.join(Protocol::TEMP_OWNER_NAME))?;
+            }
+        }
+        survey.order();
+        Ok(survey)
+    }
+
     pub(crate) fn forget(&self, repositories: Option<&BTreeSet<PathBuf>>) {
         let mut worktrees = match self.worktrees.lock() {
             Ok(worktrees) => worktrees,
@@ -138,11 +184,18 @@ impl Owners {
                 })
                 .collect(),
             worktrees: Mutex::new(BTreeMap::new()),
+            release_state: None,
         }
     }
 
     pub(crate) fn detect() -> Self {
-        Self::from_ceilings(std::env::var_os("GIT_CEILING_DIRECTORIES").as_deref())
+        let mut owners =
+            Self::from_ceilings(std::env::var_os("GIT_CEILING_DIRECTORIES").as_deref());
+        owners.release_state = match crate::store::state_path() {
+            Ok(path) => Some(path),
+            Err(_) => None,
+        };
+        owners
     }
 
     fn from_ceilings(value: Option<&std::ffi::OsStr>) -> Self {
@@ -185,6 +238,14 @@ impl Owners {
             Ok(location) => location,
             Err(_unnameable) => return None,
         };
+        if let Some(state) = &self.release_state
+            && let Some(evidence) = crate::release::evidence(root, state)
+        {
+            return Some(Worktree::Released {
+                root: location,
+                evidence,
+            });
+        }
         let cached = match self.worktrees.lock() {
             Ok(worktrees) => worktrees.get(root).cloned(),
             Err(poisoned) => poisoned.into_inner().get(root).cloned(),
@@ -262,9 +323,12 @@ mod tests {
         let listed = std::env::join_paths([absolute.as_path(), Path::new("relative")]).unwrap();
         let owners = Owners::from_ceilings(Some(&listed));
         assert_eq!(owners.ceilings, vec![absolute]);
-        assert!(Owners::from_ceilings(None).ceilings.is_empty());
+        assert_eq!(Owners::from_ceilings(None).ceilings, Vec::<PathBuf>::new());
         let empty = OsString::new();
-        assert!(Owners::from_ceilings(Some(&empty)).ceilings.is_empty());
+        assert_eq!(
+            Owners::from_ceilings(Some(&empty)).ceilings,
+            Vec::<PathBuf>::new()
+        );
         assert_eq!(owners.clone().ceilings, owners.ceilings);
     }
 

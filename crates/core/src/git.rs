@@ -83,12 +83,15 @@ pub fn names(output: &[u8]) -> Vec<Vec<u8>> {
 }
 
 pub fn commits(output: &[u8]) -> Result<Vec<String>, Unparsable> {
+    const MIN_OBJECT_ID_HEX_BYTES: usize = 40;
     output
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .map(|line| {
             let line = text(line)?;
-            if line.len() >= 40 && line.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if line.len() >= MIN_OBJECT_ID_HEX_BYTES
+                && line.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
                 Ok(String::from(line))
             } else {
                 Err(Unparsable)

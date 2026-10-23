@@ -6,10 +6,14 @@
     reason = "fixtures build real trees; a fixture that cannot be built is a broken test"
 )]
 
+mod constants;
+
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use storage_scout_core::area::{Protection, Rule};
 use storage_scout_core::location::Location;
@@ -21,12 +25,15 @@ const RECLAIM_LIMIT: usize = 8;
 
 #[must_use]
 #[derive(Debug)]
-pub struct Scratch(Option<tempfile::TempDir>);
+pub struct Scratch {
+    directory: Option<tempfile::TempDir>,
+    _owner: Arc<FixtureOwner>,
+}
 
 impl Scratch {
     #[must_use]
     pub fn path(&self) -> &Path {
-        self.0
+        self.directory
             .as_ref()
             .map_or_else(|| Path::new(""), tempfile::TempDir::path)
     }
@@ -41,7 +48,10 @@ fn writable(directory: &Path) {
     if !metadata.is_dir() {
         return;
     }
-    let _opened = fs::set_permissions(directory, fs::Permissions::from_mode(0o700));
+    let _opened = fs::set_permissions(
+        directory,
+        fs::Permissions::from_mode(constants::OWNER_DIRECTORY_MODE),
+    );
     if let Ok(entries) = fs::read_dir(directory) {
         for entry in entries.flatten() {
             writable(&entry.path());
@@ -54,7 +64,7 @@ const fn writable(_directory: &Path) {}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        if let Some(temp) = self.0.take() {
+        if let Some(temp) = self.directory.take() {
             writable(temp.path());
             drop(temp);
         }
@@ -62,43 +72,160 @@ impl Drop for Scratch {
 }
 
 const SCRATCH: &str = ".storage-scout-tests";
-const SCRATCH_OWNER: &str = r#"{"schema": "storage-scout-temp-owner-v1", "pid": 0, "started": "tests", "kept": true, "role": "scratch"}"#;
+const SCRATCH_OWNER: &str = r#"{"schema": "storage-scout-temp-owner-v1", "pid": 0, "started": "tests", "kept": false, "role": "scratch"}"#;
+const FIXTURE_MARKER_LIMIT: u64 = 1024;
 
-static HELD: std::sync::OnceLock<File> = std::sync::OnceLock::new();
+fn exact_marker(directory: &Path, expected: &str) -> bool {
+    let path = directory.join("owner.json");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {},
+        Ok(_) | Err(_) => return false,
+    }
+    let mut text = String::new();
+    match File::open(path)
+        .and_then(|file| file.take(FIXTURE_MARKER_LIMIT).read_to_string(&mut text))
+    {
+        Ok(_) => text == expected,
+        Err(_) => false,
+    }
+}
+
+fn fixture_lease(directory: &Path) -> Option<File> {
+    let path = directory.join("owner.lock");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {},
+        Ok(_) | Err(_) => return None,
+    }
+    let lock = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(lock) => lock,
+        Err(_) => return None,
+    };
+    if lock.try_lock().is_err() {
+        return None;
+    }
+    Some(lock)
+}
+
+fn tidy_fixtures(base: &Path) -> std::io::Result<()> {
+    let parent_lease = match fs::symlink_metadata(base.join("owner.json")) {
+        Ok(_) if exact_marker(base, SCRATCH_OWNER) => match fixture_lease(base) {
+            Some(lease) => Some(lease),
+            None => return Ok(()),
+        },
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    for entry in fs::read_dir(base)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir()
+            || !entry.file_name().as_encoded_bytes().starts_with(b".run-")
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !exact_marker(&path, SCRATCH_OWNER) {
+            continue;
+        }
+        let Some(lease) = fixture_lease(&path) else {
+            continue;
+        };
+        if !exact_marker(&path, SCRATCH_OWNER) {
+            continue;
+        }
+        let staged = tempfile::Builder::new().prefix(".reap-").tempdir_in(base)?;
+        match fs::rename(&path, staged.path().join("run")) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error),
+        }
+        drop(lease);
+        drop(staged);
+    }
+    drop(parent_lease);
+    Ok(())
+}
+
+static HELD: OnceLock<Mutex<Weak<FixtureOwner>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct FixtureOwner {
+    root: tempfile::TempDir,
+    lock: Option<File>,
+}
+
+impl FixtureOwner {
+    fn new() -> Self {
+        let base = scratch_root();
+        fs::create_dir_all(&base).expect("the tests' scratch directory");
+        tidy_fixtures(&base).expect("released fixture runs can be reclaimed");
+        let root = tempfile::Builder::new()
+            .prefix(".run-")
+            .tempdir_in(base)
+            .expect("a private fixture owner");
+        let lock = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(root.path().join("owner.lock"))
+            .expect("the tests' owner lock");
+        lock.lock_shared().expect("the tests' owner lease");
+        fs::write(root.path().join("owner.json"), SCRATCH_OWNER)
+            .expect("the released fixture marker");
+        Self {
+            root,
+            lock: Some(lock),
+        }
+    }
+}
+
+impl Drop for FixtureOwner {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+    }
+}
+
+fn scratch_root() -> PathBuf {
+    std::env::current_dir()
+        .expect("a current directory")
+        .join(SCRATCH)
+}
+
+fn fixture_owner() -> Arc<FixtureOwner> {
+    let mut weak = HELD
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("the fixture owner registry");
+    if let Some(owner) = weak.upgrade() {
+        return owner;
+    }
+    let owner = Arc::new(FixtureOwner::new());
+    *weak = Arc::downgrade(&owner);
+    owner
+}
 
 #[must_use]
 pub fn ceiling() -> PathBuf {
-    let scratch = std::env::current_dir()
-        .expect("a current directory")
-        .join(SCRATCH);
-    let _held = HELD.get_or_init(|| {
-        fs::create_dir_all(&scratch).expect("the tests' scratch directory");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(scratch.join("owner.lock"))
-            .expect("the tests' owner lock");
-        lock.lock_shared()
-            .expect("a share of the tests' owner lock");
-        let marker = scratch.join("owner.json");
-        if fs::symlink_metadata(&marker).is_err() {
-            let staged = scratch.join(format!("owner.json.{}", std::process::id()));
-            fs::write(&staged, SCRATCH_OWNER).expect("the tests' owner marker");
-            fs::rename(&staged, &marker).expect("the tests' owner marker in place");
-        }
-        lock
-    });
-    scratch
+    let weak = HELD
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("the fixture owner registry");
+    match weak.upgrade() {
+        Some(owner) => owner.root.path().to_path_buf(),
+        None => scratch_root(),
+    }
 }
 
 pub fn tempdir(prefix: &str) -> Scratch {
-    Scratch(Some(
-        tempfile::Builder::new()
-            .prefix(&format!(".storage-scout-{prefix}-"))
-            .tempdir_in(ceiling())
-            .expect("a temporary directory inside the repository"),
-    ))
+    let owner = fixture_owner();
+    Scratch {
+        directory: Some(
+            tempfile::Builder::new()
+                .prefix(&format!(".storage-scout-{prefix}-"))
+                .tempdir_in(owner.root.path())
+                .expect("a temporary directory inside the repository"),
+        ),
+        _owner: owner,
+    }
 }
 
 fn locate(path: &Path) -> Location {
@@ -202,7 +329,11 @@ pub fn write_patterned(path: &Path, size: u64, seed: u8) {
     }
     let size = usize::try_from(size).expect("a fixture small enough to hold in memory");
     let bytes = (0..size)
-        .map(|index| u8::try_from(index.wrapping_rem(251)).expect("a remainder below 251") ^ seed)
+        .map(|index| {
+            u8::try_from(index.wrapping_rem(constants::PATTERN_PERIOD))
+                .expect("a remainder within the byte pattern's period")
+                ^ seed
+        })
         .collect::<Vec<_>>();
     fs::write(path, bytes).expect("a patterned file");
 }
@@ -223,6 +354,13 @@ pub fn write_cargo_project(project: &Path, payload: u64) -> PathBuf {
     let target = project.join("target");
     write_sized(&target.join("debug/app"), payload);
     target
+}
+
+pub fn write_orphaned_worktree(root: &Path) {
+    write_bytes(
+        &root.join(".git"),
+        b"gitdir: .missing-git/worktrees/released\n",
+    );
 }
 
 #[derive(Debug)]
@@ -278,6 +416,34 @@ fn report_decline(notice: Option<&OsStr>, why: &str) {
 pub fn decline(why: &str) {
     let notice = std::env::var_os("RUST_MUTANTS_DECLINE_NOTICE");
     report_decline(notice.as_deref(), why);
+}
+
+#[must_use]
+pub const fn native_checkout_events() -> bool {
+    cfg!(any(target_os = "macos", target_os = "linux"))
+}
+
+#[derive(Debug)]
+pub struct IdleLocalClient {
+    #[cfg(unix)]
+    _stream: std::os::unix::net::UnixStream,
+}
+
+#[cfg(unix)]
+pub fn idle_local_client(endpoint: &Path) -> std::io::Result<IdleLocalClient> {
+    let current = std::env::current_dir()?;
+    let path = match endpoint.strip_prefix(current) {
+        Ok(relative) => relative,
+        Err(_) => endpoint,
+    };
+    Ok(IdleLocalClient {
+        _stream: std::os::unix::net::UnixStream::connect(path)?,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn idle_local_client(_endpoint: &Path) -> std::io::Result<IdleLocalClient> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 #[must_use]
@@ -432,7 +598,7 @@ pub fn executable(path: &Path) -> Built {
             Ok(metadata) => metadata.permissions(),
             Err(error) => return Built::Unavailable(error.to_string()),
         };
-        permissions.set_mode(0o755);
+        permissions.set_mode(constants::EXECUTABLE_MODE);
         match fs::set_permissions(path, permissions) {
             Ok(()) => Built::Yes(path.to_path_buf()),
             Err(error) => Built::Unavailable(error.to_string()),
@@ -483,7 +649,7 @@ pub fn restrict(path: &Path, mode: u32) -> Option<Restricted> {
     {
         use std::os::unix::fs::PermissionsExt;
         let original = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata.permissions().mode() & 0o7777,
+            Ok(metadata) => metadata.permissions().mode() & constants::FILE_MODE_MASK,
             Err(error) => return skipped(error.to_string()),
         };
         if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
@@ -493,7 +659,7 @@ pub fn restrict(path: &Path, mode: u32) -> Option<Restricted> {
             path: path.to_path_buf(),
             mode: original,
         };
-        let honoured = if mode & 0o400 == 0 {
+        let honoured = if mode & constants::OWNER_READ_PERMISSION == 0 {
             if path.is_dir() {
                 fs::read_dir(path).is_err()
             } else {
@@ -557,7 +723,11 @@ pub fn occupied_bytes(path: &Path) -> Option<u64> {
     {
         use std::os::unix::fs::MetadataExt;
         match fs::symlink_metadata(path) {
-            Ok(metadata) => Some(metadata.blocks().saturating_mul(512)),
+            Ok(metadata) => Some(
+                metadata
+                    .blocks()
+                    .saturating_mul(constants::FILE_BLOCK_BYTES),
+            ),
             Err(_unreadable) => None,
         }
     }
@@ -655,14 +825,14 @@ pub fn release_abandoned_mounts() {
         let mut reclaimed = 0usize;
         for line in images.lines() {
             if let Some(path) = line.strip_prefix("image-path") {
-                ram = path.contains("ram://");
+                ram = path.contains(constants::RAM_IMAGE_PREFIX);
                 continue;
             }
             let Some(device) = line.split_whitespace().next() else {
                 continue;
             };
             if ram
-                && device.starts_with("/dev/disk")
+                && device.starts_with(constants::MACOS_DISK_PREFIX)
                 && !mounted.contains(device)
                 && reclaimed < RECLAIM_LIMIT
             {
@@ -696,9 +866,12 @@ pub fn scratch_mount(parent: &Path, name: &str) -> Result<Mount, String> {
     fs::create_dir_all(&point).map_err(|error| error.to_string())?;
     let shown = point.display().to_string();
     if cfg!(target_os = "macos") {
-        let device = run("hdiutil", &["attach", "-nomount", "ram://32768"])?
-            .trim()
-            .to_owned();
+        let device = run(
+            "hdiutil",
+            &["attach", "-nomount", constants::RAM_IMAGE_SOURCE],
+        )?
+        .trim()
+        .to_owned();
         if device.is_empty() {
             return Err("hdiutil reported no device".to_owned());
         }
@@ -849,7 +1022,7 @@ impl Git {
 }
 
 const COMMAND_LEN: usize = 24;
-const SYMBOLS_AT: usize = 32 + COMMAND_LEN;
+const SYMBOLS_AT: usize = constants::MACHO_HEADER_LEN + COMMAND_LEN;
 
 fn little(value: usize) -> [u8; 4] {
     u32::try_from(value)
@@ -861,7 +1034,11 @@ pub fn write_macho_image(path: &Path, objects: &[&str]) {
     let mut strings = vec![b' ', 0];
     let mut symbols = Vec::new();
     for object in objects.iter().copied().chain(["_main"]) {
-        let kind: u8 = if object == "_main" { 0x0f } else { 0x66 };
+        let kind = if object == "_main" {
+            constants::MACHO_EXTERNAL_SECTION
+        } else {
+            constants::MACHO_DEBUG_OBJECT
+        };
         symbols.extend_from_slice(&little(strings.len()));
         symbols.extend_from_slice(&[kind, 0, 0, 0]);
         symbols.extend_from_slice(&0u64.to_le_bytes());
@@ -873,12 +1050,25 @@ pub fn write_macho_image(path: &Path, objects: &[&str]) {
         .expect("a small symbol table");
     let count = objects.len().checked_add(1).expect("a small symbol table");
     let mut bytes = Vec::new();
-    for field in [0xfeed_facf_u32, 0x0100_000c, 0, 2, 1] {
+    for field in [
+        constants::MACHO_MAGIC_64,
+        constants::MACHO_CPU_ARM64,
+        0,
+        constants::MACHO_EXECUTE,
+        1,
+    ] {
         bytes.extend_from_slice(&field.to_le_bytes());
     }
     bytes.extend_from_slice(&little(COMMAND_LEN));
-    bytes.extend_from_slice(&[0; 8]);
-    for field in [2, COMMAND_LEN, SYMBOLS_AT, count, strings_at, strings.len()] {
+    bytes.extend_from_slice(&[0; constants::MACHO_FLAGS_AND_RESERVED_LEN]);
+    for field in [
+        constants::MACHO_SYMTAB,
+        COMMAND_LEN,
+        SYMBOLS_AT,
+        count,
+        strings_at,
+        strings.len(),
+    ] {
         bytes.extend_from_slice(&little(field));
     }
     bytes.extend_from_slice(&symbols);
@@ -945,6 +1135,50 @@ pub fn hold_session_lock(path: &Path) -> Option<Holder> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixture_maintenance_reclaims_only_exact_released_runs_with_free_locks() {
+        let temp = tempdir("fixture-maintenance");
+        let base = temp.path();
+        let kept_marker = SCRATCH_OWNER.replace("\"kept\": false", "\"kept\": true");
+        fs::write(base.join("owner.json"), &kept_marker).expect("a person kept the fixture scope");
+        write_sized(&base.join("owner.lock"), 0);
+        let abandoned = base.join(".run-abandoned");
+        let active = base.join(".run-active");
+        let kept = base.join(".run-kept");
+        for root in [&abandoned, &active, &kept] {
+            make_dir(root);
+            fs::write(root.join("owner.json"), SCRATCH_OWNER).expect("a fixture marker");
+            write_sized(&root.join("owner.lock"), 0);
+        }
+        fs::write(kept.join("owner.json"), &kept_marker).expect("a kept fixture");
+        let held = File::open(active.join("owner.lock")).expect("the active fixture lock");
+        held.lock_shared().expect("a live fixture");
+        tidy_fixtures(base).expect("fixture maintenance");
+        assert_present(&abandoned);
+        assert_present(base.join("owner.json"));
+        fs::remove_file(base.join("owner.json"))
+            .expect("the person explicitly releases the fixture scope");
+        tidy_fixtures(base).expect("released fixture maintenance");
+        assert_absent(base.join("owner.json"));
+        assert_absent(abandoned);
+        assert_present(active);
+        assert_present(kept);
+        drop(held);
+    }
+
+    #[test]
+    fn fixture_owners_use_a_live_lock_and_remove_their_marker_on_drop() {
+        let owner = FixtureOwner::new();
+        let root = owner.root.path().to_path_buf();
+        let text = fs::read_to_string(root.join("owner.json")).expect("the fixture marker");
+        assert!(text.contains("\"kept\": false"));
+        let lock = File::open(root.join("owner.lock")).expect("the fixture lock");
+        assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+        drop(lock);
+        drop(owner);
+        assert_absent(root);
+    }
 
     #[test]
     fn a_decline_notice_names_the_test_and_only_the_stable_reason() {

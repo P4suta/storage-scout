@@ -45,6 +45,18 @@ impl AutoPolicy {
     pub fn parse(text: &str) -> Result<Self, PolicyError> {
         ingress::policy(text)
     }
+
+    pub fn user_defaults() -> Result<Self, crate::HostError> {
+        Ok(Self {
+            selection: Selection {
+                roots: crate::host::default_roots()?,
+                kinds: Vec::new(),
+                excludes: Vec::new(),
+                tiers: TierGrant::ROUTINE,
+            },
+            log_file: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,6 +90,9 @@ impl AutoRun {
 }
 
 fn sight(scout: &Scout, selection: &Selection) -> Result<Vec<Found>, Rejection> {
+    if selection.roots.is_empty() {
+        return Ok(Vec::new());
+    }
     let report = scout.sight(&selection.options())?;
     Ok(report
         .candidates
@@ -91,7 +106,7 @@ pub(crate) fn lets_go(scout: &Scout, found: &Found) -> bool {
 }
 
 pub(crate) fn confirmed(scout: &Scout, root: &Path) -> bool {
-    let Ok(survey) = busy::survey(root) else {
+    let Ok(survey) = scout.owners().survey(root) else {
         return false;
     };
     matches!(busy::held(&survey.locks), busy::Holding::Free)
@@ -167,7 +182,7 @@ pub(crate) fn run(scout: &Scout, policy: &AutoPolicy, mode: Mode) -> Result<Auto
         scout.owners(),
         mode,
     );
-    let shared = dedupe::run(&remaining, &excludes, scout.protection(), mode);
+    let shared = dedupe::run(&remaining, &excludes, scout.dedupe_access(), mode);
     Ok(AutoRun {
         schema_version: SCHEMA_VERSION,
         command: "auto",

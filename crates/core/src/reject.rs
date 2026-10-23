@@ -157,6 +157,8 @@ pub enum Rejection {
     NotADirectory { location: Location },
     #[error("symlink or reparse point at {location}")]
     Link { location: Location },
+    #[error("contains a source checkout at {location}; clean its build outputs separately")]
+    SourceCheckout { location: Location },
     #[error("filesystem boundary crossed at {location} (device {from:#x} -> {to:#x})")]
     MountBoundary {
         location: Location,
@@ -233,6 +235,7 @@ impl Rejection {
             Self::NoRoots => "no-roots",
             Self::NotADirectory { .. } => "not-a-directory",
             Self::Link { .. } => "link",
+            Self::SourceCheckout { .. } => "source-checkout",
             Self::MountBoundary { .. } => "mount-boundary",
             Self::Unnameable { .. } => "unnameable",
             Self::Stale { .. } => "stale",
@@ -260,6 +263,7 @@ impl Rejection {
             | Self::TierLocked { location, .. }
             | Self::NotADirectory { location }
             | Self::Link { location }
+            | Self::SourceCheckout { location }
             | Self::MountBoundary { location, .. }
             | Self::Stale { location, .. }
             | Self::EvidenceLost { location }

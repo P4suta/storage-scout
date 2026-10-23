@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
@@ -10,11 +10,11 @@ use rayon::prelude::*;
 use serde::{Serialize, Serializer};
 use storage_scout_core::area::{Area, Protection, SystemReason};
 use storage_scout_core::artifact::{Entries, Listing};
-use storage_scout_core::candidate::{Candidate, Measurement, Observed, Usage};
+use storage_scout_core::candidate::{Allocation, Candidate, Measurement, Observed, Usage};
 use storage_scout_core::gate::{self, Admission, Boundary, Shape, Site};
 use storage_scout_core::location::Location;
 use storage_scout_core::reject::{FsOp, Rejection};
-use storage_scout_core::size::Bytes;
+use storage_scout_core::size::{Bytes, Reconciliation};
 
 use crate::measure::{Measure, Tally};
 use crate::owners::Owners;
@@ -110,10 +110,29 @@ pub struct ScanReport {
     pub roots: Vec<Location>,
     pub listing_limit: usize,
     pub usage: Usage,
+    pub volumes: Vec<VolumeUsage>,
+    pub tool_caches: Vec<CacheUsage>,
     pub stats: ScanStats,
     pub largest_directories: Vec<DirectoryUsage>,
     pub candidates: Vec<Found>,
     pub issues: Vec<Rejection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VolumeUsage {
+    pub volume: u64,
+    pub location: Location,
+    pub capacity: Bytes,
+    pub available: Bytes,
+    pub reconciliation: Reconciliation,
+    pub failures: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheUsage {
+    pub tool: &'static str,
+    pub location: Location,
+    pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +169,8 @@ struct Collector<'a> {
     links_skipped: AtomicU64,
     mount_boundaries_skipped: AtomicU64,
     errors: AtomicU64,
+    cache_roots: BTreeMap<PathBuf, &'static str>,
+    caches: Mutex<Vec<CacheUsage>>,
 }
 
 impl Collector<'_> {
@@ -171,8 +192,10 @@ impl Collector<'_> {
 
 struct Contents {
     files: Vec<(PathBuf, Metadata)>,
+    links: Vec<(PathBuf, Metadata)>,
     directories: Vec<(PathBuf, Metadata)>,
     names: Entries,
+    failures: u64,
 }
 
 pub(crate) fn excludes(paths: &[PathBuf]) -> Vec<Location> {
@@ -225,7 +248,6 @@ fn sighting(
 ) -> Sighting {
     let sighting = ScanOptions {
         measure: Measure::Logical,
-        min_size: Bytes::ZERO,
         ..options.clone()
     };
     let (report, mut walked) =
@@ -235,7 +257,7 @@ fn sighting(
 }
 
 pub(crate) fn measured(found: &Found, protection: &Protection) -> Result<Found, Rejection> {
-    let measurement = crate::measure::strictly(&found.path)?;
+    let measurement = crate::measure::strictly(&found.path, found.candidate().kind())?;
     Ok(Found {
         path: found.path.clone(),
         candidate: found.candidate.measured(&measurement, protection.case()),
@@ -248,6 +270,11 @@ fn collect(
     owners: &Owners,
     (descent, only): (Descent, Option<&OsStr>),
 ) -> (ScanReport, Vec<PathBuf>) {
+    tracing::debug!(
+        event = "discovery",
+        roots = options.roots.len(),
+        "discovering roots"
+    );
     let collector = Collector {
         options,
         descent,
@@ -264,13 +291,15 @@ fn collect(
         links_skipped: AtomicU64::new(0),
         mount_boundaries_skipped: AtomicU64::new(0),
         errors: AtomicU64::new(0),
+        cache_roots: host::tool_caches(),
+        caches: Mutex::new(Vec::new()),
     };
     let roots = roots(options, &collector);
     let walk_all = || {
         roots
             .par_iter()
-            .map(|(path, _)| enter(path, &collector))
-            .reduce(|| Tally::empty(options.measure), Tally::merge)
+            .map(|(path, location)| (path, location, enter(path, &collector)))
+            .collect::<Vec<_>>()
     };
     let pool = options.threads.and_then(|threads| {
         match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
@@ -278,10 +307,11 @@ fn collect(
             Err(_unbuildable) => None,
         }
     });
-    let total = match pool {
+    let walked = match pool {
         Some(pool) => pool.install(walk_all),
         None => walk_all(),
     };
+    let (total, volumes) = volumes(walked, &collector);
 
     let mut largest = drain(collector.directories);
     largest.sort_by(|left, right| {
@@ -304,23 +334,80 @@ fn collect(
     let mut seen = BTreeSet::new();
     candidates.retain(|found| seen.insert(found.candidate.location().key(protection.case())));
 
+    let errors = collector.errors.load(Ordering::Relaxed);
+    let mut tool_caches = drain(collector.caches);
+    tool_caches.sort_by(|left, right| left.location.cmp(&right.location));
+    let mut usage = total.usage();
+    usage.failures = usage.failures.max(errors);
     let report = ScanReport {
         schema_version: SCHEMA_VERSION,
         roots: roots.into_iter().map(|(_, location)| location).collect(),
         listing_limit: options.top,
-        usage: total.usage(),
+        usage,
+        volumes,
+        tool_caches,
         stats: ScanStats {
             directories: collector.directory_count.load(Ordering::Relaxed),
             files: collector.files.load(Ordering::Relaxed),
             links_skipped: collector.links_skipped.load(Ordering::Relaxed),
             mount_boundaries_skipped: collector.mount_boundaries_skipped.load(Ordering::Relaxed),
-            errors: collector.errors.load(Ordering::Relaxed),
+            errors,
         },
         largest_directories: largest,
         candidates,
         issues: drain(collector.issues),
     };
     (report, drain(collector.walked))
+}
+
+fn volumes(
+    walked: Vec<(&PathBuf, &Location, Tally)>,
+    collector: &Collector<'_>,
+) -> (Tally, Vec<VolumeUsage>) {
+    let mut total = Tally::empty(collector.options.measure);
+    let mut measured: BTreeMap<u64, (Location, platform::VolumeSpace, Tally)> = BTreeMap::new();
+    for (path, location, tally) in walked {
+        total = total.merge(tally.clone());
+        let sample = platform::identity(path).and_then(|identity| {
+            platform::volume_space(path).map(|space| (identity.volume, space))
+        });
+        match sample {
+            Ok((volume, space)) => {
+                let entry = measured.entry(volume).or_insert_with(|| {
+                    (
+                        location.clone(),
+                        space,
+                        Tally::empty(collector.options.measure),
+                    )
+                });
+                entry.2 = std::mem::replace(&mut entry.2, Tally::empty(collector.options.measure))
+                    .merge(tally);
+            },
+            Err(error) => collector.issue(failure::io(path, FsOp::AllocationInfo, &error)),
+        }
+    }
+    let reports = measured
+        .into_iter()
+        .map(|(volume, (location, space, tally))| {
+            let usage = tally.usage();
+            let allocated = match usage.allocation {
+                Allocation::Measured { allocated, .. } => allocated,
+                Allocation::Unmeasured => Bytes::ZERO,
+            };
+            VolumeUsage {
+                volume,
+                location,
+                capacity: Bytes::new(space.total),
+                available: Bytes::new(space.available),
+                reconciliation: Reconciliation::new(
+                    Bytes::new(space.total.saturating_sub(space.free)),
+                    allocated,
+                ),
+                failures: usage.failures,
+            }
+        })
+        .collect();
+    (total, reports)
 }
 
 fn drain<T>(values: Mutex<Vec<T>>) -> Vec<T> {
@@ -411,7 +498,7 @@ fn enter(root: &Path, collector: &Collector<'_>) -> Tally {
         Ok(metadata) => walk(root, &metadata, 0, Region::Root, collector),
         Err(error) => {
             collector.issue(failure::io(root, FsOp::Inspect, &error));
-            Tally::empty(collector.options.measure)
+            Tally::failed(collector.options.measure)
         },
     }
 }
@@ -478,7 +565,7 @@ fn walk(
         Ok(location) => location,
         Err(rejection) => {
             collector.issue(rejection);
-            return Tally::empty(collector.options.measure);
+            return Tally::failed(collector.options.measure);
         },
     };
     if collector.excluded(&location)
@@ -488,7 +575,7 @@ fn walk(
         return Tally::empty(collector.options.measure);
     }
     let Some(contents) = read(directory, metadata, collector) else {
-        return Tally::empty(collector.options.measure);
+        return Tally::failed(collector.options.measure);
     };
     collector.directory_count.fetch_add(1, Ordering::Relaxed);
 
@@ -523,7 +610,9 @@ fn walk(
 
     let mut tally = match collector.descent {
         Descent::Measure => {
-            let mut tally = files(&contents.files, collector);
+            let mut tally =
+                files(&contents.files, collector).merge(links(&contents.links, collector));
+            tally.missing(contents.failures);
             if contents.names.has_file(crate::owners::MARKER_NAME) {
                 tally.marker(directory);
             }
@@ -559,6 +648,7 @@ fn walk(
         .reduce(|| Tally::empty(collector.options.measure), Tally::merge);
     tally = tally.merge(children);
 
+    cache_usage(directory, &location, &tally, collector);
     if let Some(admission) = admission {
         record(directory, admission, &tally, collector);
     } else if !inside
@@ -576,6 +666,19 @@ fn walk(
     tally
 }
 
+fn cache_usage(directory: &Path, location: &Location, tally: &Tally, collector: &Collector<'_>) {
+    if collector.descent == Descent::Measure
+        && let Some(tool) = collector.cache_roots.get(directory)
+        && let Ok(mut caches) = collector.caches.lock()
+    {
+        caches.push(CacheUsage {
+            tool,
+            location: location.clone(),
+            usage: tally.usage(),
+        });
+    }
+}
+
 fn read(directory: &Path, metadata: &Metadata, collector: &Collector<'_>) -> Option<Contents> {
     let reader = match fs::read_dir(directory) {
         Ok(reader) => reader,
@@ -586,13 +689,18 @@ fn read(directory: &Path, metadata: &Metadata, collector: &Collector<'_>) -> Opt
     };
     let mut contents = Contents {
         files: Vec::new(),
+        links: Vec::new(),
         directories: Vec::new(),
         names: Entries::default(),
+        failures: 0,
     };
     for entry in reader {
         match entry {
             Ok(entry) => admit_entry(&entry, metadata, &mut contents, collector),
-            Err(error) => collector.issue(failure::io(directory, FsOp::ReadEntry, &error)),
+            Err(error) => {
+                collector.issue(failure::io(directory, FsOp::ReadEntry, &error));
+                contents.failures = contents.failures.saturating_add(1);
+            },
         }
     }
     Some(contents)
@@ -616,6 +724,7 @@ fn admit_entry(
         Ok(child) => child,
         Err(error) => {
             collector.issue(failure::io(&path, FsOp::Metadata, &error));
+            contents.failures = contents.failures.saturating_add(1);
             return;
         },
     };
@@ -623,6 +732,7 @@ fn admit_entry(
     match platform::shape(&child) {
         Shape::Link => {
             collector.links_skipped.fetch_add(1, Ordering::Relaxed);
+            contents.links.push((path, child));
         },
         Shape::Directory => {
             if let (Some(from), Some(to)) = (platform::device(metadata), platform::device(&child))
@@ -642,6 +752,17 @@ fn admit_entry(
         },
         Shape::Other => {},
     }
+}
+
+fn links(links: &[(PathBuf, Metadata)], collector: &Collector<'_>) -> Tally {
+    let mut tally = Tally::empty(collector.options.measure);
+    for (path, metadata) in links {
+        if let Err(rejection) = tally.link(path, metadata) {
+            tally.unmeasurable();
+            collector.issue(rejection);
+        }
+    }
+    tally
 }
 
 fn files(files: &[(PathBuf, Metadata)], collector: &Collector<'_>) -> Tally {
@@ -727,6 +848,24 @@ fn record(directory: &Path, admission: Admission, tally: &Tally, collector: &Col
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sighting_ignores_size_filters_and_leaves_allocation_unmeasured() {
+        let temp = testkit::tempdir("sighting-measure");
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let _target = testkit::write_cargo_project(&root.join("project"), 1);
+        let mut options = ScanOptions::new(vec![root]);
+        options.measure = Measure::Allocated;
+        options.min_size = Bytes::new(u64::MAX);
+        let result = sight(
+            &options,
+            &testkit::open_protection(),
+            &Owners::default(),
+            Reach::Everything,
+        );
+        assert_eq!(result.report.candidates.len(), 1);
+        assert_eq!(result.report.usage.allocation, Allocation::Unmeasured);
+    }
 
     #[test]
     fn a_file_is_not_accepted_as_a_scan_root() {

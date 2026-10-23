@@ -6,6 +6,7 @@ storage-scout <VERSION> — read-only scan
 Roots: <PATH>
 Total logical size: 96.1 KiB
 Total allocation: unmeasured
+Volume <PATH> used 1.0 MiB, attributed 0 B, unattributed 1.0 MiB, overcount 0 B
 Scanned 5 directories and 4 files (0 links, 0 filesystem boundaries skipped, 0 errors)
 
 Largest directories:

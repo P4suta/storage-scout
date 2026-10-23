@@ -8,10 +8,26 @@ use crate::location::Location;
 #[serde(rename_all = "kebab-case")]
 pub enum Protocol {
     Cargo,
+    SwiftPackage,
+    Gleam,
     TempOwner,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Optional,
+    Required,
+}
+
 impl Protocol {
+    #[must_use]
+    pub const fn presence(self) -> Presence {
+        match self {
+            Self::Cargo | Self::Gleam => Presence::Optional,
+            Self::TempOwner | Self::SwiftPackage => Presence::Required,
+        }
+    }
+
     pub const CARGO_NAMES: [&'static str; 3] =
         [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
     pub const TEMP_OWNER_NAME: &'static str = "owner.lock";
@@ -20,6 +36,8 @@ impl Protocol {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Cargo => "cargo",
+            Self::SwiftPackage => "swiftpm",
+            Self::Gleam => "gleam",
             Self::TempOwner => "owner.lock",
         }
     }
@@ -33,6 +51,18 @@ impl Protocol {
             Some(Self::Cargo)
         } else if name == Self::TEMP_OWNER_NAME.as_bytes() {
             Some(Self::TempOwner)
+        } else if [
+            b"gleam.lock".as_slice(),
+            b"gleam-dev-erlang.lock",
+            b"gleam-dev-javascript.lock",
+            b"gleam-prod-erlang.lock",
+            b"gleam-prod-javascript.lock",
+            b"gleam-lsp-erlang.lock",
+            b"gleam-lsp-javascript.lock",
+        ]
+        .contains(&name)
+        {
+            Some(Self::Gleam)
         } else {
             None
         }
@@ -42,7 +72,7 @@ impl Protocol {
 impl fmt::Display for Protocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Cargo => "a running build",
+            Self::Cargo | Self::SwiftPackage | Self::Gleam => "a running build",
             Self::TempOwner => "its owner",
         })
     }

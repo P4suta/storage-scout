@@ -20,6 +20,15 @@ pub fn rules(platform: Platform, host: &Host) -> Result<Vec<Rule>, LocationError
     }
 }
 
+const MAC_USER_TEMP_LABEL: &str = "/var/folders";
+const MAC_USER_TEMP_ROOT: &str = "/private/var/folders";
+const MAC_TEMP_ROOT: &str = "/private/tmp";
+const MAC_VAR_TEMP_ROOT: &str = "/private/var/tmp";
+const UNIX_USERS_ROOT: &str = "/home";
+const UNIX_VAR_TEMP_ROOT: &str = "/var/tmp";
+const UNIX_TEMP_ROOT: &str = "/tmp";
+const UNIX_ROOT_PROFILE: &str = "/root";
+
 fn unix(path: &str) -> Result<Location, LocationError> {
     Location::parse_str(Syntax::Unix, path)
 }
@@ -43,18 +52,18 @@ fn macos(host: &Host) -> Result<Vec<Rule>, LocationError> {
         rules.push(Rule::app_owned("$TMPDIR", temp.clone(), Reach::Subtree));
     }
     rules.push(Rule::app_owned(
-        "/var/folders",
-        unix("/private/var/folders")?,
+        MAC_USER_TEMP_LABEL,
+        unix(MAC_USER_TEMP_ROOT)?,
         Reach::Subtree,
     ));
     rules.push(Rule::app_owned(
-        "/tmp",
-        unix("/private/tmp")?,
+        UNIX_TEMP_ROOT,
+        unix(MAC_TEMP_ROOT)?,
         Reach::Subtree,
     ));
     rules.push(Rule::app_owned(
-        "/var/tmp",
-        unix("/private/var/tmp")?,
+        UNIX_VAR_TEMP_ROOT,
+        unix(MAC_VAR_TEMP_ROOT)?,
         Reach::Subtree,
     ));
     if let Some(home) = &host.home {
@@ -129,17 +138,17 @@ fn linux(host: &Host) -> Result<Vec<Rule>, LocationError> {
     }
     rules.push(Rule::app_owned(
         "~/.cache",
-        unix("/home")?,
+        unix(UNIX_USERS_ROOT)?,
         Reach::EachChildSubtree(".cache"),
     ));
     rules.push(Rule::app_owned(
-        "/var/tmp",
-        unix("/var/tmp")?,
+        UNIX_VAR_TEMP_ROOT,
+        unix(UNIX_VAR_TEMP_ROOT)?,
         Reach::Subtree,
     ));
     let temp = match &host.temp {
         Some(temp) => temp.clone(),
-        None => unix("/tmp")?,
+        None => unix(UNIX_TEMP_ROOT)?,
     };
     rules.push(Rule::app_owned("$TMPDIR", temp, Reach::Subtree));
     for path in SYSTEM {
@@ -151,17 +160,17 @@ fn linux(host: &Host) -> Result<Vec<Rule>, LocationError> {
     }
     rules.push(Rule::system(
         SystemReason::UsersRoot,
-        unix("/home")?,
+        unix(UNIX_USERS_ROOT)?,
         Reach::Exact,
     ));
     rules.push(Rule::system(
         SystemReason::ProfileRoot,
-        unix("/home")?,
+        unix(UNIX_USERS_ROOT)?,
         Reach::EachChild,
     ));
     rules.push(Rule::system(
         SystemReason::ProfileRoot,
-        unix("/root")?,
+        unix(UNIX_ROOT_PROFILE)?,
         Reach::Exact,
     ));
     if let Some(home) = &host.home {
@@ -263,7 +272,7 @@ mod tests {
             Platform::Linux,
             &Host {
                 home: Some(at(Syntax::Unix, "/home/me")),
-                temp: Some(at(Syntax::Unix, "/tmp")),
+                temp: Some(at(Syntax::Unix, UNIX_TEMP_ROOT)),
                 ..Host::default()
             },
         )
@@ -365,10 +374,10 @@ mod tests {
             "/var/lib",
             "/snap/core",
             "/srv/www",
-            "/home",
+            UNIX_USERS_ROOT,
             "/home/me",
             "/home/other",
-            "/root",
+            UNIX_ROOT_PROFILE,
         ] {
             assert_system(&gnu, path);
         }
@@ -439,7 +448,7 @@ mod tests {
             let host = match platform.syntax() {
                 Syntax::Unix => Host {
                     home: Some(at(Syntax::Unix, "/home/me")),
-                    temp: Some(at(Syntax::Unix, "/tmp")),
+                    temp: Some(at(Syntax::Unix, UNIX_TEMP_ROOT)),
                     ..Host::default()
                 },
                 Syntax::Windows => Host {

@@ -1,0 +1,227 @@
+name: Release verification
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-verification-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Native checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-26, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: mise@2026.10.17
+      - run: mise trust
+      - run: mise install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: mise run check
+      - run: mise run dependencies
+
+  sharing:
+    name: sharing on ${{ matrix.filesystem }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        filesystem: [btrfs, xfs]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: nextest@0.9.149
+      - name: Mount a volume that shares blocks
+        env:
+          FILESYSTEM: ${{ matrix.filesystem }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs xfsprogs
+          truncate -s 2G "$RUNNER_TEMP/volume.img"
+          case "$FILESYSTEM" in
+            btrfs) mkfs.btrfs -q "$RUNNER_TEMP/volume.img" ;;
+            xfs) mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/volume.img" ;;
+          esac
+          sudo mkdir -p /mnt/share
+          sudo mount -o loop "$RUNNER_TEMP/volume.img" /mnt/share
+          sudo chown "$(id -u):$(id -g)" /mnt/share
+          rsync -a --exclude target ./ /mnt/share/repo/
+      - name: Share identical files on it
+        working-directory: /mnt/share/repo
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          STORAGE_SCOUT_REQUIRE_SHARING: "1"
+        run: cargo nextest run --package storage-scout --test dedupe --profile ci
+
+  mutants:
+    name: Mutation shard ${{ matrix.shard }}/4
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: mise@2026.10.17
+      - run: mise trust
+      - run: mise install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: mise x -- cargo fetch --locked
+      - name: Prepare the sharing filesystem
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs
+          truncate -s 10G "$RUNNER_TEMP/volume.img"
+          mkfs.btrfs -q "$RUNNER_TEMP/volume.img"
+          sudo mkdir -p /mnt/share
+          sudo mount -o loop "$RUNNER_TEMP/volume.img" /mnt/share
+          sudo chown "$(id -u):$(id -g)" /mnt/share
+          mkdir /mnt/share/tmp
+          echo "STORAGE_SCOUT_MUTATION_TMPDIR=/mnt/share/tmp" >> "$GITHUB_ENV"
+          echo "STORAGE_SCOUT_REQUIRE_SHARING=1" >> "$GITHUB_ENV"
+      - name: Measure the complete shard
+        env:
+          MUTATION_SHARD: ${{ matrix.shard }}
+        run: mise run mutants -- --shard "$MUTATION_SHARD/4"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: mutation-report-${{ matrix.shard }}
+          path: target/mutation-reports/
+          retention-days: 7
+          if-no-files-found: error
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-llvm-cov@0.9.1,nextest@0.9.149
+      - run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: coverage
+          path: lcov.info
+          retention-days: 7
+
+  msrv:
+    name: minimum supported Rust
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: rustup toolchain install "$MSRV" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+$MSRV" check --workspace --all-targets
+
+  assurance:
+    name: implementation proofs and model replay
+    runs-on: ubuntu-26.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: mise@2026.10.17
+      - run: mise trust
+      - run: mise install
+      - run: mise run assure
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: assurance-evidence
+          path: |
+            target/assurance-*/kani.json
+            target/assurance-*/gate.json
+            target/assurance-*/probe.json
+            target/assurance-*/source.sha256
+            target/assurance-*/traces/*.itf.json
+          retention-days: 7
+          if-no-files-found: error
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write # permissions: Upload candidate analysis to code scanning.
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          config-file: ./.github/codeql/codeql-config.yml
+      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  release-verified:
+    name: Release verified
+    if: always()
+    needs: [quality, sharing, mutants, coverage, msrv, assurance, codeql]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require every candidate check
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: jq -e 'length > 0 and all(.[]; . == "success")' <<< "$RESULTS"

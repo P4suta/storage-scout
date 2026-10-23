@@ -1,0 +1,31 @@
+examine_globs = [
+  "crates/core/src/**/*.rs",
+  "crates/cli/src/apply.rs",
+  "crates/cli/src/apply/**/*.rs",
+  "crates/cli/src/busy.rs",
+  "crates/cli/src/measure.rs",
+  "crates/cli/src/ingress.rs",
+  "crates/cli/src/managed.rs",
+  "crates/cli/src/managed/**/*.rs",
+  "crates/cli/src/release.rs",
+  "crates/cli/src/observe.rs",
+  "crates/cli/src/observe/**/*.rs",
+  "crates/cli/src/owners.rs",
+  "crates/cli/src/coalesce.rs",
+  "crates/cli/src/dedupe.rs",
+  "crates/cli/src/dedupe/**/*.rs",
+  "crates/cli/src/prune.rs",
+  "crates/cli/src/prune/**/*.rs",
+  "crates/cli/src/scan.rs",
+  "crates/cli/src/watch.rs",
+  "crates/cli/src/platform/**/*.rs",
+]
+exclude_globs = ["**/proofs.rs"]
+exclude_re = ['\bproofs::']
+test_workspace = true
+additional_cargo_args = ["--locked"]
+additional_cargo_test_args = ["--all-targets"]
+cap_lints = false
+copy_target = false
+copy_vcs = false
+gitignore = true

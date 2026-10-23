@@ -294,8 +294,8 @@ const fn complete(coverage: Coverage) -> bool {
     }
 }
 
-fn surveyed(root: &Path) -> Option<busy::Survey> {
-    match busy::survey(root) {
+fn surveyed(root: &Path, owners: &owners::Owners) -> Option<busy::Survey> {
+    match owners.survey(root) {
         Ok(survey) => Some(survey),
         Err(_unreadable) => None,
     }
@@ -365,7 +365,7 @@ impl Session<'_> {
 
     fn adopt(&mut self, found: Found, state: Adopted) -> Result<(), WatchError> {
         let root = found.path().to_path_buf();
-        let survey = surveyed(&root);
+        let survey = surveyed(&root, self.scout.owners());
         self.follow(&watched(&root, survey.as_ref()))?;
         let whole = state == Adopted::Unprocessed;
         if whole {
@@ -418,7 +418,7 @@ impl Session<'_> {
                     .and_then(|pool| pool.stocks.remove(found.path()))
                     .is_some_and(|stock| {
                         self.pool
-                            .restore(found, stock, &self.excludes, self.scout.protection())
+                            .restore(found, stock, &self.excludes, self.scout.dedupe_access())
                     });
                 if !restored {
                     inventoried.push(found.clone());
@@ -447,14 +447,14 @@ impl Session<'_> {
             #[cfg(target_os = "macos")]
             fresh.extend(
                 self.pool
-                    .stock(found, &self.excludes, self.scout.protection()),
+                    .stock(found, &self.excludes, self.scout.dedupe_access()),
             );
             #[cfg(target_os = "macos")]
             fresh_roots.insert(found.path().to_path_buf());
             #[cfg(not(target_os = "macos"))]
             let _fresh = self
                 .pool
-                .stock(found, &self.excludes, self.scout.protection());
+                .stock(found, &self.excludes, self.scout.dedupe_access());
         }
         for found in remaining {
             self.adopt(found, Adopted::Processed)?;
@@ -473,7 +473,7 @@ impl Session<'_> {
         let shared = self.pool.share(
             &focus,
             &self.excludes,
-            self.scout.protection(),
+            self.scout.dedupe_access(),
             Mode::Execute,
         );
         self.record(&WatchRecord {
@@ -746,7 +746,7 @@ impl Session<'_> {
         };
         let fresh_survey = entry.whole || entry.resurvey || entry.survey.is_none();
         if fresh_survey {
-            entry.survey = surveyed(root);
+            entry.survey = surveyed(root, self.scout.owners());
             entry.resurvey = false;
         }
         let Some(survey) = entry.survey.clone() else {
@@ -806,7 +806,7 @@ impl Session<'_> {
         );
         let fresh = if whole {
             self.pool
-                .stock(&found, &self.excludes, self.scout.protection())
+                .stock(&found, &self.excludes, self.scout.dedupe_access())
         } else {
             self.pool.note(root, &changed)
         };
@@ -817,7 +817,7 @@ impl Session<'_> {
                 fresh: &fresh,
             },
             &self.excludes,
-            self.scout.protection(),
+            self.scout.dedupe_access(),
             Mode::Execute,
         );
         self.record(&WatchRecord {
@@ -1372,7 +1372,7 @@ mod tests {
         assert!(!is_directory(&file));
         assert!(!is_directory(&root.join("missing")));
         assert!(is_directory(&root));
-        assert!(refs(&root).is_empty());
+        assert_eq!(refs(&root), Vec::<PathBuf>::new());
 
         testkit::make_dir(&root.join(".git/refs/heads/nested"));
         testkit::make_dir(&root.join(".git/worktrees/one"));
@@ -1386,7 +1386,7 @@ mod tests {
                 root.join(".git/refs/heads/nested"),
             ])
         );
-        assert!(directory_tree(&file).is_empty());
+        assert_eq!(directory_tree(&file), Vec::<PathBuf>::new());
         assert_eq!(
             refs(&root).into_iter().collect::<BTreeSet<_>>(),
             BTreeSet::from([
@@ -1398,7 +1398,10 @@ mod tests {
                 root.join(".git/worktrees/one"),
             ])
         );
-        assert!(additional_watches(WatchDepth::Recursive, std::slice::from_ref(&root)).is_empty());
+        assert_eq!(
+            additional_watches(WatchDepth::Recursive, std::slice::from_ref(&root)),
+            Vec::<PathBuf>::new()
+        );
         assert_eq!(
             additional_watches(WatchDepth::Named, std::slice::from_ref(&root))
                 .into_iter()
@@ -1416,8 +1419,14 @@ mod tests {
         assert!(complete(Coverage::Complete));
         assert!(!complete(Coverage::Partial));
 
-        assert!(event_watches(WatchDepth::Recursive, Event::Appeared, &root).is_empty());
-        assert!(event_watches(WatchDepth::Named, Event::Written, &root).is_empty());
+        assert_eq!(
+            event_watches(WatchDepth::Recursive, Event::Appeared, &root),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            event_watches(WatchDepth::Named, Event::Written, &root),
+            Vec::<PathBuf>::new()
+        );
         assert_eq!(
             event_watches(WatchDepth::Named, Event::Appeared, &root)
                 .into_iter()
@@ -1432,7 +1441,8 @@ mod tests {
 
         let debug = profile(&root, "app");
         let target = debug.parent().unwrap();
-        let survey = surveyed(target).unwrap();
+        let owners = owners::Owners::new(vec![testkit::ceiling()]);
+        let survey = surveyed(target, &owners).unwrap();
         assert_eq!(
             super::watched(target, Some(&survey)),
             [

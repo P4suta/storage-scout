@@ -8,6 +8,13 @@ type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 pub(super) struct Source;
 
 impl Source {
+    pub(super) fn barrier(&self) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    pub(super) fn start_release(paths: &[PathBuf], deliver: Deliver) -> io::Result<Self> {
+        Self::start(paths, "", None, deliver)
+    }
+
     #[expect(
         clippy::unused_self,
         reason = "each directory is watched on its own here"

@@ -1,4 +1,12 @@
-include = ["*.toml", ".cargo/*.toml", ".config/*.toml", "crates/**/*.toml", "xtask/**/*.toml"]
+include = [
+  "*.toml",
+  ".cargo/*.toml",
+  ".config/*.toml",
+  "crates/**/*.toml",
+  "xtask/**/*.toml",
+  "tools/**/*.toml",
+  "fuzz/*.toml",
+]
 exclude = ["**/target/**", "reports/**", "**/.storage-scout-*/**"]
 
 [formatting]

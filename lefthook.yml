@@ -10,6 +10,8 @@ pre-commit:
       stage_fixed: true
     typos:
       run: typos {staged_files}
+    ocomment:
+      run: mise x -- ocomment check --config .ocomment.toml --format github .
     taplo:
       glob: "*.toml"
       run: taplo fmt {staged_files}
@@ -18,4 +20,4 @@ pre-commit:
 pre-push:
   commands:
     check:
-      run: mise run check
+      run: just check

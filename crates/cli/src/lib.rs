@@ -9,11 +9,13 @@ mod failure;
 pub mod hook;
 mod host;
 mod ingress;
+mod managed;
 mod measure;
 mod observe;
 mod owners;
 mod platform;
 mod prune;
+mod release;
 mod report;
 mod scan;
 mod store;
@@ -34,14 +36,20 @@ pub use crate::dedupe::{Admission, DedupeRun, PairOutcome, PairStatus, Subject, 
 pub use crate::doctor::{Diagnosis, PolicyFile, Warning};
 pub use crate::explain::Explanation;
 pub use crate::host::HostError;
+pub use crate::managed::{
+    ManagedCandidate, ManagedOutcome, ManagedReport, ManagedStatus, ManagedUsage, Provider,
+    managed_store,
+};
 pub use crate::measure::Measure;
 pub use crate::prune::{PruneAdmission, PruneFailure, PruneRun, PruneSubject, Removed};
+pub use crate::release::{CheckoutRelease, ReleaseReceipt};
 pub use crate::report::{
     Color, render_auto, render_clean, render_dedupe, render_doctor, render_explain, render_json,
     render_prune, render_scan, render_watch,
 };
 pub use crate::scan::{
-    DEFAULT_MIN_SIZE, DEFAULT_TOP, DirectoryUsage, Found, ScanOptions, ScanReport, ScanStats,
+    CacheUsage, DEFAULT_MIN_SIZE, DEFAULT_TOP, DirectoryUsage, Found, ScanOptions, ScanReport,
+    ScanStats, VolumeUsage,
 };
 pub use crate::watch::{Cause, WatchError, WatchRecord};
 
@@ -54,6 +62,16 @@ pub struct Scout {
 }
 
 impl Scout {
+    #[must_use]
+    pub fn state_directory(mut self, state: PathBuf) -> Self {
+        self.owners = self.owners.with_state(state);
+        self
+    }
+
+    pub fn release(&self, checkout: &Path) -> std::io::Result<CheckoutRelease> {
+        self.owners.release(checkout)
+    }
+
     pub fn detect() -> Result<Self, HostError> {
         host::detect().map(|protection| Self {
             protection,
@@ -201,9 +219,16 @@ impl Scout {
         Ok(dedupe::run(
             &report.candidates,
             &scan::excludes(excludes),
-            &self.protection,
+            self.dedupe_access(),
             mode,
         ))
+    }
+
+    pub(crate) const fn dedupe_access(&self) -> dedupe::Access<'_> {
+        dedupe::Access {
+            protection: &self.protection,
+            owners: &self.owners,
+        }
     }
 
     pub fn prune(
@@ -244,4 +269,8 @@ impl Scout {
 
 pub fn append_log(path: &Path, document: &impl serde::Serialize) -> std::io::Result<()> {
     store::append_line(path, document)
+}
+
+pub fn release_checkout(checkout: &Path) -> std::io::Result<ReleaseReceipt> {
+    release::detached(checkout)
 }

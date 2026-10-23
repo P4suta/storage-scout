@@ -1,14 +1,22 @@
 use alloc::vec::Vec;
 
 use crate::candidate::{Candidate, CandidateId};
-use crate::ownership::Admits;
+use crate::ownership::{Admits, Settlement};
+
+pub(crate) const fn eligible<T>(settlement: Settlement, value: &T) -> Option<&T> {
+    if Admits::Settled.admits(settlement) {
+        Some(value)
+    } else {
+        None
+    }
+}
 
 #[must_use]
 pub fn reap(candidates: &[Candidate]) -> Vec<CandidateId> {
     candidates
         .iter()
-        .filter(|candidate| Admits::Settled.admits(candidate.settlement()))
-        .map(|candidate| candidate.id().clone())
+        .filter_map(|candidate| eligible(candidate.settlement(), candidate.id()))
+        .cloned()
         .collect()
 }
 
@@ -72,6 +80,7 @@ mod tests {
                 },
                 measurement: Measurement {
                     usage: Usage {
+                        failures: 0,
                         logical: bytes,
                         allocation: Allocation::Measured {
                             allocated: bytes,

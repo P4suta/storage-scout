@@ -2,14 +2,15 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use storage_scout_core::area::Protection;
-use storage_scout_core::gate::{self, Inspection, Mandate, Outcome, Stage};
+use storage_scout_core::candidate::{Candidate, Observed};
+use storage_scout_core::gate::{self, Gate, Inspection, Mandate, Outcome, Recheck, Stage, Verify};
 use storage_scout_core::location::Location;
 use storage_scout_core::lock::Liveness;
 use storage_scout_core::ownership::Ownership;
 use storage_scout_core::reject::Rejection;
 
 use crate::owners::Owners;
-use crate::{SCHEMA_VERSION, busy, observe, scan};
+use crate::{SCHEMA_VERSION, busy, measure, observe, scan};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Explanation {
@@ -44,11 +45,11 @@ pub(crate) fn explain(
     let refused = unasked
         .iter()
         .any(|stage| matches!(stage.outcome, Outcome::Reject { .. }));
-    let (stages, ownership) = if refused {
+    let (mut stages, ownership) = if refused {
         (unasked, None)
     } else {
-        let survey = busy::survey(&observed.path)?;
-        let ownership = owners.of(&observed.path, &survey.markers);
+        let survey = owners.survey(&observed.path)?;
+        let ownership = owners.recheck(&observed.path, &survey.markers);
         let liveness = match busy::probe(&survey.locks) {
             Ok(()) => Liveness::Free,
             Err(contention) => contention.liveness(),
@@ -64,6 +65,47 @@ pub(crate) fn explain(
         );
         (stages, Some(ownership))
     };
+    if !stages
+        .iter()
+        .any(|stage| matches!(stage.outcome, Outcome::Reject { .. }))
+        && let Some(ownership) = &ownership
+    {
+        let admission = gate::admit(&site)?;
+        match measure::strictly(&observed.path, admission.kind()) {
+            Ok(measured) => {
+                let candidate = Candidate::new(
+                    admission,
+                    Observed {
+                        identity: observed.identity,
+                        measurement: measured,
+                        ownership: ownership.clone(),
+                    },
+                    protection.case(),
+                );
+                stages = gate::inspect_verified(
+                    &site,
+                    &Verify {
+                        recheck: Recheck {
+                            mandate: &mandate,
+                            recorded: &candidate,
+                            identity: observed.identity,
+                            ownership,
+                            liveness: &Liveness::Free,
+                        },
+                        measured: &measured,
+                    },
+                );
+            },
+            Err(rejection) => {
+                if let Some(stage) = stages
+                    .iter_mut()
+                    .find(|stage| stage.gate == Gate::Freshness)
+                {
+                    stage.outcome = Outcome::Reject { rejection };
+                }
+            },
+        }
+    }
     let rejection = stages.iter().find_map(|stage| match &stage.outcome {
         Outcome::Reject { rejection } => Some(rejection.clone()),
         Outcome::Pass { .. } | Outcome::Abstain | Outcome::NotReached => None,

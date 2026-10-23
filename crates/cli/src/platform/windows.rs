@@ -16,15 +16,27 @@ use std::ptr::{null, null_mut};
 use storage_scout_core::candidate::Identity;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileStandardInfo, GetDiskFreeSpaceExW,
     GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 
-use super::{FileMeasure, Pruned, WalkError};
+use super::{FileMeasure, Pruned, VolumeSpace, WalkError};
 
 const REPARSE_POINT: u32 = 0x0400;
+
+pub(super) fn user_temporary(path: &Path) -> io::Result<bool> {
+    let directory = fs::canonicalize(path)?;
+    match std::env::var_os("USERPROFILE") {
+        Some(home) => Ok(directory.starts_with(fs::canonicalize(home)?)),
+        None => Ok(false),
+    }
+}
+
+pub(super) fn swift_lock_path(_root: &Path) -> io::Result<PathBuf> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
 
 struct OwnedHandle(HANDLE);
 
@@ -102,9 +114,10 @@ fn by_handle(handle: HANDLE) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
 }
 
 fn identity_from(info: &BY_HANDLE_FILE_INFORMATION) -> Identity {
+    const HIGH_WORD_SHIFT: u32 = u32::BITS;
     Identity {
         volume: u64::from(info.dwVolumeSerialNumber),
-        file: (u128::from(info.nFileIndexHigh) << 32) | u128::from(info.nFileIndexLow),
+        file: (u128::from(info.nFileIndexHigh) << HIGH_WORD_SHIFT) | u128::from(info.nFileIndexLow),
     }
 }
 
@@ -144,16 +157,28 @@ pub(super) fn file_measure(path: &Path) -> io::Result<FileMeasure> {
     })
 }
 
-pub(super) fn free_space(path: &Path) -> io::Result<u64> {
+pub(super) fn volume_space(path: &Path) -> io::Result<VolumeSpace> {
     let path = wide(path);
     let mut available = 0u64;
-    // SAFETY: the UTF-16 path and the output pointer are valid for the call; optional outputs are null.
-    let result =
-        unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &raw mut available, null_mut(), null_mut()) };
+    let mut total = 0u64;
+    let mut free = 0u64;
+    // SAFETY: the UTF-16 path and all three output pointers are valid for the call.
+    let result = unsafe {
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &raw mut available,
+            &raw mut total,
+            &raw mut free,
+        )
+    };
     if result == 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(available)
+        Ok(VolumeSpace {
+            total,
+            free,
+            available,
+        })
     }
 }
 
@@ -207,6 +232,18 @@ fn remove_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a reparse point is unlinked without changing its target's permissions"
+)]
+fn remove_link(path: &Path, metadata: &Metadata) -> io::Result<()> {
+    if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
 fn clear(dir: &Path, keep: &BTreeSet<Identity>) -> Result<bool, WalkError> {
     let io = |path: &Path| {
         let path = path.to_path_buf();
@@ -217,11 +254,7 @@ fn clear(dir: &Path, keep: &BTreeSet<Identity>) -> Result<bool, WalkError> {
         let path = entry.map_err(io(dir))?.path();
         let metadata = fs::symlink_metadata(&path).map_err(io(&path))?;
         if is_reparse_point(&metadata) || metadata.file_type().is_symlink() {
-            if metadata.is_dir() {
-                remove_dir(&path).map_err(io(&path))?;
-            } else {
-                remove_file(&path).map_err(io(&path))?;
-            }
+            remove_link(&path, &metadata).map_err(io(&path))?;
         } else if metadata.is_dir() {
             if clear(&path, keep)? {
                 remove_dir(&path).map_err(io(&path))?;

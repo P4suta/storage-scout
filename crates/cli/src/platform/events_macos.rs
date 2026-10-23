@@ -4,7 +4,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use super::{Change, Coverage, Event, WatchDepth};
 
@@ -17,8 +17,8 @@ type Callback =
 struct Context {
     version: isize,
     info: *mut c_void,
-    retain: *const c_void,
-    release: *const c_void,
+    retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<unsafe extern "C" fn(*const c_void)>,
     copy_description: *const c_void,
 }
 
@@ -67,6 +67,7 @@ unsafe extern "C" {
     fn FSEventStreamInvalidate(stream: *mut c_void);
     fn FSEventStreamRelease(stream: *mut c_void);
     fn FSEventsGetCurrentEventId() -> u64;
+    fn FSEventStreamFlushSync(stream: *mut c_void);
 }
 
 unsafe extern "C" {
@@ -83,6 +84,12 @@ const UTF8: u32 = 0x0800_0100;
 const NO_DEFER: u32 = 0x02;
 const WATCH_ROOT: u32 = 0x04;
 const IGNORE_SELF: u32 = 0x08;
+
+#[derive(Debug, Clone, Copy)]
+enum OwnWrites {
+    Ignore,
+    Observe,
+}
 const FULL_HISTORY: u32 = 0x80;
 const COALESCED: f64 = 1.0;
 const MUST_SCAN: u32 = 0x01;
@@ -96,6 +103,27 @@ const LOST: u32 = MUST_SCAN | USER_DROPPED | KERNEL_DROPPED | IDS_WRAPPED | ROOT
 struct Sink {
     deliver: Deliver,
     history: mpsc::SyncSender<()>,
+}
+
+unsafe extern "C" fn retain_sink(info: *const c_void) -> *const c_void {
+    // SAFETY: FSEvents passes the live Arc allocation supplied in its context.
+    unsafe { Arc::increment_strong_count(info.cast::<Sink>()) };
+    info
+}
+
+unsafe extern "C" fn release_sink(info: *const c_void) {
+    // SAFETY: this releases exactly one reference acquired by the native context's retain callback.
+    drop(unsafe { Arc::from_raw(info.cast::<Sink>()) });
+}
+
+fn context(sink: &Arc<Sink>) -> Context {
+    Context {
+        version: 0,
+        info: Arc::as_ptr(sink).cast_mut().cast::<c_void>(),
+        retain: Some(retain_sink),
+        release: Some(release_sink),
+        copy_description: std::ptr::null(),
+    }
 }
 
 fn change(bytes: &[u8], flag: u32) -> Change {
@@ -119,7 +147,7 @@ extern "C" fn delivered(
     flags: *const u32,
     ids: *const u64,
 ) {
-    // SAFETY: `info` is the `Sink` registered in `start`, alive until the stream is released.
+    // SAFETY: the native stream retains this Sink through its context until deallocation.
     let sink = unsafe { &*info.cast_const().cast::<Sink>() };
     // SAFETY: without the CF-types flag FSEvents passes `count` C strings.
     let paths =
@@ -184,7 +212,6 @@ fn strings(paths: &[PathBuf]) -> io::Result<Strings> {
 pub(super) struct Source {
     stream: *mut c_void,
     queue: *mut c_void,
-    sink: *mut Sink,
     checkpoint: u64,
 }
 
@@ -198,7 +225,7 @@ impl Drop for Source {
         unsafe {
             FSEventStreamInvalidate(self.stream);
         }
-        // SAFETY: the stream is released exactly once, after it stopped delivering.
+        // SAFETY: the invalidated stream is released exactly once and owns its callback context until deallocation.
         unsafe {
             FSEventStreamRelease(self.stream);
         }
@@ -206,16 +233,41 @@ impl Drop for Source {
         unsafe {
             dispatch_release(self.queue);
         }
-        // SAFETY: the stream no longer calls back, so the boxed sink can be reclaimed.
-        drop(unsafe { Box::from_raw(self.sink) });
     }
 }
 
 impl Source {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "event barriers have a fallible interface on the other platforms"
+    )]
+    pub(super) fn barrier(&self) -> io::Result<()> {
+        // SAFETY: the live stream belongs to this worker and this method never runs on its callback queue.
+        unsafe { FSEventStreamFlushSync(self.stream) };
+        Ok(())
+    }
     pub(super) fn start(
         paths: &[PathBuf],
         _notification: &str,
         checkpoint: Option<u64>,
+        deliver: Deliver,
+    ) -> io::Result<Self> {
+        Self::start_with(paths, checkpoint, OwnWrites::Ignore, deliver)
+    }
+
+    pub(super) fn start_release(paths: &[PathBuf], deliver: Deliver) -> io::Result<Self> {
+        for path in paths {
+            if super::share::filesystem(path)? != storage_scout_core::share::Filesystem::Apfs {
+                return Err(io::Error::from(io::ErrorKind::Unsupported));
+            }
+        }
+        Self::start_with(paths, None, OwnWrites::Observe, deliver)
+    }
+
+    fn start_with(
+        paths: &[PathBuf],
+        checkpoint: Option<u64>,
+        own: OwnWrites,
         deliver: Deliver,
     ) -> io::Result<Self> {
         let strings = strings(paths)?;
@@ -239,14 +291,8 @@ impl Source {
             None => unsafe { FSEventsGetCurrentEventId() },
         };
         let (history, ready) = mpsc::sync_channel(1);
-        let sink = Box::into_raw(Box::new(Sink { deliver, history }));
-        let context = Context {
-            version: 0,
-            info: sink.cast::<c_void>(),
-            retain: std::ptr::null(),
-            release: std::ptr::null(),
-            copy_description: std::ptr::null(),
-        };
+        let sink = Arc::new(Sink { deliver, history });
+        let context = context(&sink);
         // SAFETY: `array` is a CFArray of CFStrings and `context` outlives the call; FSEvents copies both.
         let stream = unsafe {
             FSEventStreamCreate(
@@ -256,15 +302,19 @@ impl Source {
                 array,
                 checkpoint,
                 COALESCED,
-                NO_DEFER | WATCH_ROOT | IGNORE_SELF | FULL_HISTORY,
+                NO_DEFER
+                    | WATCH_ROOT
+                    | FULL_HISTORY
+                    | match own {
+                        OwnWrites::Ignore => IGNORE_SELF,
+                        OwnWrites::Observe => 0,
+                    },
             )
         };
         // SAFETY: the array was created above and the stream holds its own reference.
         unsafe { CFRelease(array) };
         drop(strings);
         if stream.is_null() {
-            // SAFETY: no stream took ownership of the boxed sink.
-            drop(unsafe { Box::from_raw(sink) });
             return Err(io::Error::other("FSEvents refused the stream"));
         }
         // SAFETY: a null attribute is the serial queue attribute the QoS class is added to.
@@ -288,8 +338,6 @@ impl Source {
             unsafe { FSEventStreamRelease(stream) };
             // SAFETY: the queue came from `dispatch_queue_create` and is released once.
             unsafe { dispatch_release(queue) };
-            // SAFETY: the released stream no longer holds the boxed sink.
-            drop(unsafe { Box::from_raw(sink) });
             return Err(io::Error::other("FSEvents did not start"));
         }
         if ready.recv().is_err() {
@@ -301,14 +349,11 @@ impl Source {
             unsafe { FSEventStreamRelease(stream) };
             // SAFETY: the queue came from `dispatch_queue_create` and is released once.
             unsafe { dispatch_release(queue) };
-            // SAFETY: the released stream no longer holds the boxed sink.
-            drop(unsafe { Box::from_raw(sink) });
             return Err(io::Error::from(io::ErrorKind::BrokenPipe));
         }
         Ok(Self {
             stream,
             queue,
-            sink,
             checkpoint,
         })
     }
@@ -367,6 +412,43 @@ mod tests {
     use std::ffi::CString;
 
     use super::*;
+
+    #[test]
+    fn native_context_keeps_callback_state_alive_after_its_creator_drops() {
+        let (sent, received) = mpsc::channel();
+        let (history, _ready) = mpsc::sync_channel(1);
+        let sink = Arc::new(Sink {
+            deliver: Box::new(move |change| sent.send(change).unwrap()),
+            history,
+        });
+        let weak = Arc::downgrade(&sink);
+        let context = context(&sink);
+        let retain = context
+            .retain
+            .expect("the native stream must retain its callback state");
+        let release = context
+            .release
+            .expect("the native stream must release its callback state");
+        // SAFETY: context.info points to the live Arc allocation created above.
+        let retained = unsafe { retain(context.info.cast_const()) };
+        drop(sink);
+        assert!(weak.upgrade().is_some());
+        let name = CString::new("/work/target/").unwrap();
+        let mut paths = [name.as_ptr()];
+        delivered(
+            std::ptr::null(),
+            retained.cast_mut(),
+            paths.len(),
+            paths.as_mut_ptr().cast::<c_void>(),
+            [0].as_ptr(),
+            [1].as_ptr(),
+        );
+        assert!(matches!(received.recv().unwrap(), Change::Entry { .. }));
+        assert_eq!(received.recv().unwrap(), Change::Checkpoint(1));
+        // SAFETY: the native retain above owns this reference and the callback has returned.
+        unsafe { release(retained) };
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn dropped_events_are_lost_and_directories_are_trimmed() {

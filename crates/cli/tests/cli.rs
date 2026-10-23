@@ -13,6 +13,10 @@ use storage_scout::core::area::Area;
 use storage_scout::{SCHEMA_VERSION, Scout};
 use testkit::{link_dir, tempdir, write_cargo_project, write_sized};
 
+#[path = "support/user.rs"]
+mod user;
+use user::run as isolated_user;
+
 fn cli(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_storage-scout"))
         .args(args)
@@ -95,6 +99,7 @@ fn git_is_not_asked_above_a_ceiling() {
 #[test]
 fn clean_discovers_dry_runs_refuses_unconfirmed_and_executes_by_id() {
     let temp = tempdir("cli-clean");
+    testkit::write_orphaned_worktree(temp.path());
     if !open_space(temp.path()) {
         return;
     }
@@ -135,6 +140,35 @@ fn clean_discovers_dry_runs_refuses_unconfirmed_and_executes_by_id() {
         "deleted"
     );
     testkit::assert_absent(&target);
+}
+
+#[test]
+fn explicit_manual_selection_never_deletes_an_unclaimed_artifact() {
+    let temp = tempdir("cli-unclaimed");
+    if !open_space(temp.path()) {
+        return;
+    }
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let root = temp.path().to_str().unwrap();
+    let discovery = json(&cli(&["clean", root, "--min-size", "0", "--json"]));
+    let id = discovery["candidates"][0]["id"].as_str().unwrap();
+    let output = cli(&[
+        "clean",
+        root,
+        "--min-size",
+        "0",
+        "--id",
+        id,
+        "--execute",
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let status = &json(&output)["summary"]["outcomes"][0]["status"];
+    assert_eq!(status["status"], "rejected");
+    assert_eq!(status["rejection"]["reason"], "owned");
+    assert_eq!(status["rejection"]["settlement"], "unclaimed");
+    testkit::assert_present(target);
 }
 
 #[test]
@@ -210,6 +244,576 @@ fn write_policy(path: &Path, roots: &Path, log: &Path) {
         log = log.to_str().unwrap(),
     );
     fs::write(path, policy).unwrap();
+}
+
+fn released_cache(directory: &Path, retired: &Path) {
+    testkit::write_owner_marker(
+        directory,
+        testkit::MarkerRole::Cache,
+        testkit::MarkerKeep::Released,
+        Some(retired),
+    );
+    write_sized(&directory.join("artifact"), 4096);
+}
+
+#[test]
+fn swift_build_links_are_unlinked_only_after_the_real_workspace_lock_is_free() {
+    let temp = tempdir("swift-links");
+    let home = temp.path().join("home");
+    let project = home.join("project");
+    testkit::write_orphaned_worktree(&project);
+    write_sized(&project.join("Package.swift"), 1);
+    let build = project.join(".build");
+    write_sized(&build.join("debug/app"), 32);
+    write_sized(&build.join("checkouts/dependency/.git/HEAD"), 16);
+    let outside = home.join("outside");
+    write_sized(&outside.join("payload"), 1024);
+    let Some(_) =
+        link_dir(&build.join("release"), &build.join("debug")).or_decline("a directory link")
+    else {
+        return;
+    };
+    let Some(_) = link_dir(&build.join("external"), &outside).or_decline("a directory link") else {
+        return;
+    };
+    let absent = isolated_user(&["explain", build.to_str().unwrap(), "--json"], &home);
+    let absent = json(&absent);
+    if !testkit::native_checkout_events() {
+        assert_eq!(absent["eligible"], false);
+        assert_eq!(absent["rejection"]["reason"], "io");
+        return;
+    }
+    assert_eq!(
+        absent["rejection"]["reason"], "liveness-unknown",
+        "{absent:#}"
+    );
+    let path = std::path::PathBuf::from(absent["rejection"]["lock"].as_str().unwrap());
+    assert!(path.starts_with(fs::canonicalize(home.join("temporary")).unwrap()));
+    write_sized(&path, 0);
+    let lock = File::open(path).unwrap();
+    lock.lock().unwrap();
+    let held = isolated_user(&["explain", build.to_str().unwrap(), "--json"], &home);
+    assert_eq!(json(&held)["rejection"]["reason"], "busy");
+    let discovery = isolated_user(
+        &[
+            "clean",
+            project.to_str().unwrap(),
+            "--min-size",
+            "0",
+            "--json",
+        ],
+        &home,
+    );
+    let document = json(&discovery);
+    let id = document["candidates"][0]["id"].as_str().unwrap();
+    let args = [
+        "clean",
+        project.to_str().unwrap(),
+        "--min-size",
+        "0",
+        "--id",
+        id,
+        "--execute",
+        "--yes",
+        "--json",
+    ];
+    let blocked = isolated_user(&args, &home);
+    assert_eq!(
+        json(&blocked)["summary"]["outcomes"][0]["status"]["rejection"]["reason"],
+        "busy"
+    );
+    testkit::assert_present(&build);
+    drop(lock);
+    let executed = isolated_user(&args, &home);
+    assert_eq!(executed.status.code(), Some(0), "{executed:?}");
+    assert_eq!(
+        json(&executed)["summary"]["outcomes"][0]["status"]["status"],
+        "deleted"
+    );
+    testkit::assert_absent(build);
+    assert_eq!(fs::read(outside.join("payload")).unwrap(), vec![b'x'; 1024]);
+    testkit::assert_present(project.join("Package.swift"));
+}
+
+#[test]
+fn gleam_build_links_and_checkouts_respect_the_producers_locks() {
+    let temp = tempdir("gleam-links");
+    let home = temp.path().join("home");
+    let project = home.join("project");
+    testkit::write_orphaned_worktree(&project);
+    write_sized(&project.join("gleam.toml"), 1);
+    let build = project.join("build");
+    write_sized(&build.join("dev/erlang/app/app.beam"), 32);
+    write_sized(&build.join("packages/dependency/.git/HEAD"), 16);
+    let outside = home.join("outside");
+    write_sized(&outside.join("payload"), 1024);
+    let Some(_) =
+        link_dir(&build.join("dev/erlang/app/priv"), &outside).or_decline("a directory link")
+    else {
+        return;
+    };
+    for name in [
+        "gleam.lock",
+        "gleam-dev-erlang.lock",
+        "gleam-prod-javascript.lock",
+        "gleam-lsp-erlang.lock",
+    ] {
+        write_sized(&build.join(name), 0);
+    }
+    let discovery = isolated_user(
+        &[
+            "clean",
+            project.to_str().unwrap(),
+            "--min-size",
+            "0",
+            "--json",
+        ],
+        &home,
+    );
+    let document = json(&discovery);
+    let id = document["candidates"][0]["id"].as_str().unwrap();
+    let args = [
+        "clean",
+        project.to_str().unwrap(),
+        "--min-size",
+        "0",
+        "--id",
+        id,
+        "--execute",
+        "--yes",
+        "--json",
+    ];
+    for name in [
+        "gleam.lock",
+        "gleam-dev-erlang.lock",
+        "gleam-prod-javascript.lock",
+        "gleam-lsp-erlang.lock",
+    ] {
+        let holder = File::open(build.join(name)).unwrap();
+        holder.lock().unwrap();
+        let explained = isolated_user(&["explain", build.to_str().unwrap(), "--json"], &home);
+        let blocked = isolated_user(&args, &home);
+        assert_eq!(json(&explained)["rejection"]["reason"], "busy", "{name}");
+        assert_eq!(
+            json(&blocked)["summary"]["outcomes"][0]["status"]["rejection"]["reason"],
+            "busy",
+            "{name}"
+        );
+        testkit::assert_present(&build);
+    }
+    let executed = isolated_user(&args, &home);
+    assert_eq!(executed.status.code(), Some(0), "{executed:?}");
+    testkit::assert_absent(build);
+    assert_eq!(fs::read(outside.join("payload")).unwrap(), vec![b'x'; 1024]);
+    testkit::assert_present(project.join("gleam.toml"));
+}
+
+#[test]
+fn known_tool_caches_are_attributed_without_becoming_candidates() {
+    let temp = tempdir("tool-cache-attribution");
+    let home = temp.path().join("home");
+    let cache = home.join(".cache/uv");
+    write_sized(&cache.join("wheels/payload"), 8192);
+    let output = isolated_user(
+        &[
+            "scan",
+            home.to_str().unwrap(),
+            "--measure",
+            "both",
+            "--min-size",
+            "0",
+            "--json",
+        ],
+        &home,
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json(&output);
+    assert_eq!(report["tool_caches"][0]["tool"], "uv");
+    assert_eq!(report["tool_caches"][0]["usage"]["logical"], 8192);
+    assert_eq!(report["candidates"], serde_json::json!([]));
+    testkit::assert_present(cache.join("wheels/payload"));
+}
+
+#[test]
+fn release_starts_a_monitor_and_auto_reaps_a_primary_checkout_target() {
+    if !testkit::native_checkout_events() {
+        testkit::decline("native checkout release events");
+        return;
+    }
+    let temp = tempdir("cli-primary-release");
+    let home = temp.path().join("home");
+    let work = home.join("work");
+    testkit::make_dir(&work);
+    let git = testkit::Git::isolated(temp.path());
+    git.run(&work, &["init", "--quiet"]);
+    git.commit_file(&work, "Cargo.toml", "[package]\nname = 'x'\n");
+    git.commit_file(&work, ".gitignore", "target/\n");
+    let target = write_cargo_project(&work, 4096);
+    let release = isolated_user(&["release", work.to_str().unwrap(), "--json"], &home);
+    assert_eq!(release.status.code(), Some(0), "{release:?}");
+    assert!(
+        json(&release)["monitor_pid"]
+            .as_u64()
+            .is_some_and(|pid| pid > 0)
+    );
+    let policy = home.join("policy.toml");
+    fs::write(
+        &policy,
+        format!(
+            "[select]\nroots = [{}]\n",
+            serde_json::to_string(&work).unwrap()
+        ),
+    )
+    .unwrap();
+    let output = isolated_user(
+        &[
+            "auto",
+            "--config",
+            policy.to_str().unwrap(),
+            "--execute",
+            "--json",
+        ],
+        &home,
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(json(&output)["reap"]["selected"], 1);
+    testkit::assert_absent(target);
+    testkit::assert_present(work.join("Cargo.toml"));
+}
+
+#[test]
+fn no_policy_uses_user_defaults_and_preserves_unreleased_work() {
+    let temp = tempdir("default-user-policy");
+    let home = temp.path().join("home");
+    let cache = home.join(".cache");
+    let released = cache.join("released");
+    released_cache(&released, &home.join("retired"));
+    let active = cache.join("active");
+    let key = home.join("current-project");
+    write_sized(&key, 1);
+    released_cache(&active, &key);
+    let unclaimed = write_cargo_project(&cache.join("unclaimed"), 4096);
+    let dry = isolated_user(&["auto", "--json"], &home);
+    assert_eq!(dry.status.code(), Some(0), "{dry:?}");
+    assert_eq!(json(&dry)["reap"]["selected"], 1);
+    assert_eq!(
+        json(&dry)["policy"]["selection"]["tiers"]["reinstallable"],
+        false
+    );
+    assert_eq!(
+        json(&dry)["policy"]["selection"]["tiers"]["expensive"],
+        false
+    );
+    testkit::assert_present(&released);
+    let executed = isolated_user(&["auto", "--execute", "--json"], &home);
+    assert_eq!(executed.status.code(), Some(0), "{executed:?}");
+    testkit::assert_absent(&released);
+    testkit::assert_present(&active);
+    testkit::assert_present(&unclaimed);
+    testkit::assert_absent(home.join(".config/storage-scout/auto.toml"));
+}
+
+#[test]
+fn an_existing_default_policy_replaces_the_default_roots() {
+    let temp = tempdir("configured-user-policy");
+    let home = temp.path().join("home");
+    let unselected = home.join(".cache/released");
+    released_cache(&unselected, &home.join("retired"));
+    let configured = home.join("selected");
+    let selected = configured.join("released");
+    released_cache(&selected, &home.join("retired"));
+    let config = home.join(".config/storage-scout/auto.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    write_policy(&config, &configured, &home.join("auto.jsonl"));
+    let executed = isolated_user(&["auto", "--execute", "--json"], &home);
+    assert_eq!(executed.status.code(), Some(0), "{executed:?}");
+    testkit::assert_absent(&selected);
+    testkit::assert_present(&unselected);
+}
+
+#[test]
+fn missing_explicit_and_invalid_default_policies_never_enable_defaults() {
+    let temp = tempdir("invalid-user-policy");
+    let home = temp.path().join("home");
+    let released = home.join(".cache/released");
+    released_cache(&released, &home.join("retired"));
+    let missing = home.join("missing.toml");
+    let executed = isolated_user(
+        &[
+            "auto",
+            "--config",
+            missing.to_str().unwrap(),
+            "--execute",
+            "--json",
+        ],
+        &home,
+    );
+    assert_eq!(executed.status.code(), Some(1));
+    testkit::assert_present(&released);
+    testkit::write_bytes(
+        &home.join(".config/storage-scout/auto.toml"),
+        b"invalid policy",
+    );
+    let invalid = isolated_user(&["auto", "--execute", "--json"], &home);
+    assert_eq!(invalid.status.code(), Some(1));
+    testkit::assert_present(&released);
+}
+
+#[test]
+fn a_reviewed_batch_discovers_once_and_revalidates_every_candidate() {
+    let temp = tempdir("cli-batch-discovery");
+    testkit::write_orphaned_worktree(temp.path());
+    if !open_space(temp.path()) {
+        return;
+    }
+    let first = write_cargo_project(&temp.path().join("first"), 4096);
+    let second = write_cargo_project(&temp.path().join("second"), 4096);
+    let root = temp.path().to_str().unwrap();
+    let discovered = cli(&["clean", root, "--min-size", "0", "--json"]);
+    assert_eq!(discovered.status.code(), Some(0));
+    let document = json(&discovered);
+    let candidates = document["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate["id"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(",");
+    let trace = temp.path().join("batch.jsonl");
+    let executed = cli(&[
+        "clean",
+        root,
+        "--min-size",
+        "0",
+        "--id",
+        &ids,
+        "--execute",
+        "--yes",
+        "--json",
+        "--trace-file",
+        trace.to_str().unwrap(),
+    ]);
+    assert_eq!(executed.status.code(), Some(0), "{executed:?}");
+    assert_eq!(
+        json(&executed)["summary"]["outcomes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    testkit::assert_absent(first);
+    testkit::assert_absent(second);
+    let discoveries = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            let event: Value = serde_json::from_str(line).unwrap();
+            event["fields"]["event"] == "discovery"
+        })
+        .count();
+    assert_eq!(discoveries, 1);
+}
+
+#[test]
+fn shared_temporary_storage_is_not_a_default_cleanup_root() {
+    let temp = tempdir("default-shared-temporary");
+    let home = temp.path().join("home");
+    let temporary = home.join("temporary");
+    fs::create_dir_all(&temporary).unwrap();
+    let Some(_permissions) = testkit::restrict(&temporary, 0o1777) else {
+        testkit::decline("Unix temporary-directory permissions");
+        return;
+    };
+    let output = isolated_user(&["auto", "--execute", "--json"], &home);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        json(&output)["policy"]["selection"]["roots"],
+        serde_json::json!([])
+    );
+    testkit::assert_absent(home.join(".config/storage-scout/auto.toml"));
+}
+
+#[test]
+fn unused_toolchains_are_removed_by_rustup_and_checkout_pins_are_preserved() {
+    let temp = tempdir("cli-managed-rustup");
+    let home = temp.path().join("home");
+    let checkout = temp.path().join("checkout");
+    let unused = "1.83.0-x86_64-unknown-linux-gnu";
+    let pinned = "1.84.0-x86_64-unknown-linux-gnu";
+    for version in [unused, pinned] {
+        testkit::write_bytes(
+            &home
+                .join(".rustup/toolchains")
+                .join(version)
+                .join("bin/rustc"),
+            b"fixture compiler",
+        );
+    }
+    testkit::write_bytes(&home.join(".rustup/settings.toml"), b"version = '12'\n");
+    testkit::write_bytes(
+        &checkout.join("rust-toolchain.toml"),
+        b"[toolchain]\nchannel = '1.84.0'\n",
+    );
+    let root = checkout.to_str().unwrap();
+    let discovered = isolated_user(
+        &[
+            "stores",
+            root,
+            "--provider",
+            "rustup",
+            "--include-tier",
+            "reinstallable",
+            "--json",
+        ],
+        &home,
+    );
+    assert_eq!(discovered.status.code(), Some(0), "{discovered:?}");
+    let document = json(&discovered);
+    assert_eq!(document["warnings"], serde_json::json!([]));
+    let candidates = document["candidates"].as_array().unwrap();
+    let find = |version: &str| {
+        candidates
+            .iter()
+            .find(|candidate| candidate["label"] == format!("rust@{version}"))
+            .unwrap()
+    };
+    assert_eq!(find(unused)["refusal"], Value::Null);
+    assert_eq!(find(pinned)["refusal"], "referenced");
+    let ids = format!(
+        "{},{}",
+        find(unused)["id"].as_str().unwrap(),
+        find(pinned)["id"].as_str().unwrap()
+    );
+    let executed = isolated_user(
+        &[
+            "stores",
+            root,
+            "--provider",
+            "rustup",
+            "--include-tier",
+            "reinstallable",
+            "--id",
+            &ids,
+            "--execute",
+            "--yes",
+            "--json",
+        ],
+        &home,
+    );
+    assert_eq!(executed.status.code(), Some(1), "{executed:?}");
+    testkit::assert_absent(home.join(".rustup/toolchains").join(unused));
+    testkit::assert_present(home.join(".rustup/toolchains").join(pinned));
+    assert!(
+        json(&executed)["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|outcome| outcome["result"]["status"] == "removed")
+    );
+}
+
+#[test]
+fn mise_removes_only_an_unused_installation_and_preserves_a_checkout_pin() {
+    let temp = tempdir("cli-managed-mise");
+    let home = temp.path().join("home");
+    let checkout = temp.path().join("checkout");
+    let installs = home.join("mise-data/installs/node");
+    for version in ["18.1.0", "20.1.0"] {
+        for binary in ["node", "node.exe"] {
+            testkit::write_bytes(
+                &installs.join(version).join("bin").join(binary),
+                b"fixture runtime",
+            );
+        }
+    }
+    testkit::write_bytes(&checkout.join("mise.toml"), b"[tools]\nnode = '20.1.0'\n");
+    let root = checkout.to_str().unwrap();
+    let discovered = isolated_user(
+        &[
+            "stores",
+            root,
+            "--provider",
+            "mise",
+            "--include-tier",
+            "reinstallable",
+            "--json",
+        ],
+        &home,
+    );
+    assert_eq!(discovered.status.code(), Some(0), "{discovered:?}");
+    let document = json(&discovered);
+    assert_eq!(document["warnings"], serde_json::json!([]));
+    let candidates = document["candidates"].as_array().unwrap();
+    let find = |version: &str| {
+        candidates
+            .iter()
+            .find(|candidate| candidate["label"] == format!("node@{version}"))
+            .unwrap()
+    };
+    assert_eq!(find("18.1.0")["refusal"], Value::Null);
+    assert_eq!(find("20.1.0")["refusal"], "referenced");
+    let id = find("18.1.0")["id"].as_str().unwrap();
+    let executed = isolated_user(
+        &[
+            "stores",
+            root,
+            "--provider",
+            "mise",
+            "--include-tier",
+            "reinstallable",
+            "--id",
+            id,
+            "--execute",
+            "--yes",
+            "--json",
+        ],
+        &home,
+    );
+    assert_eq!(executed.status.code(), Some(0), "{executed:?}");
+    testkit::assert_absent(installs.join("18.1.0"));
+    testkit::assert_present(installs.join("20.1.0"));
+}
+
+#[test]
+fn auto_reaps_a_released_cache_with_links_and_preserves_their_targets() {
+    let temp = tempdir("cli-auto-linked-cache");
+    if !open_space(temp.path()) {
+        return;
+    }
+    let work = temp.path().join("work");
+    let cache = work.join("cache");
+    testkit::write_owner_marker(
+        &cache,
+        testkit::MarkerRole::Cache,
+        testkit::MarkerKeep::Released,
+        Some(&temp.path().join("retired-checkout")),
+    );
+    write_sized(&cache.join("target/app"), 8192);
+    let outside = temp.path().join("outside");
+    write_sized(&outside.join("payload"), 4096);
+    let Some(_) =
+        link_dir(&cache.join("tree/target/release"), &outside).or_decline("a directory link")
+    else {
+        return;
+    };
+    let policy = temp.path().join("auto.toml");
+    write_policy(&policy, &work, &temp.path().join("auto.jsonl"));
+    let config = policy.to_str().unwrap();
+    let dry = cli(&["auto", "--config", config, "--json"]);
+    assert_eq!(dry.status.code(), Some(0), "{dry:?}");
+    assert_eq!(
+        json(&dry)["reap"]["summary"]["outcomes"][0]["status"]["status"],
+        "would-delete"
+    );
+    testkit::assert_present(&cache);
+    let executed = cli(&["auto", "--config", config, "--execute", "--json"]);
+    assert_eq!(executed.status.code(), Some(0), "{executed:?}");
+    assert_eq!(
+        json(&executed)["reap"]["summary"]["outcomes"][0]["status"]["status"],
+        "deleted"
+    );
+    testkit::assert_absent(&cache);
+    assert_eq!(fs::read(outside.join("payload")).unwrap(), vec![b'x'; 4096]);
 }
 
 #[test]

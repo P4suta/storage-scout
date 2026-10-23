@@ -12,8 +12,9 @@
 
 ## Rules the build enforces
 
-- No comments.
+- No comments in Rust source.
   The only exception is a `// SAFETY:` line on an `unsafe` block, and `unsafe` exists only in `crates/cli/src/platform`.
+- Workflow comments record immutable action versions and `permissions:` rationales required by the security linter.
 - Deletion is a capability: `apply::capability::Authorized` holds a `Clearance` (minted only by `core::gate::clear` after the whole `PIPELINE`) and the `Lease` on every lock the tool uses.
   `remove_tree` is reachable only from it.
 - Sharing is a capability too: `dedupe::capability::Shareable` holds a `ShareClearance` (minted only by `core::gate::clear_share`) and the `Lease`.
@@ -38,15 +39,17 @@
 
 - Real deletion happens only under temporary directories inside the repository (`testkit::tempdir`).
 - OS differences go through `testkit` (`Built::Unavailable`), never `#[cfg]` on a test.
-- Every surviving mutant is either a missing test or a claim with a reason in `.rust-mutants.toml`.
-  `question-to-unwrap` is not measured: it turns a reported refusal into a panic, and both stop before anything changes.
-  `ignore-question-statement` and `return-ok-default` are, because they turn a failure into success.
-- Pull requests measure only the files they change, on btrfs so sharing runs; `STORAGE_SCOUT_REQUIRE_SHARING=1` makes the sharing tests fail instead of skipping.
-  Full measurement is local: `mise run mutants`, and `mise run verify` for the whole contract.
+- Mutation testing uses the pinned upstream `cargo-mutants` and `.cargo/mutants.toml`.
+  Missed mutants, timeouts, missing outcomes, and empty catalogs fail release verification.
+  An unviable mutation isn't a detected mutation, and results from another instrumenter grant no exemption.
+- Pull requests run the fast gate and cross-target checks.
+  The manual or reusable release gate adds native OS tests, sharing on btrfs and XFS, full mutation, coverage, implementation proofs, model replay, fuzzing, Miri, and CodeQL.
+  `STORAGE_SCOUT_REQUIRE_SHARING=1` makes sharing tests fail instead of declining.
 
 ```sh
 mise run check     # fmt, clippy, gates, pure, tests, doctests
 mise run cross     # clippy for Windows, macOS, and Linux targets
 mise run mutants          # mutation testing, every file
-mise run mutants:branch   # only what this branch changes, as a pull request does
+mise run mutants:dry      # list the catalog without executing mutants
+mise run mutants -- --no-config --file crates/core/src/gate.rs
 ```

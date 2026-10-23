@@ -106,7 +106,7 @@ fn identical_build_outputs_come_to_share_their_blocks_without_changing_a_byte() 
     let run = dedupe(root, Mode::Execute);
     assert!(!run.failed(), "{run:#?}");
     assert_eq!(statuses(&run), vec![&PairStatus::Shared; 3]);
-    assert!(run.observed_freed.is_some());
+    assert_eq!(run.observed_freed, None);
     for target in [b, c] {
         assert_eq!(
             fs::read(a.join(RLIB)).unwrap(),

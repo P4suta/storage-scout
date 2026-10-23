@@ -3,6 +3,8 @@ source: crates/cli/tests/rendering.rs
 expression: kinds
 ---
 rust-target          routine Rust target
+swift-package-build  routine SwiftPM .build
+gleam-build          routine Gleam build
 dotnet-output        routine .NET bin/obj
 solution-build       routine solution build
 visual-studio-cache  routine Visual Studio .vs

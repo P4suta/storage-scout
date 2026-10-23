@@ -15,9 +15,37 @@ use std::path::{Component, Path};
 
 use storage_scout_core::candidate::Identity;
 
-use super::{FileMeasure, Pruned, WalkError};
+use super::{FileMeasure, Pruned, VolumeSpace, WalkError};
 
 const BLOCK_UNIT: u64 = 512;
+
+pub(super) fn user_temporary(path: &Path) -> io::Result<bool> {
+    const OTHER_WRITERS: u32 = 0o022;
+    let metadata = fs::metadata(path)?;
+    // SAFETY: geteuid takes no pointers and does not mutate process state.
+    let caller = unsafe { libc::geteuid() };
+    Ok(metadata.is_dir() && metadata.uid() == caller && metadata.mode() & OTHER_WRITERS == 0)
+}
+
+pub(super) fn swift_lock_path(root: &Path) -> io::Result<std::path::PathBuf> {
+    const NAME_BYTES: usize = 255;
+    let canonical = fs::canonicalize(root)?;
+    let text = canonical
+        .to_str()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
+    let relative = text
+        .strip_prefix('/')
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let name = format!("_{}.lock", relative.replace(['/', ':'], "_"));
+    let mut start = name.len().saturating_sub(NAME_BYTES);
+    while !name.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    let suffix = name
+        .get(start..)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    Ok(std::env::temp_dir().join(suffix))
+}
 
 fn identity_from(dev: u64, ino: u64) -> Identity {
     Identity {
@@ -60,7 +88,7 @@ pub(super) fn c_path(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes).map_err(|_interior_nul| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
-pub(super) fn free_space(path: &Path) -> io::Result<u64> {
+pub(super) fn volume_space(path: &Path) -> io::Result<VolumeSpace> {
     let path = c_path(path.as_os_str().as_bytes())?;
     let mut stat = MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `path` is NUL-terminated and `stat` is a writable buffer of the exact type.
@@ -70,7 +98,12 @@ pub(super) fn free_space(path: &Path) -> io::Result<u64> {
     }
     // SAFETY: `statvfs` returned 0, so it initialised the buffer.
     let stat = unsafe { stat.assume_init() };
-    Ok(widen(stat.f_bavail).saturating_mul(widen(stat.f_frsize)))
+    let unit = widen(stat.f_frsize);
+    Ok(VolumeSpace {
+        total: widen(stat.f_blocks).saturating_mul(unit),
+        free: widen(stat.f_bfree).saturating_mul(unit),
+        available: widen(stat.f_bavail).saturating_mul(unit),
+    })
 }
 
 fn widen<T: Into<u64>>(value: T) -> u64 {

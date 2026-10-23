@@ -1,0 +1,81 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>P4suta/renovate-config"
+  ],
+  "packageRules": [
+    {
+      "description": "The mise Cargo manager treats repository-backed tools as registry crates.",
+      "matchManagers": [
+        "mise"
+      ],
+      "matchDepNames": [
+        "cargo:P4suta/OComment"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Mise regenerates native npm sidecars from the declared tool versions.",
+      "matchFileNames": [
+        ".mise/locks/**"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Verification adapters need an explicit compatibility review when their tools change.",
+      "matchDepNames": [
+        "cargo:cargo-mutants",
+        "cargo-mutants",
+        "cargo:kani-verifier",
+        "kani-verifier",
+        "github:Z3Prover/z3",
+        "npm:@informalsystems/quint"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Miri nightly changes require the pinned interpreter checks to pass.",
+      "matchFileNames": ["tools/miri/rust-toolchain.toml"],
+      "automerge": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^mise\\.toml$/"
+      ],
+      "matchStrings": [
+        "\"cargo:P4suta/OComment\"\\s*=\\s*\\{\\s*version\\s*=\\s*\"rev:(?<currentDigest>[a-f0-9]{40})\""
+      ],
+      "currentValueTemplate": "main",
+      "depNameTemplate": "P4suta/OComment",
+      "packageNameTemplate": "https://github.com/P4suta/OComment",
+      "datasourceTemplate": "git-refs"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^mise\\.toml$/"
+      ],
+      "matchStrings": [
+        "RUSTUP_TOOLCHAIN\\s*=\\s*\"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\""
+      ],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "rust-version",
+      "versioningTemplate": "rust-release-channel"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^xtask/src/assurance/ingress\\.rs$/"
+      ],
+      "matchStrings": [
+        "kani_version\"?\\s*(?:==|:)\\s*\"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\""
+      ],
+      "depNameTemplate": "kani-verifier",
+      "datasourceTemplate": "crate",
+      "versioningTemplate": "semver"
+    }
+  ]
+}

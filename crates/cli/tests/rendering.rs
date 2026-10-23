@@ -2,7 +2,7 @@
 
 use storage_scout::core::artifact::{Kind, Tier};
 use storage_scout::core::gate::{Mandate, TierGrant};
-use storage_scout::core::size::Bytes;
+use storage_scout::core::size::{Bytes, Reconciliation};
 use storage_scout::{
     Cause, Color, Measure, Mode, ScanOptions, Scout, WatchRecord, render_clean, render_explain,
     render_prune, render_scan, render_watch,
@@ -57,9 +57,12 @@ fn options(root: &std::path::Path) -> ScanOptions {
 fn a_scan_report() {
     let temp = tempdir("render-scan");
     fixture(temp.path());
-    let report = Scout::with(testkit::open_protection())
+    let mut report = Scout::with(testkit::open_protection())
         .confined(vec![temp.path().to_path_buf()])
         .scan(&options(temp.path()));
+    for volume in &mut report.volumes {
+        volume.reconciliation = Reconciliation::new(Bytes::new(1024 * 1024), Bytes::ZERO);
+    }
     stable!(insta::assert_snapshot!(render(|out| render_scan(
         &report,
         Color::Never,
@@ -70,8 +73,9 @@ fn a_scan_report() {
 #[test]
 fn a_dry_run() {
     let temp = tempdir("render-clean");
+    testkit::write_orphaned_worktree(temp.path());
     fixture(temp.path());
-    let scout = Scout::with(testkit::open_protection()).confined(vec![temp.path().to_path_buf()]);
+    let scout = Scout::with(testkit::open_protection()).confined(vec![testkit::ceiling()]);
     let report = scout.discover(&options(temp.path())).unwrap();
     let ids = report
         .candidates
@@ -95,8 +99,9 @@ fn a_dry_run() {
 #[test]
 fn an_explanation_that_holds_and_one_that_refuses() {
     let temp = tempdir("render-explain");
+    testkit::write_orphaned_worktree(temp.path());
     fixture(temp.path());
-    let scout = Scout::with(testkit::open_protection()).confined(vec![temp.path().to_path_buf()]);
+    let scout = Scout::with(testkit::open_protection()).confined(vec![testkit::ceiling()]);
     let eligible = scout
         .explain(&temp.path().join("proj/target"), &[], Mandate::default())
         .unwrap();

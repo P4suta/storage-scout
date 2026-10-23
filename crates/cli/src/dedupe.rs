@@ -22,11 +22,10 @@ use storage_scout_core::share::{
     self, Capability, Extras, Failure, Fingerprint, Group, MINIMUM, Method, Pair, Pairing, Record,
     Refusal, TEMPORARY_SUFFIX,
 };
-use storage_scout_core::size::Bytes;
+use storage_scout_core::size::{Bytes, Reclamation};
 
 use self::capability::Shareable;
 use crate::apply::Mode;
-use crate::measure::Volumes;
 use crate::platform::{self, Event, FileFacts, Request};
 use crate::scan::Found;
 #[cfg(target_os = "macos")]
@@ -169,9 +168,16 @@ struct Inventory {
     unreadable: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Access<'a> {
+    pub(crate) protection: &'a Protection,
+    pub(crate) owners: &'a crate::owners::Owners,
+}
+
 struct Terms<'a> {
     excludes: &'a [Location],
     protection: &'a Protection,
+    owners: &'a crate::owners::Owners,
 }
 
 fn capability(path: &Path) -> Result<Capability, Rejection> {
@@ -184,7 +190,7 @@ fn capability(path: &Path) -> Result<Capability, Rejection> {
 fn admit(found: &Found, terms: &Terms<'_>) -> Result<Method, Rejection> {
     let observed = observe::observe(found.path())?;
     let site = observed.site(terms.protection, terms.excludes);
-    let survey = busy::survey(&observed.path)?;
+    let survey = terms.owners.survey(&observed.path)?;
     let liveness = match busy::probe(&survey.locks) {
         Ok(()) => Liveness::Free,
         Err(contention) => contention.liveness(),
@@ -201,7 +207,7 @@ fn admit(found: &Found, terms: &Terms<'_>) -> Result<Method, Rejection> {
 fn hold(found: &Found, terms: &Terms<'_>) -> Result<Shareable, Rejection> {
     let observed = observe::observe(found.path())?;
     let site = observed.site(terms.protection, terms.excludes);
-    let survey = busy::survey(&observed.path)?;
+    let survey = terms.owners.survey(&observed.path)?;
     let lease = busy::lease(&survey.locks);
     let liveness = match &lease {
         Ok(_) => Liveness::Free,
@@ -389,15 +395,6 @@ fn settle<'f>(
     }
 }
 
-fn free_space<'f>(found: impl Iterator<Item = &'f Found>) -> Volumes {
-    Volumes::sample(found.map(|each| {
-        (
-            each.candidate().identity().volume,
-            each.path().parent().unwrap_or_else(|| each.path()),
-        )
-    }))
-}
-
 struct Stock {
     found: Found,
     subject: Subject,
@@ -580,14 +577,15 @@ impl Pool {
         found: &Found,
         cached: CachedStock,
         excludes: &[Location],
-        protection: &Protection,
+        access: Access<'_>,
     ) -> bool {
         if cached.root != found.path() || cached.identity != found.candidate().identity() {
             return false;
         }
         let terms = Terms {
             excludes,
-            protection,
+            protection: access.protection,
+            owners: access.owners,
         };
         let (admission, method, files, replace) = match admit(found, &terms) {
             Ok(method) => (
@@ -653,11 +651,12 @@ impl Pool {
         &mut self,
         found: &Found,
         excludes: &[Location],
-        protection: &Protection,
+        access: Access<'_>,
     ) -> BTreeMap<Identity, u64> {
         let terms = Terms {
             excludes,
-            protection,
+            protection: access.protection,
+            owners: access.owners,
         };
         let known = match self.stocks.remove(found.path()) {
             Some(old) => {
@@ -851,25 +850,15 @@ impl Pool {
         &self,
         focus: &Focus<'_>,
         excludes: &[Location],
-        protection: &Protection,
+        access: Access<'_>,
         mode: Mode,
     ) -> DedupeRun {
         let terms = Terms {
             excludes,
-            protection,
+            protection: access.protection,
+            owners: access.owners,
         };
         let (subjects, items) = self.items(focus);
-        let found = || {
-            items
-                .iter()
-                .map(|item| (item.found.path(), item.found))
-                .collect::<BTreeMap<_, _>>()
-                .into_values()
-        };
-        let before = match mode {
-            Mode::Execute => Some(free_space(found())),
-            Mode::DryRun => None,
-        };
         let sized = share::groups(&items)
             .into_iter()
             .filter(|group| focus.group(group))
@@ -924,13 +913,22 @@ impl Pool {
             });
         }
         drop(held);
+        let observed_freed = match mode {
+            Mode::DryRun => None,
+            Mode::Execute => if totals.shared.files > 0 || totals.failed.files > 0 {
+                Reclamation::Unattributable
+            } else {
+                Reclamation::Unchanged
+            }
+            .observed(),
+        };
         DedupeRun {
             schema_version: SCHEMA_VERSION,
             command: "dedupe",
             mode,
             subjects,
             totals,
-            observed_freed: before.and_then(|before| before.gained(&free_space(found()))),
+            observed_freed,
             pairs: outcomes,
         }
     }
@@ -939,14 +937,14 @@ impl Pool {
 pub(crate) fn run(
     found: &[Found],
     excludes: &[Location],
-    protection: &Protection,
+    access: Access<'_>,
     mode: Mode,
 ) -> DedupeRun {
     let mut pool = Pool::default();
     for each in found {
-        let _fresh = pool.stock(each, excludes, protection);
+        let _fresh = pool.stock(each, excludes, access);
     }
-    pool.share(&Focus::Everything, excludes, protection, mode)
+    pool.share(&Focus::Everything, excludes, access, mode)
 }
 
 #[cfg(test)]
@@ -1221,7 +1219,12 @@ mod tests {
         let found = sighted.report.candidates.first().unwrap().clone();
         let protection = testkit::open_protection();
         let mut pool = Pool::default();
-        let first = pool.stock(&found, &[], &protection);
+        let owners = crate::owners::Owners::new(vec![testkit::ceiling()]);
+        let access = Access {
+            protection: &protection,
+            owners: &owners,
+        };
+        let first = pool.stock(&found, &[], access);
         let admitted = pool.stocks.get(found.path()).unwrap().method.is_some();
         if !admitted {
             let required = std::env::var_os("STORAGE_SCOUT_REQUIRE_SHARING").is_some();
@@ -1232,12 +1235,12 @@ mod tests {
         }
         let one = platform::identity(&target.join("debug/deps/one.rlib")).unwrap();
         assert_eq!(first, BTreeMap::from([(one, MINIMUM)]));
-        assert!(pool.stock(&found, &[], &protection).is_empty());
+        assert!(pool.stock(&found, &[], access).is_empty());
         assert!(pool.lengths(&Focus::Everything).is_empty());
         testkit::write_patterned(&target.join("debug/deps/two.rlib"), MINIMUM, 2);
         let two = platform::identity(&target.join("debug/deps/two.rlib")).unwrap();
         assert_eq!(
-            pool.stock(&found, &[], &protection),
+            pool.stock(&found, &[], access),
             BTreeMap::from([(two, MINIMUM)])
         );
         assert_eq!(pool.lengths(&Focus::Everything), BTreeSet::from([MINIMUM]));
@@ -1336,7 +1339,16 @@ mod tests {
         };
         let protection = testkit::open_protection();
         let mut pool = Pool::default();
-        assert!(pool.restore(&found, cached, &[], &protection));
+        let owners = crate::owners::Owners::new(vec![testkit::ceiling()]);
+        assert!(pool.restore(
+            &found,
+            cached,
+            &[],
+            Access {
+                protection: &protection,
+                owners: &owners
+            }
+        ));
         match &pool.stocks[&target].subject.admission {
             Admission::Admitted {
                 files, unreadable, ..

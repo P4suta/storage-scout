@@ -1,0 +1,7 @@
+[select]
+roots = ["/work", "C:\\work"]
+kinds = ["rust-target"]
+exclude = ["/work/keep"]
+include_tier = ["reinstallable", "expensive"]
+[report]
+log_file = "/log"
