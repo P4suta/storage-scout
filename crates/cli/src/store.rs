@@ -46,6 +46,12 @@ pub(crate) fn append_line(path: &Path, document: &impl Serialize) -> io::Result<
 }
 
 pub(crate) fn state_dir() -> io::Result<PathBuf> {
+    let base = state_path()?;
+    create(&base)?;
+    Ok(base)
+}
+
+pub(crate) fn state_path() -> io::Result<PathBuf> {
     let base = match std::env::var_os("STORAGE_SCOUT_STATE_DIR") {
         Some(explicit) if !explicit.is_empty() => PathBuf::from(explicit),
         Some(_) | None => match std::env::var_os("XDG_STATE_HOME") {
@@ -55,8 +61,112 @@ pub(crate) fn state_dir() -> io::Result<PathBuf> {
                 .join(".local/state/storage-scout"),
         },
     };
-    create(&base)?;
     Ok(base)
+}
+
+pub(crate) fn release_paths(state: &Path, root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let key = hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes()));
+    (
+        state.join(format!("release-{key}.bin")),
+        state.join(format!("release-{key}.lock")),
+        state.join(format!("release-{key}.endpoint")),
+    )
+}
+
+#[derive(Debug)]
+pub(crate) struct ReleaseFile {
+    path: PathBuf,
+    endpoint: PathBuf,
+    _lock: File,
+}
+
+impl ReleaseFile {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the store owns checkout release records"
+    )]
+    pub(crate) fn begin(state: &Path, root: &Path) -> io::Result<Self> {
+        create(state)?;
+        let (path, lock_path, endpoint) = release_paths(state, root);
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)?;
+        lock.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+            TryLockError::Error(error) => error,
+        })?;
+        let record = Self {
+            path,
+            endpoint,
+            _lock: lock,
+        };
+        record.invalidate()?;
+        Ok(record)
+    }
+
+    pub(crate) fn record(
+        &self,
+        record: storage_scout_core::ownership::ReleaseRecord,
+        channel: &Path,
+    ) -> io::Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+        let mut endpoint = tempfile::NamedTempFile::new_in(parent)?;
+        endpoint.write_all(
+            channel
+                .to_str()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?
+                .as_bytes(),
+        )?;
+        endpoint
+            .persist(&self.endpoint)
+            .map_err(|error| error.error)?;
+        staged.write_all(&record.encode())?;
+        staged.as_file().sync_all()?;
+        staged.persist(&self.path).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the store removes only its own release record"
+    )]
+    pub(crate) fn invalidate(&self) -> io::Result<()> {
+        for path in [&self.path, &self.endpoint] {
+            match fs::remove_file(path) {
+                Ok(()) => {},
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReleaseFile {
+    fn drop(&mut self) {
+        let _removed = self.invalidate();
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn release_channel(state: &Path) -> io::Result<tempfile::TempDir> {
+    create(state)?;
+    let state = fs::canonicalize(state)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".storage-scout-release-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        const PRIVATE_DIRECTORY: u32 = 0o700;
+        builder.permissions(fs::Permissions::from_mode(PRIVATE_DIRECTORY));
+    }
+    builder.tempdir_in(state)
 }
 
 #[expect(
@@ -357,7 +467,8 @@ fn parse_root_value(mut value: &[u8]) -> Option<(Identity, usize)> {
 
 #[cfg(target_os = "macos")]
 fn facts_value(facts: FileFacts) -> Vec<u8> {
-    let mut value = Vec::with_capacity(51);
+    const FACT_CAPACITY: usize = 51;
+    let mut value = Vec::with_capacity(FACT_CAPACITY);
     value.extend_from_slice(&facts.identity.volume.to_le_bytes());
     value.extend_from_slice(&facts.identity.file.to_le_bytes());
     value.extend_from_slice(&facts.len.to_le_bytes());
@@ -427,7 +538,7 @@ fn file_key(root: &Path, relative: &Path) -> io::Result<Vec<u8>> {
         u32::try_from(root.len()).map_err(|_wide| io::Error::from(io::ErrorKind::InvalidInput))?;
     let relative = relative.as_os_str().as_bytes();
     let mut key = Vec::with_capacity(
-        4usize
+        size_of::<u32>()
             .saturating_add(root.len())
             .saturating_add(relative.len()),
     );
@@ -637,13 +748,14 @@ mod cache_tests {
     use super::*;
 
     const fn facts(volume: u64, file: u128, len: u64) -> FileFacts {
+        const FIXTURE_CLUSTER: u64 = 7;
         FileFacts {
             identity: Identity { volume, file },
             len,
             links: 1,
             owner: Owner::Caller,
             mode: Mode::Executable,
-            sharing: Sharing::Cluster(7),
+            sharing: Sharing::Cluster(FIXTURE_CLUSTER),
         }
     }
 

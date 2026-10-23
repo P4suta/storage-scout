@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use storage_scout_core::candidate::Identity;
+use storage_scout_core::gate::Shape;
 use storage_scout_core::location::Location;
 use storage_scout_core::lock::{Liveness, Protocol};
 use storage_scout_core::reject::{FsOp, Rejection};
@@ -11,6 +12,12 @@ use storage_scout_core::reject::{FsOp, Rejection};
 use crate::{failure, host, platform};
 
 const CARGO_INTERNALS: [&str; 5] = ["deps", "incremental", ".fingerprint", "build", "examples"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recognition {
+    Artifacts,
+    Owners,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Lock {
@@ -35,11 +42,27 @@ pub(crate) struct Survey {
     pub markers: Vec<PathBuf>,
 }
 
+impl Survey {
+    pub(crate) fn owner(&mut self, path: PathBuf) -> Result<(), Rejection> {
+        self.locks.push(Lock {
+            location: host::locate(&path)?,
+            path,
+            protocol: Protocol::TempOwner,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn order(&mut self) {
+        self.locks.sort_by(|left, right| left.path.cmp(&right.path));
+        self.locks.dedup_by(|left, right| left.path == right.path);
+    }
+}
+
 pub(crate) fn survey(root: &Path) -> Result<Survey, Rejection> {
     let mut locks = Vec::new();
     let mut markers = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
+    let mut pending = vec![(root.to_path_buf(), Recognition::Artifacts)];
+    while let Some((directory, recognition)) = pending.pop() {
         let entries = fs::read_dir(&directory)
             .map_err(|e| failure::io(&directory, FsOp::ReadDir, &e))?
             .collect::<Result<Vec<_>, _>>()
@@ -47,23 +70,40 @@ pub(crate) fn survey(root: &Path) -> Result<Survey, Rejection> {
         let profile = entries
             .iter()
             .any(|entry| entry.file_name() == ".fingerprint");
+        let project = entries.iter().any(|entry| {
+            ["Cargo.toml", "Package.swift", "gleam.toml", "package.json"]
+                .iter()
+                .any(|name| entry.file_name() == *name)
+        });
+        if swift_workspace(&directory, &entries)? {
+            let path = platform::swift_lock_path(&directory)
+                .map_err(|error| failure::io(&directory, FsOp::Lock, &error))?;
+            locks.push(Lock {
+                location: host::locate(&path)?,
+                path,
+                protocol: Protocol::SwiftPackage,
+            });
+        }
         for entry in entries {
             let path = entry.path();
-            let kind = entry
-                .file_type()
-                .map_err(|e| failure::io(&path, FsOp::FileType, &e))?;
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|e| failure::io(&path, FsOp::FileType, &e))?;
             let name = entry.file_name();
-            if kind.is_dir() {
-                let internal = CARGO_INTERNALS
-                    .iter()
-                    .any(|skip| name.as_encoded_bytes() == skip.as_bytes());
-                if !(profile && internal) {
-                    pending.push(path);
-                }
-            } else if kind.is_file() {
+            if platform::shape(&metadata) == Shape::Directory {
+                let next = if project {
+                    Recognition::Artifacts
+                } else if profile && CARGO_INTERNALS.iter().any(|internal| name == *internal) {
+                    Recognition::Owners
+                } else {
+                    recognition
+                };
+                pending.push((path, next));
+            } else if platform::shape(&metadata) == Shape::File {
                 if name == crate::owners::MARKER_NAME {
                     markers.push(directory.clone());
-                } else if let Some(protocol) = Protocol::of(name.as_encoded_bytes()) {
+                } else if let Some(protocol) = Protocol::of(name.as_encoded_bytes())
+                    && (recognition == Recognition::Artifacts || protocol == Protocol::TempOwner)
+                {
                     locks.push(Lock {
                         location: host::locate(&path)?,
                         path,
@@ -76,6 +116,30 @@ pub(crate) fn survey(root: &Path) -> Result<Survey, Rejection> {
     locks.sort_by(|left, right| left.path.cmp(&right.path));
     markers.sort();
     Ok(Survey { locks, markers })
+}
+
+fn swift_workspace(directory: &Path, entries: &[fs::DirEntry]) -> Result<bool, Rejection> {
+    if !directory
+        .file_name()
+        .is_some_and(|name| name.as_encoded_bytes().eq_ignore_ascii_case(b".build"))
+    {
+        return Ok(false);
+    }
+    if entries
+        .iter()
+        .any(|entry| entry.file_name() == "workspace-state.json" || entry.file_name() == ".lock")
+    {
+        return Ok(true);
+    }
+    let Some(parent) = directory.parent() else {
+        return Ok(false);
+    };
+    let manifest = parent.join("Package.swift");
+    match fs::symlink_metadata(&manifest) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(failure::io(&manifest, FsOp::Metadata, &error)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +177,12 @@ enum Attempt {
 fn attempt(lock: &Lock) -> Attempt {
     let file = match File::open(&lock.path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Attempt::Vanished,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return match lock.protocol.presence() {
+                storage_scout_core::lock::Presence::Optional => Attempt::Vanished,
+                storage_scout_core::lock::Presence::Required => Attempt::Unknown,
+            };
+        },
         Err(_unreadable) => return Attempt::Unknown,
     };
     match file.try_lock() {

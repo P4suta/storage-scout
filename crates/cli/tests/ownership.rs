@@ -121,6 +121,126 @@ fn the_primary_worktree_is_always_in_use() {
     assert_eq!(repo.settlement(&target), Settlement::Active);
 }
 
+fn release_fixture(name: &str) -> (testkit::Scratch, Scout, PathBuf, PathBuf) {
+    let temp = tempdir(name);
+    let work = temp.path().join("work");
+    testkit::make_dir(&work);
+    let git = Git::isolated(temp.path());
+    git.run(&work, &["init", "--quiet"]);
+    git.commit_file(&work, "Cargo.toml", "[package]\nname = 'x'\n");
+    git.commit_file(&work, ".gitignore", "target/\n");
+    git.commit_file(&work, "src/lib.rs", "pub fn one() {}\n");
+    let target = build(&work);
+    let scout = Scout::with(testkit::open_protection())
+        .confined(vec![temp.path().to_path_buf()])
+        .state_directory(temp.path().join("state"));
+    (temp, scout, work, target)
+}
+
+fn release_supported(scout: &Scout, work: &Path) -> Option<storage_scout::CheckoutRelease> {
+    match scout.release(work) {
+        Ok(lease) => Some(lease),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            testkit::decline("native checkout release events");
+            None
+        },
+        Err(error) => panic!("checkout release failed: {error}"),
+    }
+}
+
+#[test]
+fn a_recorded_primary_release_is_reaped_by_auto() {
+    let (_temp, scout, work, target) = release_fixture("released-primary");
+    let Some(lease) = release_supported(&scout, &work) else {
+        return;
+    };
+    assert_eq!(settlement(&scout, &work, &target), Settlement::Released);
+    let policy = AutoPolicy::parse(&format!(
+        "[select]\nroots = [{}]\n",
+        serde_json::to_string(&work).unwrap()
+    ))
+    .unwrap();
+    let result = scout.auto(&policy, Mode::Execute).unwrap();
+    assert_eq!(result.reap.selected, 1);
+    testkit::assert_absent(target);
+    drop(lease);
+    testkit::assert_present(work.join("src/lib.rs"));
+}
+
+#[test]
+fn a_build_after_release_revokes_the_release_before_auto() {
+    let (_temp, scout, work, target) = release_fixture("release-build");
+    let Some(lease) = release_supported(&scout, &work) else {
+        return;
+    };
+    write_bytes(&target.join("debug/app"), &[b'y'; 4096]);
+    assert_eq!(settlement(&scout, &work, &target), Settlement::Active);
+    let policy = AutoPolicy::parse(&format!(
+        "[select]\nroots = [{}]\n",
+        serde_json::to_string(&work).unwrap()
+    ))
+    .unwrap();
+    assert_eq!(scout.auto(&policy, Mode::Execute).unwrap().reap.selected, 0);
+    testkit::assert_present(target);
+    drop(lease);
+}
+
+#[test]
+fn a_write_that_restores_the_same_bytes_still_revokes_a_live_release() {
+    let (_temp, scout, work, target) = release_fixture("release-restored-write");
+    let Some(lease) = release_supported(&scout, &work) else {
+        return;
+    };
+    write_bytes(&work.join("src/lib.rs"), b"pub fn changed() {}\n");
+    write_bytes(&work.join("src/lib.rs"), b"pub fn one() {}\n");
+    assert_eq!(settlement(&scout, &work, &target), Settlement::Active);
+    lease.wait().unwrap();
+    testkit::assert_present(target);
+}
+
+#[test]
+fn stopping_the_release_monitor_and_held_build_locks_keep_the_target_active() {
+    if !testkit::native_checkout_events() {
+        testkit::decline("native checkout release events");
+        return;
+    }
+    let (_temp, scout, work, target) = release_fixture("release-stopped");
+    write_sized(&target.join("debug/.cargo-lock"), 0);
+    let held = fs::File::open(target.join("debug/.cargo-lock")).unwrap();
+    held.lock().unwrap();
+    assert_eq!(
+        scout.release(&work).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(held);
+    let lease = scout.release(&work).unwrap();
+    drop(lease);
+    assert_eq!(settlement(&scout, &work, &target), Settlement::Active);
+    testkit::assert_present(target);
+}
+
+#[test]
+fn an_idle_local_peer_cannot_block_revoking_a_checkout_release() {
+    let (temp, scout, work, target) = release_fixture("c");
+    let Some(lease) = release_supported(&scout, &work) else {
+        return;
+    };
+    let endpoint = fs::read_dir(temp.path().join("state"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "endpoint")
+        })
+        .unwrap();
+    let socket = PathBuf::from(fs::read_to_string(&endpoint).unwrap());
+    let client = testkit::idle_local_client(&socket).unwrap();
+    drop(lease);
+    testkit::assert_absent(endpoint);
+    assert_eq!(settlement(&scout, &work, &target), Settlement::Active);
+    drop(client);
+}
+
 #[test]
 fn a_named_branch_without_its_own_commits_is_about_to_be_worked_on() {
     let repo = Repo::new("own-fresh");

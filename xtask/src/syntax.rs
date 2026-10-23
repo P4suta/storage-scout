@@ -23,6 +23,25 @@ const CAPABILITY: &[&str] = &[
 
 const RESTRICTIONS: &[Restriction] = &[
     Restriction {
+        segments: &["ToolchainRemoval"],
+        allowed: &[
+            "crates/cli/src/managed.rs",
+            "crates/cli/src/managed/toolchains.rs",
+            "crates/cli/src/platform/spawn.rs",
+        ],
+        rule: "only the managed adapter may mint a toolchain removal capability",
+    },
+    Restriction {
+        segments: &["prune_images"],
+        allowed: &["crates/cli/src/platform/engine.rs"],
+        rule: "only the engine adapter may prune images with a managed clearance",
+    },
+    Restriction {
+        segments: &["prune_build"],
+        allowed: &["crates/cli/src/platform/engine.rs"],
+        rule: "only the engine adapter may prune build cache with a managed clearance",
+    },
+    Restriction {
         segments: &["remove_tree"],
         allowed: CAPABILITY,
         rule: "only apply::capability may remove a tree, and only with an Authorized",
@@ -148,11 +167,20 @@ const RESTRICTIONS: &[Restriction] = &[
         allowed: &[
             "crates/cli/src/observe/git.rs",
             "crates/cli/src/platform/spawn.rs",
+            "xtask/src/assurance/runner.rs",
         ],
         rule: "processes start only through observe::git and platform::spawn",
     },
     Restriction {
         segments: &["toml", "from_str"],
+        allowed: &[
+            "crates/cli/src/ingress.rs",
+            "xtask/src/assurance/ingress.rs",
+        ],
+        rule: "untrusted input is decoded only in ingress",
+    },
+    Restriction {
+        segments: &["serde_json", "from_value"],
         allowed: &["crates/cli/src/ingress.rs"],
         rule: "untrusted input is decoded only in ingress",
     },
@@ -163,7 +191,10 @@ const RESTRICTIONS: &[Restriction] = &[
     },
     Restriction {
         segments: &["serde_json", "from_slice"],
-        allowed: &["crates/cli/src/ingress.rs"],
+        allowed: &[
+            "crates/cli/src/ingress.rs",
+            "xtask/src/assurance/ingress.rs",
+        ],
         rule: "untrusted input is decoded only in ingress",
     },
     Restriction {
@@ -178,7 +209,7 @@ const RESTRICTIONS: &[Restriction] = &[
     },
     Restriction {
         segments: &["create_dir_all"],
-        allowed: &["crates/cli/src/store.rs"],
+        allowed: &["crates/cli/src/store.rs", "xtask/src/assurance/runner.rs"],
         rule: "directories storage-scout creates are made only in store",
     },
 ];
@@ -259,6 +290,10 @@ fn is_test_attribute(attrs: &[syn::Attribute]) -> bool {
 }
 
 impl<'ast> Visit<'ast> for Gate<'_> {
+    fn visit_expr_method_call(&mut self, expr: &'ast syn::ExprMethodCall) {
+        self.check_segments(&[expr.method.to_string()], expr.method.span());
+        visit::visit_expr_method_call(self, expr);
+    }
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         let test = is_test_attribute(&item.attrs);
         self.tests = self.tests.saturating_add(usize::from(test));
@@ -267,7 +302,7 @@ impl<'ast> Visit<'ast> for Gate<'_> {
     }
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        if item.sig.unsafety.is_some() && !allowed(self.file, PLATFORM) {
+        if matches!(item.sig.safety, syn::Safety::Unsafe(_)) && !allowed(self.file, PLATFORM) {
             self.flag(item.sig.span(), "unsafe code lives only in platform");
         }
         let test = is_test_attribute(&item.attrs);
@@ -367,86 +402,124 @@ mod tests {
 
     #[test]
     fn removal_outside_the_capability_is_flagged() {
-        assert!(
-            !rules(
+        assert_ne!(
+            rules(
                 "fn f() { platform::remove_tree(); }",
                 "crates/cli/src/scan.rs"
-            )
-            .is_empty()
+            ),
+            Vec::<&str>::new()
         );
-        assert!(
+        assert_eq!(
             rules(
                 "fn f() { platform::remove_tree(); }",
                 "crates/cli/src/apply/capability.rs"
-            )
-            .is_empty()
+            ),
+            Vec::<&str>::new()
         );
-        assert!(
-            !rules(
+        assert_ne!(
+            rules(
                 "use std::fs::remove_dir_all;",
                 "crates/cli/src/platform/unix.rs"
-            )
-            .is_empty()
+            ),
+            Vec::<&str>::new()
         );
     }
 
     #[test]
     fn unsafe_outside_platform_is_flagged() {
-        assert!(!rules("fn f() { unsafe { g() } }", "crates/cli/src/scan.rs").is_empty());
-        assert!(
+        assert_ne!(
+            rules("fn f() { unsafe { g() } }", "crates/cli/src/scan.rs"),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
             rules(
                 "fn f() { unsafe { g() } }",
                 "crates/cli/src/platform/unix.rs"
-            )
-            .is_empty()
+            ),
+            Vec::<&str>::new()
         );
     }
 
     #[test]
     fn decoding_outside_ingress_is_flagged() {
-        assert!(
-            !rules(
+        assert_ne!(
+            rules(
                 "fn f() { toml::from_str::<T>(s); }",
                 "crates/cli/src/auto.rs"
-            )
-            .is_empty()
+            ),
+            Vec::<&str>::new()
         );
-        assert!(
+        assert_eq!(
             rules(
                 "fn f() { toml::from_str::<T>(s); }",
                 "crates/cli/src/ingress.rs"
-            )
-            .is_empty()
+            ),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn engine_mutators_and_toolchain_capabilities_stay_with_their_adapters() {
+        assert_ne!(
+            rules(
+                "fn f(client: Client) { client.prune_images(None); }",
+                "crates/cli/src/scan.rs"
+            ),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            rules(
+                "fn f(client: Client) { client.prune_images(None); }",
+                "crates/cli/src/platform/engine.rs"
+            ),
+            Vec::<&str>::new()
+        );
+        assert_ne!(
+            rules(
+                "fn f(client: Client) { client.prune_build(None); }",
+                "crates/cli/src/scan.rs"
+            ),
+            Vec::<&str>::new()
+        );
+        assert_ne!(
+            rules(
+                "fn f() { let x = ToolchainRemoval {}; }",
+                "crates/cli/src/scan.rs"
+            ),
+            Vec::<&str>::new()
         );
     }
 
     #[test]
     fn guessing_serde_attributes_are_flagged() {
-        assert!(!rules("#[serde(untagged)] enum E { A }", "crates/core/src/x.rs").is_empty());
-        assert!(
-            !rules(
+        assert_ne!(
+            rules("#[serde(untagged)] enum E { A }", "crates/core/src/x.rs"),
+            Vec::<&str>::new()
+        );
+        assert_ne!(
+            rules(
                 "struct S { #[serde(default)] a: u8 }",
                 "crates/core/src/x.rs"
-            )
-            .is_empty()
+            ),
+            Vec::<&str>::new()
         );
-        assert!(
+        assert_eq!(
             rules(
                 "#[serde(tag = \"kind\")] enum E { A }",
                 "crates/core/src/x.rs"
-            )
-            .is_empty()
+            ),
+            Vec::<&str>::new()
         );
     }
 
     #[test]
     fn test_modules_may_use_restricted_paths() {
-        assert!(
+        assert_eq!(
             rules(
                 "#[cfg(test)] mod tests { fn f() { toml::from_str::<T>(s); } }",
                 "crates/cli/src/auto.rs"
-            )
-            .is_empty()
+            ),
+            Vec::<&str>::new()
         );
     }
 }

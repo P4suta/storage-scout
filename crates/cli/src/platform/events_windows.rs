@@ -15,10 +15,11 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    ReadDirectoryChangesW,
+    CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
+    FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
 };
 use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Threading::{
@@ -32,6 +33,9 @@ type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 
 const WORDS: usize = 16 * 1024;
 const HEADER: usize = 12;
+const WORD_BYTES: usize = size_of::<u32>();
+const ACTION_OFFSET: usize = WORD_BYTES;
+const NAME_LENGTH_OFFSET: usize = 2 * WORD_BYTES;
 const FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
     | FILE_NOTIFY_CHANGE_DIR_NAME
     | FILE_NOTIFY_CHANGE_SIZE
@@ -92,14 +96,17 @@ fn listen(notification: &str, deliver: Arc<Deliver>) -> io::Result<()> {
 fn word(bytes: &[u8], at: usize) -> Option<u32> {
     bytes
         .get(at..)?
-        .first_chunk::<4>()
+        .first_chunk::<WORD_BYTES>()
         .map(|word| u32::from_le_bytes(*word))
 }
 
 fn changed(bytes: &[u8], root: &Path, deliver: &Deliver) {
     let mut at = 0usize;
     loop {
-        let (Some(next), Some(len)) = (word(bytes, at), word(bytes, at.saturating_add(8))) else {
+        let (Some(next), Some(len)) = (
+            word(bytes, at),
+            word(bytes, at.saturating_add(NAME_LENGTH_OFFSET)),
+        ) else {
             return;
         };
         let Ok(len) = usize::try_from(len) else {
@@ -117,10 +124,10 @@ fn changed(bytes: &[u8], root: &Path, deliver: &Deliver) {
             .collect::<Vec<_>>();
         deliver(Change::Entry {
             path: root.join(OsString::from_wide(&units)),
-            event: match word(bytes, at.saturating_add(4)) {
-                Some(1 | 5) => Event::Appeared,
-                Some(2 | 4) => Event::Vanished,
-                Some(3) => Event::Written,
+            event: match word(bytes, at.saturating_add(ACTION_OFFSET)) {
+                Some(FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME) => Event::Appeared,
+                Some(FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME) => Event::Vanished,
+                Some(FILE_ACTION_MODIFIED) => Event::Written,
                 Some(_) | None => Event::Unsure,
             },
         });
@@ -135,7 +142,7 @@ fn changed(bytes: &[u8], root: &Path, deliver: &Deliver) {
 }
 
 fn arm(directory: &Directory, buffer: &mut [u32], overlapped: &mut OVERLAPPED) -> io::Result<()> {
-    let capacity = u32::try_from(buffer.len().saturating_mul(4))
+    let capacity = u32::try_from(buffer.len().saturating_mul(WORD_BYTES))
         .map_err(|_wide| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: the handle is an open directory, the buffer is DWORD-aligned and `capacity` bytes long, and both it and `overlapped` stay in place until the read completes.
     let result = unsafe {
@@ -211,6 +218,18 @@ fn follow(
 pub(super) struct Source;
 
 impl Source {
+    pub(super) fn start_release(_paths: &[PathBuf], _deliver: Deliver) -> io::Result<Self> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    #[expect(
+        clippy::unused_self,
+        reason = "native event sources share the barrier interface"
+    )]
+    pub(super) fn barrier(&self) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
     pub(super) fn start(
         paths: &[PathBuf],
         notification: &str,

@@ -17,6 +17,14 @@ name = "cleanup"
 path = "tests/cleanup.rs"
 
 [[test]]
+name = "cleanup_replay"
+path = "tests/cleanup_replay.rs"
+
+[[test]]
+name = "policy_corpus"
+path = "tests/policy_corpus.rs"
+
+[[test]]
 name = "cli"
 path = "tests/cli.rs"
 
@@ -49,6 +57,10 @@ name = "watch"
 path = "tests/watch.rs"
 
 [dependencies]
+bollard.workspace = true
+tokio.workspace = true
+hex.workspace = true
+tempfile.workspace = true
 storage-scout-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
@@ -75,7 +87,6 @@ libc.workspace = true
 testkit.workspace = true
 insta.workspace = true
 proptest.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

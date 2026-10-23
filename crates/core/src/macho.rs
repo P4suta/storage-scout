@@ -4,6 +4,13 @@ const DYLIB: u32 = 0x6;
 const BUNDLE: u32 = 0x8;
 const SYMTAB: u32 = 0x2;
 const DEBUG_OBJECT: u8 = 0x66;
+const WORD_BYTES: usize = size_of::<u32>();
+const FILETYPE_OFFSET: usize = 12;
+const COMMAND_COUNT_OFFSET: usize = 16;
+const COMMAND_BYTES_OFFSET: usize = 20;
+const LOAD_COMMAND_HEADER: usize = 8;
+const STRINGS_LENGTH_FIELD: usize = 3;
+const SYMBOL_TYPE_OFFSET: usize = 4;
 
 pub const HEADER_LEN: usize = 32;
 pub const SYMBOL_LEN: usize = 16;
@@ -30,7 +37,7 @@ pub struct Symtab {
 }
 
 fn word(bytes: &[u8], at: usize) -> Option<u32> {
-    let end = at.checked_add(4)?;
+    let end = at.checked_add(WORD_BYTES)?;
     match bytes.get(at..end) {
         Some(&[a, b, c, d]) => Some(u32::from_le_bytes([a, b, c, d])),
         Some(_) | None => None,
@@ -42,13 +49,13 @@ pub fn header(bytes: &[u8]) -> Result<Commands, MachError> {
     if magic != MAGIC_64 {
         return Err(MachError::NotAnImage);
     }
-    let filetype = word(bytes, 12).ok_or(MachError::Truncated)?;
+    let filetype = word(bytes, FILETYPE_OFFSET).ok_or(MachError::Truncated)?;
     if !matches!(filetype, EXECUTE | DYLIB | BUNDLE) {
         return Err(MachError::NotAnImage);
     }
     Ok(Commands {
-        count: word(bytes, 16).ok_or(MachError::Truncated)?,
-        len: word(bytes, 20).ok_or(MachError::Truncated)?,
+        count: word(bytes, COMMAND_COUNT_OFFSET).ok_or(MachError::Truncated)?,
+        len: word(bytes, COMMAND_BYTES_OFFSET).ok_or(MachError::Truncated)?,
     })
 }
 
@@ -57,10 +64,13 @@ pub fn symtab(commands: &[u8], count: u32) -> Result<Symtab, MachError> {
     let mut found = None;
     for _ in 0..count {
         let command = word(commands, at).ok_or(MachError::Truncated)?;
-        let size = word(commands, at.checked_add(4).ok_or(MachError::Malformed)?)
-            .ok_or(MachError::Truncated)?;
+        let size = word(
+            commands,
+            at.checked_add(WORD_BYTES).ok_or(MachError::Malformed)?,
+        )
+        .ok_or(MachError::Truncated)?;
         let size = usize::try_from(size).map_err(|_wide| MachError::Malformed)?;
-        if size < 8 {
+        if size < LOAD_COMMAND_HEADER {
             return Err(MachError::Malformed);
         }
         if command == SYMTAB {
@@ -69,8 +79,8 @@ pub fn symtab(commands: &[u8], count: u32) -> Result<Symtab, MachError> {
             }
             let field = |index: usize| {
                 index
-                    .checked_mul(4)
-                    .and_then(|offset| offset.checked_add(8))
+                    .checked_mul(WORD_BYTES)
+                    .and_then(|offset| offset.checked_add(LOAD_COMMAND_HEADER))
                     .and_then(|offset| at.checked_add(offset))
                     .and_then(|offset| word(commands, offset))
                     .map(u64::from)
@@ -80,7 +90,7 @@ pub fn symtab(commands: &[u8], count: u32) -> Result<Symtab, MachError> {
                 symbols: field(0)?,
                 count: field(1)?,
                 strings: field(2)?,
-                strings_len: field(3)?,
+                strings_len: field(STRINGS_LENGTH_FIELD)?,
             });
         }
         at = at.checked_add(size).ok_or(MachError::Malformed)?;
@@ -93,7 +103,7 @@ pub fn debug_objects(symbols: &[u8]) -> impl Iterator<Item = u32> + '_ {
         .as_chunks::<SYMBOL_LEN>()
         .0
         .iter()
-        .filter(|symbol| symbol.get(4) == Some(&DEBUG_OBJECT))
+        .filter(|symbol| symbol.get(SYMBOL_TYPE_OFFSET) == Some(&DEBUG_OBJECT))
         .map(|&[a, b, c, d, ..]| u32::from_le_bytes([a, b, c, d]))
 }
 

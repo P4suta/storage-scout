@@ -4,6 +4,7 @@ use core::fmt;
 
 use serde::Serialize;
 
+use crate::candidate::Identity;
 use crate::location::Location;
 use crate::reject::IoFailure;
 
@@ -59,6 +60,84 @@ pub enum OwnerLock {
     Free,
     Missing,
     Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReleaseEvidence {
+    pub recorded_identity: Identity,
+    pub identity: Identity,
+    pub recorded_digest: [u8; 32],
+    pub digest: [u8; 32],
+    pub monitor: OwnerLock,
+    pub writers: OwnerLock,
+}
+
+const RELEASE_TAG: &[u8; 16] = b"scout-release-v1";
+const SHA256_BYTES: usize = 32;
+pub const RELEASE_RECORD_BYTES: usize =
+    RELEASE_TAG.len() + size_of::<u64>() + size_of::<u128>() + SHA256_BYTES;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseRecord {
+    pub identity: Identity,
+    pub digest: [u8; 32],
+}
+
+impl ReleaseRecord {
+    #[must_use]
+    pub const fn encode(self) -> [u8; RELEASE_RECORD_BYTES] {
+        let mut bytes = [0; RELEASE_RECORD_BYTES];
+        let (tag, tail) = bytes.split_at_mut(RELEASE_TAG.len());
+        let (volume, tail) = tail.split_at_mut(size_of::<u64>());
+        let (file, digest) = tail.split_at_mut(size_of::<u128>());
+        tag.copy_from_slice(RELEASE_TAG);
+        volume.copy_from_slice(&self.identity.volume.to_le_bytes());
+        file.copy_from_slice(&self.identity.file.to_le_bytes());
+        digest.copy_from_slice(&self.digest);
+        bytes
+    }
+
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        const TAG_BYTES: usize = RELEASE_TAG.len();
+        const VOLUME_BYTES: usize = size_of::<u64>();
+        const FILE_BYTES: usize = size_of::<u128>();
+        if bytes.len() != RELEASE_RECORD_BYTES {
+            return None;
+        }
+        let (tag, bytes) = bytes.split_first_chunk::<TAG_BYTES>()?;
+        if tag != RELEASE_TAG {
+            return None;
+        }
+        let (volume, bytes) = bytes.split_first_chunk::<VOLUME_BYTES>()?;
+        let (file, bytes) = bytes.split_first_chunk::<FILE_BYTES>()?;
+        let (digest, tail) = bytes.split_first_chunk::<SHA256_BYTES>()?;
+        if !tail.is_empty() {
+            return None;
+        }
+        Some(Self {
+            identity: Identity {
+                volume: u64::from_le_bytes(*volume),
+                file: u128::from_le_bytes(*file),
+            },
+            digest: *digest,
+        })
+    }
+}
+
+impl ReleaseEvidence {
+    #[must_use]
+    pub fn settlement(&self) -> Settlement {
+        if self.recorded_identity == self.identity
+            && self.recorded_digest == self.digest
+            && self.monitor == OwnerLock::Held
+            && self.writers == OwnerLock::Free
+        {
+            Settlement::Released
+        } else {
+            Settlement::Active
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -137,6 +216,10 @@ pub enum Landing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "worktree", rename_all = "kebab-case")]
 pub enum Worktree {
+    Released {
+        root: Location,
+        evidence: ReleaseEvidence,
+    },
     Primary {
         root: Location,
     },
@@ -172,8 +255,9 @@ pub enum GitFailure {
 
 impl Worktree {
     #[must_use]
-    pub const fn settlement(&self) -> Settlement {
+    pub fn settlement(&self) -> Settlement {
         match self {
+            Self::Released { evidence, .. } => evidence.settlement(),
             Self::Primary { .. }
             | Self::Unreadable { .. }
             | Self::Linked {
@@ -273,13 +357,47 @@ impl Ownership {
     }
 }
 
-const fn protection(settlement: Settlement) -> u8 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Protection {
+    Released,
+    Landed,
+    Unclaimed,
+    Active,
+    Kept,
+}
+
+const fn protection(settlement: Settlement) -> Protection {
     match settlement {
-        Settlement::Kept => 4,
-        Settlement::Active => 3,
-        Settlement::Unclaimed => 2,
-        Settlement::Landed => 1,
-        Settlement::Released => 0,
+        Settlement::Kept => Protection::Kept,
+        Settlement::Active => Protection::Active,
+        Settlement::Unclaimed => Protection::Unclaimed,
+        Settlement::Landed => Protection::Landed,
+        Settlement::Released => Protection::Released,
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{Settlement, strongest};
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn strongest_ownership_protection_is_ordered() {
+        let ordered = [
+            Settlement::Released,
+            Settlement::Landed,
+            Settlement::Unclaimed,
+            Settlement::Active,
+            Settlement::Kept,
+        ];
+        let left: usize = kani::any();
+        let right: usize = kani::any();
+        kani::assume(left < ordered.len() && right < ordered.len());
+        let strongest = strongest([ordered[left], ordered[right]].into_iter());
+        assert_eq!(strongest, ordered[left.max(right)]);
+        kani::cover!(strongest == Settlement::Kept);
+        kani::cover!(strongest == Settlement::Active);
+        kani::cover!(strongest == Settlement::Released);
     }
 }
 
@@ -291,7 +409,25 @@ pub enum Admits {
     Unkept,
 }
 
+#[derive(Debug)]
+pub(crate) struct DeletionGrant(());
+
+impl DeletionGrant {
+    pub(crate) const fn new(admits: Admits, settlement: Settlement) -> Option<Self> {
+        if admits.deletion(settlement) {
+            Some(Self(()))
+        } else {
+            None
+        }
+    }
+}
+
 impl Admits {
+    #[must_use]
+    pub const fn deletion(self, settlement: Settlement) -> bool {
+        Self::Settled.admits(settlement) && self.admits(settlement)
+    }
+
     #[must_use]
     pub const fn admits(self, settlement: Settlement) -> bool {
         match (self, settlement) {
@@ -330,6 +466,16 @@ mod tests {
             keep,
             lock,
             key,
+        }
+    }
+
+    #[test]
+    fn every_deletion_grant_requires_released_or_landed_ownership() {
+        for admits in [Admits::Anything, Admits::Settled, Admits::Unkept] {
+            for settlement in Settlement::ALL {
+                let expected = matches!(settlement, Settlement::Released | Settlement::Landed);
+                assert_eq!(DeletionGrant::new(admits, *settlement).is_some(), expected);
+            }
         }
     }
 

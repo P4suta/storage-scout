@@ -1,0 +1,7 @@
+name = "storage-scout"
+summary = "Disk usage scanner and safe build artifact cleaner"
+install = "cargo install --locked --path crates/cli"
+usage = "storage-scout scan ~/projects --measure both"
+copyright = "Yasunobu"
+license = "MIT OR Apache-2.0"
+documentation_index = true

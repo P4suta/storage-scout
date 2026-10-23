@@ -9,9 +9,12 @@ use crate::candidate::{Candidate, CandidateId, Identity, Measurement};
 use crate::location::Location;
 use crate::lock::Liveness;
 use crate::lock::Protocol;
-use crate::ownership::{Admits, Ownership, Settlement};
+use crate::ownership::{Admits, DeletionGrant, Ownership, Settlement};
 use crate::reject::{Rejection, StaleField};
 use crate::share::{Capability, Filesystem, Method};
+
+#[cfg(kani)]
+mod proofs;
 
 ordered! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -156,7 +159,7 @@ impl Default for Mandate {
     fn default() -> Self {
         Self {
             tiers: TierGrant::ROUTINE,
-            settlements: Admits::Anything,
+            settlements: Admits::Settled,
         }
     }
 }
@@ -406,7 +409,13 @@ fn ownership(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
         Ask::Prune(prune) => (prune.ownership, Admits::Unkept),
     };
     let settlement = ownership.settlement();
-    if admits.admits(settlement) {
+    let deletes = matches!(ask, Ask::Inspect(_) | Ask::Recheck(_) | Ask::Verify(_));
+    let admitted = if deletes {
+        admits.deletion(settlement)
+    } else {
+        admits.admits(settlement)
+    };
+    if admitted {
         Verdict::Pass(Note::Settled { settlement })
     } else {
         Verdict::Reject(Rejection::Owned {
@@ -524,10 +533,12 @@ fn freshness(site: &Site<'_>, ask: Ask<'_>) -> Verdict {
     }
 }
 
-fn run(site: &Site<'_>, ask: Ask<'_>) -> Result<Identification, Rejection> {
+fn pipeline(
+    mut evaluate: impl FnMut(Gate) -> Verdict,
+) -> Result<Option<Identification>, Rejection> {
     let mut identified = None;
     for gate in Gate::ALL {
-        match check(*gate, site, ask) {
+        match evaluate(*gate) {
             Verdict::Pass(Note::Identified { identification }) => {
                 identified = Some(identification);
             },
@@ -535,7 +546,11 @@ fn run(site: &Site<'_>, ask: Ask<'_>) -> Result<Identification, Rejection> {
             Verdict::Reject(rejection) => return Err(rejection),
         }
     }
-    identified.ok_or_else(|| Rejection::EvidenceLost {
+    Ok(identified)
+}
+
+fn run(site: &Site<'_>, ask: Ask<'_>) -> Result<Identification, Rejection> {
+    pipeline(|gate| check(gate, site, ask))?.ok_or_else(|| Rejection::EvidenceLost {
         location: site.location.clone(),
     })
 }
@@ -571,6 +586,7 @@ pub fn recheck(site: &Site<'_>, recheck: &Recheck<'_>) -> Result<(), Rejection> 
 #[derive(Debug)]
 #[must_use]
 pub struct Clearance {
+    _ownership: DeletionGrant,
     location: Location,
     identity: Identity,
     identification: Identification,
@@ -594,7 +610,17 @@ impl Clearance {
 }
 
 pub fn clear(site: &Site<'_>, verify: &Verify<'_>) -> Result<Clearance, Rejection> {
-    run(site, Ask::Verify(verify)).map(|identification| Clearance {
+    let identification = run(site, Ask::Verify(verify))?;
+    let settlement = verify.recheck.ownership.settlement();
+    let ownership =
+        DeletionGrant::new(verify.recheck.mandate.settlements, settlement).ok_or_else(|| {
+            Rejection::Owned {
+                location: site.location.clone(),
+                settlement,
+            }
+        })?;
+    Ok(Clearance {
+        _ownership: ownership,
         location: site.location.clone(),
         identity: verify.recheck.identity,
         identification,
@@ -684,7 +710,15 @@ pub struct Stage {
 
 #[must_use]
 pub fn inspect(site: &Site<'_>, inspection: &Inspection<'_>) -> Vec<Stage> {
-    let ask = Ask::Inspect(inspection);
+    stages(site, Ask::Inspect(inspection))
+}
+
+#[must_use]
+pub fn inspect_verified(site: &Site<'_>, verify: &Verify<'_>) -> Vec<Stage> {
+    stages(site, Ask::Verify(verify))
+}
+
+fn stages(site: &Site<'_>, ask: Ask<'_>) -> Vec<Stage> {
     let mut refused = false;
     Gate::ALL
         .iter()
@@ -722,6 +756,26 @@ mod tests {
     use crate::lock::Protocol;
     use crate::ownership::{Keep, Key, Marker, OwnerLock, Role};
     use crate::size::Bytes;
+
+    #[test]
+    fn granting_one_tier_preserves_previous_grants_and_adds_only_that_tier() {
+        for previous in [
+            &[][..],
+            &[Tier::Reinstallable][..],
+            &[Tier::Expensive][..],
+            &[Tier::Reinstallable, Tier::Expensive][..],
+        ] {
+            for next in Tier::ALL {
+                let granted = TierGrant::of(previous.iter().copied()).with(*next);
+                for queried in Tier::ALL {
+                    assert_eq!(
+                        granted.admits(*queried),
+                        *queried == Tier::Routine || previous.contains(queried) || queried == next
+                    );
+                }
+            }
+        }
+    }
 
     fn at(path: &str) -> Location {
         Location::parse_str(Syntax::Unix, path).unwrap()
@@ -799,6 +853,7 @@ mod tests {
     fn measured(logical: u64) -> Measurement {
         Measurement {
             usage: Usage {
+                failures: 0,
                 logical: Bytes::new(logical),
                 allocation: Allocation::Measured {
                     allocated: Bytes::new(logical),
@@ -820,6 +875,14 @@ mod tests {
             },
             Case::Sensitive,
         )
+    }
+
+    fn released() -> Ownership {
+        Ownership::Worktree {
+            worktree: crate::ownership::Worktree::Orphaned {
+                root: at("/work/app"),
+            },
+        }
     }
 
     #[test]
@@ -844,7 +907,7 @@ mod tests {
                 mandate: &mandate,
                 recorded: &candidate,
                 identity: IDENTITY,
-                ownership: &Ownership::Nothing,
+                ownership: &released(),
                 liveness: &Liveness::Free,
             },
             measured: &measurement,
@@ -852,6 +915,44 @@ mod tests {
         let clearance = clear(&fixture.site(), &verify).unwrap();
         assert_eq!(clearance.identity(), IDENTITY);
         assert_eq!(clearance.identification().kind, Kind::RustTarget);
+    }
+
+    #[test]
+    fn manual_selection_cannot_clear_unclaimed_or_active_artifacts() {
+        let fixture = Fixture::target();
+        let measurement = measured(100);
+        let candidate = discovered(&fixture, &measurement);
+        let mandate = Mandate {
+            tiers: TierGrant::ROUTINE,
+            settlements: Admits::Anything,
+        };
+        for ownership in [
+            Ownership::Nothing,
+            Ownership::Worktree {
+                worktree: crate::ownership::Worktree::Primary {
+                    root: at("/work/app"),
+                },
+            },
+        ] {
+            let verify = Verify {
+                recheck: Recheck {
+                    mandate: &mandate,
+                    recorded: &candidate,
+                    identity: IDENTITY,
+                    ownership: &ownership,
+                    liveness: &Liveness::Free,
+                },
+                measured: &measurement,
+            };
+            assert!(matches!(
+                recheck(&fixture.site(), &verify.recheck),
+                Err(Rejection::Owned { .. })
+            ));
+            assert!(matches!(
+                clear(&fixture.site(), &verify),
+                Err(Rejection::Owned { .. })
+            ));
+        }
     }
 
     #[test]
@@ -1020,7 +1121,7 @@ mod tests {
                     mandate: &mandate,
                     recorded: &candidate,
                     identity: IDENTITY,
-                    ownership: &Ownership::Nothing,
+                    ownership: &released(),
                     liveness: &liveness,
                 },
             );
@@ -1051,7 +1152,7 @@ mod tests {
                 mandate: &mandate,
                 recorded: &candidate,
                 identity: other,
-                ownership: &Ownership::Nothing,
+                ownership: &released(),
                 liveness: &Liveness::Free,
             },
         );
@@ -1069,7 +1170,7 @@ mod tests {
                 mandate: &mandate,
                 recorded: &candidate,
                 identity: IDENTITY,
-                ownership: &Ownership::Nothing,
+                ownership: &released(),
                 liveness: &Liveness::Free,
             },
             measured: &grown,
@@ -1097,7 +1198,7 @@ mod tests {
                 mandate: &mandate,
                 recorded: &candidate,
                 identity: IDENTITY,
-                ownership: &Ownership::Nothing,
+                ownership: &released(),
                 liveness: &Liveness::Free,
             },
         );
@@ -1301,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn what_its_owner_still_wants_is_refused_unless_the_caller_takes_it() {
+    fn what_its_owner_still_wants_is_refused_even_with_manual_selection() {
         let fixture = Fixture::target();
         let candidate = discovered(&fixture, &measured(100));
         let settled_only = Mandate {
@@ -1327,7 +1428,10 @@ mod tests {
                 ..
             })
         ));
-        ask(&Mandate::default()).unwrap();
+        assert!(matches!(
+            ask(&Mandate::default()),
+            Err(Rejection::Owned { .. })
+        ));
     }
 
     #[test]

@@ -15,6 +15,8 @@ type Deliver = Box<dyn Fn(Change) + Send + Sync>;
 type Watches = Arc<Mutex<BTreeMap<i32, PathBuf>>>;
 
 const MASK: u32 = libc::IN_CREATE
+    | libc::IN_MODIFY
+    | libc::IN_ATTRIB
     | libc::IN_DELETE
     | libc::IN_MOVED_FROM
     | libc::IN_MOVED_TO
@@ -26,6 +28,10 @@ const MASK: u32 = libc::IN_CREATE
     | libc::IN_EXCL_UNLINK;
 const HEADER: usize = 16;
 const BUFFER: usize = 64 * 1024;
+const EVENT_WORD_BYTES: usize = size_of::<u32>();
+const MASK_OFFSET: usize = EVENT_WORD_BYTES;
+const LENGTH_OFFSET: usize = 3 * EVENT_WORD_BYTES;
+const LOWEST_PRIORITY: libc::c_int = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchFailure {
@@ -42,8 +48,8 @@ const fn watch_failure(code: Option<i32>) -> WatchFailure {
     }
 }
 
-fn field(bytes: &[u8], at: usize) -> Option<[u8; 4]> {
-    bytes.get(at..)?.first_chunk::<4>().copied()
+fn field(bytes: &[u8], at: usize) -> Option<[u8; EVENT_WORD_BYTES]> {
+    bytes.get(at..)?.first_chunk::<EVENT_WORD_BYTES>().copied()
 }
 
 const VANISHED: u32 = libc::IN_DELETE
@@ -58,7 +64,7 @@ const fn event(mask: u32) -> Event {
         Event::Vanished
     } else if mask & APPEARED != 0 {
         Event::Appeared
-    } else if mask & libc::IN_CLOSE_WRITE != 0 {
+    } else if mask & (libc::IN_CLOSE_WRITE | libc::IN_MODIFY) != 0 {
         Event::Written
     } else {
         Event::Unsure
@@ -69,8 +75,8 @@ fn dispatch(bytes: &[u8], watches: &Watches, deliver: &Deliver) {
     let mut at = 0usize;
     while let (Some(wd), Some(mask), Some(len)) = (
         field(bytes, at),
-        field(bytes, at.saturating_add(4)),
-        field(bytes, at.saturating_add(12)),
+        field(bytes, at.saturating_add(MASK_OFFSET)),
+        field(bytes, at.saturating_add(LENGTH_OFFSET)),
     ) {
         let (wd, mask) = (i32::from_ne_bytes(wd), u32::from_ne_bytes(mask));
         let Ok(len) = usize::try_from(u32::from_ne_bytes(len)) else {
@@ -106,12 +112,126 @@ fn dispatch(bytes: &[u8], watches: &Watches, deliver: &Deliver) {
     }
 }
 
+enum Control {
+    Flush(std::sync::mpsc::SyncSender<io::Result<()>>),
+    Stop,
+}
+
 pub(super) struct Source {
     fd: Arc<OwnedFd>,
+    signal: Arc<OwnedFd>,
     watches: Watches,
+    control: std::sync::mpsc::Sender<Control>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+fn notify(signal: &OwnedFd) -> io::Result<()> {
+    let word = 1u64.to_ne_bytes();
+    // SAFETY: the descriptor is an eventfd and the buffer contains one valid eventfd counter.
+    let written = unsafe { libc::write(signal.as_raw_fd(), word.as_ptr().cast(), word.len()) };
+    if written < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn drain(file: &mut File, watches: &Watches, deliver: &Deliver) -> io::Result<()> {
+    let mut buffer = vec![0; BUFFER];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+            Ok(read) => {
+                if let Some((bytes, _)) = buffer.split_at_checked(read) {
+                    dispatch(bytes, watches, deliver);
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn drive(
+    mut file: File,
+    mut signal: File,
+    watches: &Watches,
+    commands: &std::sync::mpsc::Receiver<Control>,
+    deliver: &Deliver,
+) -> io::Result<()> {
+    const POLL_FILES: libc::nfds_t = 2;
+    let mut descriptors = [
+        libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: signal.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: both pollfd entries hold live descriptors and poll may write their revents fields.
+        if unsafe { libc::poll(descriptors.as_mut_ptr(), POLL_FILES, -1) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if descriptors
+            .first()
+            .is_some_and(|fd| fd.revents & libc::POLLIN != 0)
+        {
+            drain(&mut file, watches, deliver)?;
+        }
+        if descriptors
+            .get(1)
+            .is_some_and(|fd| fd.revents & libc::POLLIN != 0)
+        {
+            signal.read_exact(&mut [0; size_of::<u64>()])?;
+            for command in commands.try_iter() {
+                match command {
+                    Control::Stop => return Ok(()),
+                    Control::Flush(reply) => {
+                        let _sent = reply.send(drain(&mut file, watches, deliver));
+                    },
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _sent = self.control.send(Control::Stop);
+            let _notified = notify(&self.signal);
+            let _joined = worker.join();
+        }
+    }
 }
 
 impl Source {
+    pub(super) fn start_release(paths: &[PathBuf], deliver: Deliver) -> io::Result<Self> {
+        for path in paths {
+            local_events(path)?;
+        }
+        Self::start(paths, "", None, deliver)
+    }
+
+    pub(super) fn barrier(&self) -> io::Result<()> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.control
+            .send(Control::Flush(reply))
+            .map_err(io::Error::other)?;
+        notify(&self.signal)?;
+        result.recv().map_err(io::Error::other)?
+    }
+
     #[expect(
         clippy::unused_self,
         reason = "each directory is watched on its own here"
@@ -126,37 +246,41 @@ impl Source {
         _checkpoint: Option<u64>,
         deliver: Deliver,
     ) -> io::Result<Self> {
-        // SAFETY: `inotify_init1` takes only flags.
-        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        // SAFETY: inotify_init1 takes only flags.
+        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if raw == -1 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `inotify_init1` just returned this descriptor and nothing else owns it.
+        // SAFETY: the successful inotify_init1 call returned this uniquely owned descriptor.
         let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
-        let source = Self {
+        // SAFETY: eventfd takes an initial counter and valid descriptor flags.
+        let raw_signal = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if raw_signal == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful eventfd call returned this uniquely owned descriptor.
+        let signal = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_signal) });
+        let (control, commands) = std::sync::mpsc::channel();
+        let mut source = Self {
             fd,
+            signal,
+            control,
             watches: Arc::new(Mutex::new(BTreeMap::new())),
+            worker: None,
         };
-        let roots = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-        source.watch(&roots)?;
-        let reader = source.fd.try_clone()?;
+        source.watch(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>())?;
+        let file = File::from(source.fd.try_clone()?);
+        let signal_reader = File::from(source.signal.try_clone()?);
         let watches = Arc::clone(&source.watches);
-        std::thread::Builder::new()
-            .name("storage-scout-events".to_owned())
-            .spawn(move || {
-                let mut file = File::from(reader);
-                let mut buffer = vec![0u8; BUFFER];
-                loop {
-                    match file.read(&mut buffer) {
-                        Ok(0) | Err(_) => return,
-                        Ok(read) => {
-                            if let Some((events, _)) = buffer.split_at_checked(read) {
-                                dispatch(events, &watches, &deliver);
-                            }
-                        },
+        source.worker = Some(
+            std::thread::Builder::new()
+                .name("storage-scout-events".to_owned())
+                .spawn(move || {
+                    if drive(file, signal_reader, &watches, &commands, &deliver).is_err() {
+                        deliver(Change::Lost);
                     }
-                }
-            })?;
+                })?,
+        );
         Ok(source)
     }
 
@@ -164,7 +288,7 @@ impl Source {
         let mut coverage = Coverage::Complete;
         for directory in directories {
             let name = super::imp::c_path(directory.as_os_str().as_bytes())?;
-            // SAFETY: the descriptor is an inotify instance and `name` is NUL-terminated.
+            // SAFETY: the descriptor is an inotify instance and name is NUL-terminated.
             let wd = unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), name.as_ptr(), MASK) };
             if wd == -1 {
                 let error = io::Error::last_os_error();
@@ -185,6 +309,32 @@ impl Source {
     }
 }
 
+fn local_events(path: &Path) -> io::Result<()> {
+    fn number<T: Into<i64>>(value: T) -> i64 {
+        value.into()
+    }
+    let path = super::imp::c_path(path.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the path is NUL-terminated and stat is a writable buffer of the exact type.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful statfs call initialized the buffer.
+    let stat = unsafe { stat.assume_init() };
+    let supported = [
+        number(libc::EXT4_SUPER_MAGIC),
+        number(libc::BTRFS_SUPER_MAGIC),
+        number(libc::XFS_SUPER_MAGIC),
+        number(libc::TMPFS_MAGIC),
+        number(libc::OVERLAYFS_SUPER_MAGIC),
+    ];
+    if supported.contains(&number(stat.f_type)) {
+        Ok(())
+    } else {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
 #[expect(
     clippy::unnecessary_wraps,
     reason = "raising a station notification has the same interface on every platform"
@@ -198,7 +348,7 @@ pub(super) fn background() {
     let thread = unsafe { libc::gettid() };
     if let Ok(thread) = u32::try_from(thread) {
         // SAFETY: a thread may lower its own priority without privilege.
-        let _lowered = unsafe { libc::setpriority(libc::PRIO_PROCESS, thread, 19) };
+        let _lowered = unsafe { libc::setpriority(libc::PRIO_PROCESS, thread, LOWEST_PRIORITY) };
     }
 }
 

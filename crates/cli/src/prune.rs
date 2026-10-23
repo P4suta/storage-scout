@@ -16,12 +16,11 @@ use storage_scout_core::lock::{Liveness, Protocol};
 use storage_scout_core::macho::{self, MachError};
 use storage_scout_core::prune::{self, Object, Rule, Session};
 use storage_scout_core::reject::Rejection;
-use storage_scout_core::size::Bytes;
+use storage_scout_core::size::{Bytes, Reclamation};
 
 use self::capability::Prunable;
 use crate::apply::Mode;
 use crate::dedupe::Tally;
-use crate::measure::Volumes;
 use crate::owners::Owners;
 use crate::platform::{self, Pruned};
 use crate::scan::Found;
@@ -219,16 +218,18 @@ fn sessions(root: &Path, profile: &Path, scope: Scope<'_>, doomed: &mut Vec<Doom
             .collect::<Vec<Session<'_>>>();
         for (session, rule) in prune::doomed(&parsed) {
             let path = directory.join(session.name);
-            if let (Ok(identity), Some(relative)) =
-                (platform::identity(&path), relative(root, &path))
-            {
+            if let (Ok(identity), Some(relative), Ok(lock)) = (
+                platform::identity(&path),
+                relative(root, &path),
+                session.lock_name(),
+            ) {
                 doomed.push(Doomed {
                     relative,
                     identity,
                     len: weight(&path),
                     rule,
                     doom: Doom::Session {
-                        lock: OsString::from(session.lock_name()),
+                        lock: OsString::from(lock.to_string()),
                     },
                 });
             }
@@ -459,14 +460,13 @@ fn candidate(
     let attempt = || -> Result<Pass, Rejection> {
         let observed = observe::observe(found.path())?;
         let site = observed.site(terms.protection, terms.excludes);
-        let surveyed;
-        let survey = match known {
-            Some(survey) => survey,
-            None => {
-                surveyed = busy::survey(&observed.path)?;
-                &surveyed
-            },
+        let surveyed = match known {
+            Some(survey) => terms
+                .owners
+                .complete_survey(&observed.path, survey.clone())?,
+            None => terms.owners.survey(&observed.path)?,
         };
+        let survey = &surveyed;
         let ownership = terms.owners.of(&observed.path, &survey.markers);
         let (lease, liveness) = match mode {
             Mode::DryRun => match busy::probe(&survey.locks) {
@@ -530,15 +530,6 @@ fn candidate(
     }
 }
 
-fn free_space(found: &[Found]) -> Volumes {
-    Volumes::sample(found.iter().map(|each| {
-        (
-            each.candidate().identity().volume,
-            each.path().parent().unwrap_or_else(|| each.path()),
-        )
-    }))
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Scope<'a> {
     Everything,
@@ -573,10 +564,10 @@ pub(crate) fn run_changed(
         protection,
         owners,
     };
-    let before = free_space(std::slice::from_ref(found));
     let pass = candidate(found, &terms, Mode::Execute, (Some(survey), scope));
     let mut totals = Removed::default();
     totals.merge(&pass.subject.removed);
+    let observed_freed = reclamation(&totals, &pass.failures).observed();
     PruneRun {
         schema_version: SCHEMA_VERSION,
         command: "prune",
@@ -584,7 +575,7 @@ pub(crate) fn run_changed(
         subjects: vec![pass.subject],
         totals,
         failures: pass.failures,
-        observed_freed: before.gained(&free_space(std::slice::from_ref(found))),
+        observed_freed,
     }
 }
 
@@ -600,10 +591,6 @@ pub(crate) fn run(
         protection,
         owners,
     };
-    let before = match mode {
-        Mode::Execute => Some(free_space(found)),
-        Mode::DryRun => None,
-    };
     let mut subjects = Vec::with_capacity(found.len());
     let mut failures = Vec::new();
     let mut totals = Removed::default();
@@ -613,6 +600,10 @@ pub(crate) fn run(
         failures.extend(pass.failures);
         subjects.push(pass.subject);
     }
+    let observed_freed = match mode {
+        Mode::DryRun => None,
+        Mode::Execute => reclamation(&totals, &failures).observed(),
+    };
     PruneRun {
         schema_version: SCHEMA_VERSION,
         command: "prune",
@@ -620,7 +611,15 @@ pub(crate) fn run(
         subjects,
         totals,
         failures,
-        observed_freed: before.and_then(|before| before.gained(&free_space(found))),
+        observed_freed,
+    }
+}
+
+const fn reclamation(removed: &Removed, failures: &[PruneFailure]) -> Reclamation {
+    if removed.files() > 0 || !failures.is_empty() {
+        Reclamation::Unattributable
+    } else {
+        Reclamation::Unchanged
     }
 }
 

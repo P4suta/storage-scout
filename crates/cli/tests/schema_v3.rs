@@ -18,6 +18,54 @@ use testkit::{tempdir, write_cache_tag, write_cargo_project, write_patterned, wr
 
 const RECORD: &str = "tests/schema/v3.json";
 
+#[path = "support/user.rs"]
+mod user;
+
+fn managed_document(root: &Path) -> Value {
+    let home = root.join("managed-home");
+    let checkout = root.join("managed-checkout");
+    testkit::write_bytes(&home.join(".rustup/settings.toml"), b"version='12'\n");
+    testkit::write_bytes(
+        &home.join(".rustup/toolchains/1.83.0-x86_64-unknown-linux-gnu/bin/rustc"),
+        b"fixture",
+    );
+    testkit::write_bytes(&checkout.join("rust-toolchain"), b"1.84.0\n");
+    let output = user::run(
+        &[
+            "stores",
+            checkout.to_str().unwrap(),
+            "--provider",
+            "rustup",
+            "--include-tier",
+            "reinstallable",
+            "--json",
+        ],
+        &home,
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let mut document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id: storage_scout::core::candidate::CandidateId = "0".repeat(64).parse().unwrap();
+    let outcomes = [
+        storage_scout::ManagedStatus::WouldRemove,
+        storage_scout::ManagedStatus::Removed {
+            manager_reclaimed: Some(Bytes::new(1)),
+        },
+        storage_scout::ManagedStatus::Refused {
+            reason: storage_scout::core::managed::Refusal::Referenced,
+        },
+        storage_scout::ManagedStatus::Failed {
+            error: "fixture failure".to_owned(),
+        },
+    ]
+    .map(|result| storage_scout::ManagedOutcome {
+        id: id.clone(),
+        result,
+        observed_freed: None,
+    });
+    *document.pointer_mut("/outcomes").unwrap() = serde_json::to_value(outcomes).unwrap();
+    document
+}
+
 fn field_paths(value: &Value, prefix: &str, into: &mut BTreeSet<String>) {
     match value {
         Value::Object(map) => {
@@ -97,6 +145,7 @@ fn subjects(place: &storage_scout::core::location::Location) -> [storage_scout::
 fn documents() -> BTreeMap<String, Value> {
     let temp = tempdir("schema");
     let root = temp.path();
+    testkit::write_orphaned_worktree(root);
     let target = write_cargo_project(&root.join("proj"), 64 * 1024);
     write_cache_tag(&root.join("cache"));
     write_sized(&root.join("cache/blob"), 64 * 1024);
@@ -107,7 +156,7 @@ fn documents() -> BTreeMap<String, Value> {
         Some(&root.join("proj")),
     );
     write_sized(&root.join("run/scratch"), 64 * 1024);
-    let scout = Scout::with(testkit::open_protection()).confined(vec![root.to_path_buf()]);
+    let scout = Scout::with(testkit::open_protection()).confined(vec![testkit::ceiling()]);
     let options = ScanOptions {
         roots: vec![root.to_path_buf()],
         top: 10,
@@ -181,6 +230,16 @@ fn documents() -> BTreeMap<String, Value> {
         json!({ "pairs": to_value(&pairs) }),
     );
     documents.insert("vocabulary".to_owned(), vocabulary());
+    documents.insert(
+        "release".to_owned(),
+        to_value(&storage_scout::ReleaseReceipt {
+            schema_version: SCHEMA_VERSION,
+            command: "release",
+            location: place,
+            monitor_pid: 1,
+        }),
+    );
+    documents.insert("stores".to_owned(), managed_document(root));
     documents
 }
 

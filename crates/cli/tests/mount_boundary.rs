@@ -59,6 +59,7 @@ fn a_scan_counts_the_boundary_and_not_what_is_behind_it() {
 #[test]
 fn a_candidate_beside_a_mount_never_reaches_into_it() {
     with_mount("mount-beside", |root, mounted| {
+        testkit::write_orphaned_worktree(root);
         write_sized(&root.join("proj/Cargo.toml"), 32);
         write_sized(&root.join("proj/target/debug/app"), 64 * 1024);
         write_sized(&mounted.join("payload.bin"), 128 * 1024);

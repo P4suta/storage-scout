@@ -67,6 +67,7 @@ fn candidates(shapes: &[(u8, u64, bool)]) -> Vec<Candidate> {
             let bytes = Bytes::new(size * 1000);
             let measurement = Measurement {
                 usage: Usage {
+                    failures: 0,
                     logical: bytes,
                     allocation: Allocation::Measured {
                         allocated: bytes,

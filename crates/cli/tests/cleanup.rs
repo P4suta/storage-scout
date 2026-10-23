@@ -27,6 +27,12 @@ fn scout() -> Scout {
     Scout::with(testkit::open_protection()).confined(vec![testkit::ceiling()])
 }
 
+fn released_tempdir(label: &str) -> testkit::Scratch {
+    let temp = tempdir(label);
+    testkit::write_orphaned_worktree(temp.path());
+    temp
+}
+
 fn options(root: &Path) -> ScanOptions {
     ScanOptions {
         roots: vec![root.to_path_buf()],
@@ -72,6 +78,10 @@ fn status(summary: &Summary) -> &Status {
 fn make_all_artifacts(root: &Path) {
     write_sized(&root.join("rust/Cargo.toml"), 1);
     write_sized(&root.join("rust/target/debug/app.exe"), 100);
+    write_sized(&root.join("swift/Package.swift"), 1);
+    write_sized(&root.join("swift/.build/debug/app"), 118);
+    write_sized(&root.join("gleam/gleam.toml"), 1);
+    write_sized(&root.join("gleam/build/dev/app"), 119);
     write_sized(&root.join("dotnet/App.csproj"), 1);
     write_sized(&root.join("dotnet/bin/Debug/App.dll"), 101);
     write_sized(&root.join("dotnet/obj/project.assets.json"), 102);
@@ -196,7 +206,10 @@ fn a_logical_scan_says_allocation_is_unmeasured() {
 fn missing_roots_are_reported_as_typed_issues() {
     let temp = tempdir("missing");
     let report = scout().scan(&ScanOptions::new(vec![temp.path().join("absent")]));
-    assert!(report.roots.is_empty());
+    assert_eq!(
+        report.roots,
+        Vec::<storage_scout::core::location::Location>::new()
+    );
     assert!(
         matches!(report.issues.as_slice(), [Rejection::Io { .. }]),
         "{:#?}",
@@ -236,7 +249,7 @@ fn an_exclusion_inside_a_candidate_protects_the_whole_candidate() {
 
 #[test]
 fn a_dry_run_revalidates_and_deletes_nothing() {
-    let temp = tempdir("dry-run");
+    let temp = released_tempdir("dry-run");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     let report = discover(temp.path());
     let summary = apply(
@@ -250,8 +263,141 @@ fn a_dry_run_revalidates_and_deletes_nothing() {
 }
 
 #[test]
+fn a_rejected_execute_reports_zero_own_reclamation() {
+    let temp = released_tempdir("rejected-accounting");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let report = discover(temp.path());
+    let reviewed = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    write_sized(&target.join("new-file"), 10);
+    let summary = apply(&reviewed, Mode::Execute);
+    assert!(matches!(status(&summary), Status::Rejected { .. }));
+    assert_eq!(summary.observed_freed, Some(Bytes::ZERO));
+    testkit::assert_present(target);
+}
+
+#[test]
+fn measured_roots_reconcile_once_per_volume() {
+    let temp = tempdir("volume-accounting");
+    write_sized(&temp.path().join("first/payload"), 4096);
+    write_sized(&temp.path().join("second/payload"), 8192);
+    let report = scout().discover(&options(temp.path())).unwrap();
+    assert_eq!(report.volumes.len(), 1);
+    let volume = &report.volumes[0];
+    let account = volume.reconciliation;
+    assert_eq!(
+        account.attributed.saturating_add(account.unattributed),
+        account.used
+    );
+    assert!(
+        matches!(report.usage.allocation, Allocation::Measured { allocated, .. } if account.measured == allocated)
+    );
+    assert_eq!(volume.failures, 0);
+}
+
+#[test]
+fn an_unreadable_subtree_preserves_its_siblings_measurements() {
+    let temp = tempdir("partial-accounting");
+    write_sized(&temp.path().join("known/payload"), 8192);
+    let private = temp.path().join("private");
+    write_sized(&private.join("payload"), 4096);
+    let Some(restricted) = testkit::restrict(&private, 0o000) else {
+        return;
+    };
+    let report = scout().scan(&ScanOptions {
+        measure: Measure::Allocated,
+        ..options(temp.path())
+    });
+    assert_eq!(report.usage.logical, Bytes::new(8192));
+    assert_eq!(report.usage.failures, 1);
+    assert_eq!(report.usage.reclaimable(), None);
+    assert!(
+        matches!(report.usage.allocation, Allocation::Measured { allocated, .. } if allocated >= Bytes::new(8192))
+    );
+    drop(restricted);
+}
+
+#[test]
+fn nested_owner_markers_in_cargo_internals_protect_both_commands() {
+    let temp = released_tempdir("internal-marker");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    testkit::make_dir(&target.join("debug/.fingerprint"));
+    testkit::write_owner_marker(
+        &target.join("debug/deps/copied-tests"),
+        testkit::MarkerRole::Scratch,
+        testkit::MarkerKeep::Kept,
+        None,
+    );
+    let report = discover(temp.path());
+    let reviewed = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    let summary = apply(&reviewed, Mode::DryRun);
+    let explanation = scout().explain(&target, &[], Mandate::default()).unwrap();
+    assert!(!explanation.eligible);
+    assert!(matches!(
+        status(&summary),
+        Status::Rejected {
+            rejection: Rejection::Owned {
+                settlement: storage_scout::core::ownership::Settlement::Kept,
+                ..
+            }
+        }
+    ));
+    testkit::assert_present(target);
+}
+
+#[test]
+fn source_worktrees_inside_a_target_are_preserved() {
+    let temp = released_tempdir("nested-source");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let checkout = target.join("worktrees/source");
+    testkit::make_dir(&checkout.join(".git"));
+    let inner = write_cargo_project(&checkout, 8192);
+    let report = discover(temp.path());
+    let reviewed = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    let dry = apply(&reviewed, Mode::DryRun);
+    assert!(matches!(
+        status(&dry),
+        Status::Rejected {
+            rejection: Rejection::SourceCheckout { .. }
+        }
+    ));
+    assert!(
+        !scout()
+            .explain(&target, &[], Mandate::default())
+            .unwrap()
+            .eligible
+    );
+    let executed = apply(&reviewed, Mode::Execute);
+    assert!(matches!(
+        status(&executed),
+        Status::Rejected {
+            rejection: Rejection::SourceCheckout { .. }
+        }
+    ));
+    testkit::assert_present(&checkout);
+    testkit::write_owner_marker(
+        &checkout,
+        testkit::MarkerRole::Scratch,
+        testkit::MarkerKeep::Released,
+        None,
+    );
+    let inner_report = discover(&checkout);
+    let result = apply(
+        &plan(
+            &inner_report.candidates,
+            &ids(&inner_report.candidates),
+            &[],
+        )
+        .unwrap(),
+        Mode::Execute,
+    );
+    assert_eq!(status(&result), &Status::Deleted);
+    testkit::assert_absent(inner);
+    testkit::assert_present(checkout.join("Cargo.toml"));
+}
+
+#[test]
 fn executing_deletes_only_the_discovered_candidate() {
-    let temp = tempdir("execute");
+    let temp = released_tempdir("execute");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     write_sized(&temp.path().join("proj/src/main.rs"), 10);
     let report = discover(temp.path());
@@ -262,7 +408,28 @@ fn executing_deletes_only_the_discovered_candidate() {
     assert_eq!(status(&summary), &Status::Deleted);
     testkit::assert_absent(&target);
     testkit::assert_present(temp.path().join("proj/src/main.rs"));
-    assert!(summary.observed_freed.is_some());
+    assert_eq!(summary.observed_freed, None);
+}
+
+#[test]
+fn a_cached_orphan_is_not_deleted_after_its_git_directory_reappears() {
+    let temp = released_tempdir("orphan-reappears");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let scout = scout();
+    let report = scout.discover(&options(temp.path())).unwrap();
+    let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    testkit::make_dir(&temp.path().join(".missing-git/worktrees/released"));
+    let result = scout.apply(&plan, Mode::Execute);
+    assert!(matches!(
+        status(&result),
+        Status::Rejected {
+            rejection: Rejection::Owned {
+                settlement: storage_scout::core::ownership::Settlement::Active,
+                ..
+            }
+        }
+    ));
+    testkit::assert_present(target);
 }
 
 #[test]
@@ -284,7 +451,7 @@ fn unknown_and_duplicate_ids_are_refused_when_planning() {
 
 #[test]
 fn a_file_added_after_discovery_makes_the_plan_stale() {
-    let temp = tempdir("stale-added");
+    let temp = released_tempdir("stale-added");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     let report = discover(temp.path());
     let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
@@ -304,7 +471,7 @@ fn a_file_added_after_discovery_makes_the_plan_stale() {
 
 #[test]
 fn a_replaced_directory_is_a_different_candidate() {
-    let temp = tempdir("replaced");
+    let temp = released_tempdir("replaced");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     let report = discover(temp.path());
     let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
@@ -325,7 +492,7 @@ fn a_replaced_directory_is_a_different_candidate() {
 
 #[test]
 fn a_same_size_replacement_of_a_file_is_stale() {
-    let temp = tempdir("same-size");
+    let temp = released_tempdir("same-size");
     write_sized(&temp.path().join("proj/Cargo.toml"), 1);
     let payload = temp.path().join("proj/target/app");
     write_sized(&payload, 64);
@@ -345,8 +512,168 @@ fn a_same_size_replacement_of_a_file_is_stale() {
 }
 
 #[test]
+fn descendant_links_are_unlinked_without_visiting_their_targets() {
+    let temp = released_tempdir("descendant-links");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let outside = temp.path().join("outside");
+    let payload = outside.join("payload");
+    write_sized(&payload, 1_048_576);
+    let Some(_) =
+        link_dir(&target.join("nested/directory"), &outside).or_decline("a directory link")
+    else {
+        return;
+    };
+    for (name, destination) in [
+        ("file", payload.clone()),
+        ("relative", PathBuf::from("debug/app")),
+        ("dangling", temp.path().join("missing")),
+        ("cycle", PathBuf::from("cycle")),
+    ] {
+        if testkit::symlink_file(&target.join(name), &destination)
+            .or_decline("a file link")
+            .is_none()
+        {
+            return;
+        }
+    }
+    let permissions = fs::metadata(&payload).unwrap().permissions();
+    let report = discover(temp.path());
+    let found = only(&report);
+    assert!(found.candidate().usage().logical.get() < 65_536);
+    let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    let dry = apply(&plan, Mode::DryRun);
+    assert!(matches!(status(&dry), Status::WouldDelete), "{dry:#?}");
+    testkit::assert_present(&target);
+    fs::write(&payload, b"changed outside the candidate").unwrap();
+    let executed = apply(&plan, Mode::Execute);
+    assert!(
+        matches!(status(&executed), Status::Deleted),
+        "{executed:#?}"
+    );
+    testkit::assert_absent(&target);
+    assert_eq!(
+        fs::read(&payload).unwrap(),
+        b"changed outside the candidate"
+    );
+    assert_eq!(fs::metadata(&payload).unwrap().permissions(), permissions);
+}
+
+#[test]
+fn dependency_bins_with_links_are_cleaned_without_deleting_the_package_source() {
+    let temp = released_tempdir("dependency-links");
+    let project = temp.path().join("project");
+    write_sized(&project.join("package.json"), 1);
+    let dependencies = project.join("node_modules");
+    write_sized(&dependencies.join("tool/bin.js"), 32);
+    let source = temp.path().join("package-source/bin.js");
+    write_sized(&source, 2048);
+    let Some(_) =
+        testkit::symlink_file(&dependencies.join(".bin/tool"), &source).or_decline("a file link")
+    else {
+        return;
+    };
+    let report = discover(temp.path());
+    assert_eq!(only(&report).candidate().kind(), Kind::NodeModules);
+    let plan = Scout::plan(
+        &report.candidates,
+        &ids(&report.candidates),
+        Mandate {
+            tiers: TierGrant::ROUTINE.with(Tier::Reinstallable),
+            ..Mandate::default()
+        },
+        &[],
+    )
+    .unwrap();
+    let executed = apply(&plan, Mode::Execute);
+    assert!(
+        matches!(status(&executed), Status::Deleted),
+        "{executed:#?}"
+    );
+    testkit::assert_absent(&dependencies);
+    assert_eq!(fs::read(&source).unwrap(), vec![b'x'; 2048]);
+    testkit::assert_present(project.join("package.json"));
+}
+
+#[test]
+fn a_descendant_link_retargeted_after_discovery_is_stale() {
+    let temp = released_tempdir("link-retargeted");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let link = target.join("link");
+    let first = temp.path().join("first");
+    let other = temp.path().join("other");
+    write_sized(&first.join("payload"), 10);
+    write_sized(&other.join("payload"), 10);
+    let Some(_) = link_dir(&link, &first).or_decline("a directory link") else {
+        return;
+    };
+    let report = discover(temp.path());
+    let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    assert!(matches!(
+        status(&apply(&plan, Mode::DryRun)),
+        Status::WouldDelete
+    ));
+    fs::rename(&link, temp.path().join("original-link")).unwrap();
+    if link_dir(&link, &other)
+        .or_decline("a directory link")
+        .is_none()
+    {
+        return;
+    }
+    let executed = apply(&plan, Mode::Execute);
+    assert!(
+        matches!(
+            status(&executed),
+            Status::Rejected {
+                rejection: Rejection::Stale {
+                    field: StaleField::Content,
+                    ..
+                }
+            }
+        ),
+        "{executed:#?}"
+    );
+    testkit::assert_present(&target);
+    testkit::assert_present(first.join("payload"));
+    testkit::assert_present(other.join("payload"));
+    assert_ne!(
+        only(&discover(temp.path())).candidate().id(),
+        only(&report).candidate().id()
+    );
+}
+
+#[test]
+fn a_descendant_link_removed_after_discovery_is_stale() {
+    let temp = released_tempdir("link-removed");
+    let target = write_cargo_project(&temp.path().join("proj"), 4096);
+    let link = target.join("link");
+    let outside = temp.path().join("outside");
+    write_sized(&outside.join("payload"), 10);
+    let Some(_) = link_dir(&link, &outside).or_decline("a directory link") else {
+        return;
+    };
+    let report = discover(temp.path());
+    let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
+    fs::rename(&link, temp.path().join("removed-link")).unwrap();
+    let executed = apply(&plan, Mode::Execute);
+    assert!(
+        matches!(
+            status(&executed),
+            Status::Rejected {
+                rejection: Rejection::Stale {
+                    field: StaleField::Content,
+                    ..
+                }
+            }
+        ),
+        "{executed:#?}"
+    );
+    testkit::assert_present(&target);
+    testkit::assert_present(outside.join("payload"));
+}
+
+#[test]
 fn a_link_inserted_after_discovery_is_never_followed() {
-    let temp = tempdir("link-inserted");
+    let temp = released_tempdir("link-inserted");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     let report = discover(temp.path());
     let plan = plan(&report.candidates, &ids(&report.candidates), &[]).unwrap();
@@ -364,7 +691,10 @@ fn a_link_inserted_after_discovery_is_never_followed() {
     assert!(matches!(
         status(&summary),
         Status::Rejected {
-            rejection: Rejection::Link { .. }
+            rejection: Rejection::Stale {
+                field: StaleField::Content,
+                ..
+            }
         }
     ));
 }
@@ -541,7 +871,7 @@ fn an_application_owned_area_admits_only_declared_caches() {
 
 #[test]
 fn a_build_holding_its_lock_blocks_deletion_until_it_lets_go() {
-    let temp = tempdir("busy");
+    let temp = released_tempdir("busy");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     let lock = target.join("debug/.cargo-lock");
     write_sized(&lock, 0);
@@ -570,7 +900,7 @@ fn a_build_holding_its_lock_blocks_deletion_until_it_lets_go() {
 
 #[test]
 fn a_lock_in_a_nested_target_counts_too() {
-    let temp = tempdir("nested-busy");
+    let temp = released_tempdir("nested-busy");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     write_sized(&target.join("debug/deps/libx.rlib"), 1024);
     let nested = target.join("pre-push/debug/.cargo-lock");
@@ -608,8 +938,8 @@ fn refused_while_held(target: &Path, lock_dir: &Path) {
         matches!(
             status(&refused),
             Status::Rejected {
-                rejection: Rejection::Busy {
-                    protocol: Protocol::TempOwner,
+                rejection: Rejection::Owned {
+                    settlement: storage_scout::core::ownership::Settlement::Active,
                     ..
                 }
             }
@@ -622,7 +952,7 @@ fn refused_while_held(target: &Path, lock_dir: &Path) {
 
 #[test]
 fn a_lock_anywhere_outside_cargos_own_directories_is_found() {
-    let temp = tempdir("busy-anywhere");
+    let temp = released_tempdir("busy-anywhere");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     fs::create_dir_all(target.join("debug/.fingerprint")).unwrap();
     write_sized(&target.join("debug/deps/libx.rlib"), 1024);
@@ -662,7 +992,7 @@ fn a_directory_that_cannot_be_read_keeps_the_whole_target() {
 
 #[test]
 fn a_lock_that_cannot_be_opened_is_never_taken_for_free() {
-    let temp = tempdir("busy-sealed");
+    let temp = released_tempdir("busy-sealed");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     let lock = target.join("debug/.cargo-lock");
     write_sized(&lock, 0);
@@ -703,7 +1033,7 @@ fn a_lock_that_cannot_be_opened_is_never_taken_for_free() {
 
 #[test]
 fn a_removal_the_filesystem_refuses_is_a_failure_not_a_refusal() {
-    let temp = tempdir("remove-refused");
+    let temp = released_tempdir("remove-refused");
     let project = temp.path().join("proj");
     let target = write_cargo_project(&project, 4096);
     let report = discover(temp.path());
@@ -870,7 +1200,7 @@ fn the_size_floor_keeps_what_reaches_it_exactly() {
 
 #[test]
 fn a_lock_name_inside_cargos_own_directories_is_not_a_lock() {
-    let temp = tempdir("busy-decoys");
+    let temp = released_tempdir("busy-decoys");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     fs::create_dir_all(target.join("debug/.fingerprint")).unwrap();
     let decoy = target.join("debug/deps/.cargo-lock");
@@ -953,7 +1283,7 @@ fn a_candidate_measured_only_by_length_cannot_be_planned() {
 
 #[test]
 fn a_declared_target_is_still_declared_when_it_is_deleted() {
-    let temp = tempdir("declared-delete");
+    let temp = released_tempdir("declared-delete");
     let target = temp.path().join("sbt");
     write_declared_target(&target, "debug");
     write_sized(&target.join("debug/app"), 4096);
@@ -995,7 +1325,7 @@ fn a_manifest_replaced_by_a_link_is_no_longer_evidence() {
 
 #[test]
 fn a_locked_tier_is_refused_by_the_gate() {
-    let temp = tempdir("tier");
+    let temp = released_tempdir("tier");
     write_cache_tag(&temp.path().join("cache"));
     write_sized(&temp.path().join("cache/blob"), 4096);
     let report = discover(temp.path());
@@ -1030,7 +1360,7 @@ fn a_locked_tier_is_refused_by_the_gate() {
 
 #[test]
 fn a_read_only_tree_is_still_removed() {
-    let temp = tempdir("read-only");
+    let temp = released_tempdir("read-only");
     let target = write_cargo_project(&temp.path().join("proj"), 4096);
     let sealed = target.join("debug/sealed");
     write_sized(&sealed.join("file"), 10);

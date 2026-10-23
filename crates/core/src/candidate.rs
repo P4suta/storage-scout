@@ -1,4 +1,3 @@
-use alloc::format;
 use alloc::string::String;
 use core::fmt;
 use core::str::FromStr;
@@ -32,11 +31,15 @@ pub enum Allocation {
 pub struct Usage {
     pub logical: Bytes,
     pub allocation: Allocation,
+    pub failures: u64,
 }
 
 impl Usage {
     #[must_use]
     pub const fn reclaimable(&self) -> Option<Bytes> {
+        if self.failures > 0 {
+            return None;
+        }
         match self.allocation {
             Allocation::Measured { reclaimable, .. } => Some(reclaimable),
             Allocation::Unmeasured => None,
@@ -64,6 +67,23 @@ impl Contents {
             },
             None => hash.update([0]),
         }
+        Self::digest(hash)
+    }
+
+    #[must_use]
+    pub fn link(path: &[u8], target: &[u8], identity: Identity) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"symbolic-link\0");
+        hash.update(path);
+        hash.update([0]);
+        hash.update(target);
+        hash.update([0]);
+        hash.update(identity.volume.to_le_bytes());
+        hash.update(identity.file.to_le_bytes());
+        Self::digest(hash)
+    }
+
+    fn digest(hash: Sha256) -> Self {
         let digest = hash.finalize();
         let mut bytes = [0u8; 16];
         for (slot, byte) in bytes.iter_mut().zip(digest.iter()) {
@@ -87,6 +107,7 @@ pub struct Measurement {
 impl Measurement {
     pub const UNMEASURED: Self = Self {
         usage: Usage {
+            failures: 0,
             logical: Bytes::ZERO,
             allocation: Allocation::Unmeasured,
         },
@@ -115,6 +136,10 @@ impl CandidateId {
         hash.update(kind.as_str());
         hash.update([0]);
         hash.update(measurement.usage.logical.get().to_le_bytes());
+        if measurement.usage.failures > 0 {
+            hash.update(b"incomplete\0");
+            hash.update(measurement.usage.failures.to_le_bytes());
+        }
         match measurement.usage.allocation {
             Allocation::Measured {
                 allocated,
@@ -127,7 +152,7 @@ impl CandidateId {
             Allocation::Unmeasured => hash.update([0]),
         }
         hash.update(measurement.contents.0.to_le_bytes());
-        Self(format!("{:x}", hash.finalize()))
+        Self(hex::encode(hash.finalize()))
     }
 
     #[must_use]
@@ -150,7 +175,8 @@ impl FromStr for CandidateId {
     type Err = MalformedId;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        const ID_HEX_BYTES: usize = 64;
+        if value.len() == ID_HEX_BYTES && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             Ok(Self(value.to_ascii_lowercase()))
         } else {
             Err(MalformedId)
@@ -269,6 +295,25 @@ mod tests {
     use crate::location::Syntax;
 
     #[test]
+    fn a_link_fingerprint_binds_its_name_target_identity_and_kind() {
+        let identity = Identity { volume: 1, file: 2 };
+        let original = Contents::link(b"/target/link", b"first", identity);
+        for changed in [
+            Contents::link(b"/target/next", b"first", identity),
+            Contents::link(b"/target/link", b"other", identity),
+            Contents::link(b"/target/link", b"first", Identity { volume: 1, file: 3 }),
+            Contents::link(b"/target/link", b"first", Identity { volume: 2, file: 2 }),
+            Contents::file(b"/target/link", 5, Some(identity)),
+        ] {
+            assert_ne!(original, changed);
+        }
+        assert_eq!(
+            original,
+            Contents::link(b"/target/link", b"first", identity)
+        );
+    }
+
+    #[test]
     fn measuring_a_sighting_keeps_what_it_is_and_names_what_it_holds() {
         let at = |path| Location::parse_str(Syntax::Unix, path).unwrap();
         let protection = Protection::new(
@@ -304,6 +349,7 @@ mod tests {
         let bytes = Bytes::new(10);
         let measurement = Measurement {
             usage: Usage {
+                failures: 0,
                 logical: bytes,
                 allocation: Allocation::Measured {
                     allocated: bytes,

@@ -275,7 +275,7 @@ pub(super) fn facts(path: &Path, metadata: &Metadata) -> io::Result<FileFacts> {
         } else {
             Owner::Other
         },
-        mode: if metadata.mode() & 0o111 == 0 {
+        mode: if metadata.mode() & u32::from(libc::S_IXUSR | libc::S_IXGRP | libc::S_IXOTH) == 0 {
             Mode::Plain
         } else {
             Mode::Executable
@@ -295,7 +295,8 @@ pub(super) fn extras(path: &Path, identity: Identity) -> Extras {
 }
 
 const fn executable(stat: &libc::stat) -> Mode {
-    if stat.st_mode & 0o111 == 0 {
+    const EXECUTABLE: libc::mode_t = 0o111;
+    if stat.st_mode & EXECUTABLE == 0 {
         Mode::Plain
     } else {
         Mode::Executable
@@ -360,9 +361,10 @@ fn check(result: libc::c_int) -> io::Result<()> {
 }
 
 fn carry(clone: &File, original: &libc::stat) -> io::Result<()> {
+    const PERMISSIONS: libc::mode_t = 0o7777;
     let fd = clone.as_raw_fd();
     // SAFETY: `fd` is an open descriptor for the clone this process created.
-    check(unsafe { libc::fchmod(fd, original.st_mode & 0o7777) })?;
+    check(unsafe { libc::fchmod(fd, original.st_mode & PERMISSIONS) })?;
     if imp::stat_fd(clone)?.st_gid != original.st_gid {
         // SAFETY: `fd` is open; `UNCHANGED` leaves the owner as it is.
         check(unsafe { libc::fchown(fd, UNCHANGED, original.st_gid) })?;

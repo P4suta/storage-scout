@@ -23,6 +23,8 @@ use storage_scout::{
     render_prune, render_scan, render_watch,
 };
 
+const SELECTION_PAGE_SIZE: usize = 15;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "storage-scout",
@@ -48,6 +50,43 @@ enum Command {
     Watch(WatchArgs),
     Doctor(Output),
     Explain(ExplainArgs),
+    Release(ReleaseArgs),
+    Stores(StoresArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum StoreProvider {
+    Docker,
+    Rustup,
+    Mise,
+}
+
+#[derive(Debug, Args)]
+struct StoresArgs {
+    #[arg(value_name = "CHECKOUT-ROOT")]
+    roots: Vec<PathBuf>,
+    #[arg(long, value_enum)]
+    provider: StoreProvider,
+    #[arg(long, value_name = "TIER", value_delimiter = ',', value_parser = parse_tier)]
+    include_tier: Vec<Tier>,
+    #[arg(long, value_name = "SHA256", value_delimiter = ',', value_parser = parse_id)]
+    id: Vec<CandidateId>,
+    #[arg(long, requires_all = ["yes", "id"])]
+    execute: bool,
+    #[arg(long, requires = "execute")]
+    yes: bool,
+    #[command(flatten)]
+    output: Output,
+}
+
+#[derive(Debug, Args)]
+struct ReleaseArgs {
+    #[arg(value_name = "CHECKOUT")]
+    path: PathBuf,
+    #[arg(long, hide = true)]
+    monitor: bool,
+    #[command(flatten)]
+    output: Output,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,7 +312,90 @@ fn run(command: Command) -> Result<ExitCode> {
         Command::Watch(args) => watch(&scout, args),
         Command::Doctor(output) => doctor(&scout, &output),
         Command::Explain(args) => explain(&scout, &args),
+        Command::Release(args) => release(&scout, &args),
+        Command::Stores(args) => stores(&args),
     }
+}
+
+fn stores(args: &StoresArgs) -> Result<ExitCode> {
+    let report = storage_scout::managed_store(
+        match args.provider {
+            StoreProvider::Docker => storage_scout::Provider::Docker,
+            StoreProvider::Rustup => storage_scout::Provider::Rustup,
+            StoreProvider::Mise => storage_scout::Provider::Mise,
+        },
+        &args.roots,
+        TierGrant::of(args.include_tier.iter().copied()),
+        &args.id,
+        if args.execute {
+            Mode::Execute
+        } else {
+            Mode::DryRun
+        },
+    )?;
+    let mut out = io::stdout().lock();
+    match args.output.format() {
+        Format::Json => render_json(&report, &mut out)?,
+        Format::Human => {
+            writeln!(out, "Managed store: {}", report.scope)?;
+            for item in &report.inventory {
+                let bytes = match item.bytes {
+                    Some(bytes) => bytes.to_string(),
+                    None => "unreported".to_owned(),
+                };
+                writeln!(out, "{}: {bytes} ({:?})", item.name, item.references)?;
+            }
+            for candidate in &report.candidates {
+                writeln!(out, "{}  {}", candidate.id, candidate.label)?;
+                if let Some(reason) = candidate.refusal {
+                    writeln!(out, "  refused: {reason}")?;
+                }
+            }
+            for outcome in &report.outcomes {
+                writeln!(out, "{}: {:?}", outcome.id, outcome.result)?;
+            }
+            for warning in &report.warnings {
+                writeln!(out, "warning: {warning}")?;
+            }
+        },
+    }
+    let failed = report.outcomes.iter().any(|outcome| {
+        matches!(
+            outcome.result,
+            storage_scout::ManagedStatus::Refused { .. }
+                | storage_scout::ManagedStatus::Failed { .. }
+        )
+    });
+    Ok(ExitCode::from(u8::from(failed)))
+}
+
+fn release(scout: &Scout, args: &ReleaseArgs) -> Result<ExitCode> {
+    if args.monitor {
+        let lease = scout.release(&args.path)?;
+        let mut out = io::stdout().lock();
+        writeln!(out, "released")?;
+        out.flush()?;
+        drop(out);
+        lease.wait()?;
+    } else {
+        let receipt = storage_scout::release_checkout(&args.path)?;
+        let mut out = io::stdout().lock();
+        match args.output.format() {
+            Format::Json => render_json(&receipt, &mut out)?,
+            Format::Human => {
+                writeln!(
+                    out,
+                    "Released {} (monitor {}).",
+                    receipt.location, receipt.monitor_pid
+                )?;
+                writeln!(
+                    out,
+                    "The next checkout write or monitor exit revokes this release."
+                )?;
+            },
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn color() -> Color {
@@ -302,8 +424,7 @@ fn explain(scout: &Scout, args: &ExplainArgs) -> Result<ExitCode> {
             Mandate {
                 tiers: TierGrant::of(args.include_tier.iter().copied()),
                 settlements: match args.phase {
-                    Phase::Manual => Admits::Anything,
-                    Phase::Reap => Admits::Settled,
+                    Phase::Manual | Phase::Reap => Admits::Settled,
                 },
             },
         )
@@ -390,7 +511,7 @@ fn clean(scout: &Scout, args: CleanArgs) -> Result<ExitCode> {
         &ids,
         Mandate {
             tiers,
-            settlements: Admits::Anything,
+            settlements: Admits::Settled,
         },
         &args.exclude,
     )
@@ -480,31 +601,77 @@ fn prune(scout: &Scout, args: &DedupeArgs) -> Result<ExitCode> {
     Ok(ExitCode::from(u8::from(run.failed())))
 }
 
-fn policy_path(given: Option<PathBuf>) -> Result<PathBuf> {
-    match given {
-        Some(config) => Ok(config),
-        None => default_policy_path().context("no --config given and no home directory is set"),
+#[derive(Debug)]
+enum Configuration {
+    Explicit(PathBuf),
+    Default(PathBuf),
+}
+
+impl Configuration {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Explicit(path) | Self::Default(path) => path,
+        }
+    }
+
+    fn resolve(self) -> Result<Self> {
+        let path = self.path();
+        let resolved = match fs::symlink_metadata(path) {
+            Ok(_) => fs::canonicalize(path)
+                .with_context(|| format!("cannot resolve policy {}", path.display()))?,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && matches!(self, Self::Default(_)) =>
+            {
+                std::path::absolute(path)?
+            },
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot resolve policy {}", path.display()));
+            },
+        };
+        Ok(match self {
+            Self::Explicit(_) => Self::Explicit(resolved),
+            Self::Default(_) => Self::Default(resolved),
+        })
     }
 }
 
-fn load_policy(config: &std::path::Path) -> Result<AutoPolicy> {
-    let text = fs::read_to_string(config)
-        .with_context(|| format!("cannot read policy {}", config.display()))?;
+fn policy_path(given: Option<PathBuf>) -> Result<Configuration> {
+    match given {
+        Some(config) => Ok(Configuration::Explicit(config)),
+        None => default_policy_path()
+            .map(Configuration::Default)
+            .context("no --config given and no home directory is set"),
+    }
+}
+
+fn load_policy(config: &Configuration) -> Result<AutoPolicy> {
+    let text = match fs::read_to_string(config.path()) {
+        Ok(text) => text,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && matches!(config, Configuration::Default(_)) =>
+        {
+            return AutoPolicy::user_defaults().context("cannot resolve default user areas");
+        },
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot read policy {}", config.path().display()));
+        },
+    };
     AutoPolicy::parse(&text)
-        .map_err(|error| anyhow!("invalid policy {}: {error}", config.display()))
+        .map_err(|error| anyhow!("invalid policy {}: {error}", config.path().display()))
 }
 
 fn watch(scout: &Scout, args: WatchArgs) -> Result<ExitCode> {
-    let config = policy_path(args.config)?;
-    let config = fs::canonicalize(&config)
-        .with_context(|| format!("cannot resolve policy {}", config.display()))?;
+    let config = policy_path(args.config)?.resolve()?;
     let policy = load_policy(&config)?;
     let render = |record: &storage_scout::WatchRecord| {
         let mut out = io::stdout().lock();
         render_watch(record, &mut out)?;
         out.flush()
     };
-    Err(anyhow!(scout.watch(&policy, &config, &render)))
+    Err(anyhow!(scout.watch(&policy, config.path(), &render)))
 }
 
 fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
@@ -524,18 +691,18 @@ fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
         },
         None => None,
     };
-    let config = fs::canonicalize(&config)
-        .with_context(|| format!("cannot resolve policy {}", config.display()))?;
+    let config = config.resolve()?;
     if args.detach {
-        let forwarded = [
-            OsString::from("auto"),
-            OsString::from("--config"),
-            config.clone().into_os_string(),
-            OsString::from("--execute"),
-        ];
+        let mut forwarded = vec![OsString::from("auto")];
+        if let Configuration::Explicit(path) = &config {
+            forwarded.extend([OsString::from("--config"), path.as_os_str().to_owned()]);
+        }
+        forwarded.push(OsString::from("--execute"));
         let detached = match hook_directory.as_deref() {
-            Some(directory) => storage_scout::hook::detach_hook(&config, &forwarded, directory),
-            None => storage_scout::hook::detach(&config, &forwarded),
+            Some(directory) => {
+                storage_scout::hook::detach_hook(config.path(), &forwarded, directory)
+            },
+            None => storage_scout::hook::detach(config.path(), &forwarded),
         }
         .context("cannot start the background run")?;
         if args.output.format() == Format::Json {
@@ -577,9 +744,9 @@ fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
             };
             let coalescing = match hook_directory.as_deref() {
                 Some(directory) => {
-                    storage_scout::hook::coalesced_hook(&config, directory, &mut execute)
+                    storage_scout::hook::coalesced_hook(config.path(), directory, &mut execute)
                 },
-                None => storage_scout::hook::coalesced(&config, &mut execute),
+                None => storage_scout::hook::coalesced(config.path(), &mut execute),
             }
             .map_err(|error| match error {
                 storage_scout::hook::CoalesceError::Station(error) => {
@@ -592,7 +759,7 @@ fn auto(scout: &Scout, args: AutoArgs) -> Result<ExitCode> {
                 storage_scout::hook::Coalescing::Handed => writeln!(
                     io::stderr().lock(),
                     "Another run for {} is in progress; it will run once more when it finishes.",
-                    config.display()
+                    config.path().display()
                 )?,
             }
         },
@@ -618,9 +785,14 @@ fn list(candidates: &[Found], tiers: TierGrant) -> Result<()> {
         } else {
             " [locked: use --include-tier]"
         };
+        let ownership = if Admits::Settled.admits(candidate.settlement()) {
+            ""
+        } else {
+            " [not released]"
+        };
         writeln!(
             out,
-            "  [{}] {:>11}  [{}, {}, {}]{lock}\n      id={}\n      {}",
+            "  [{}] {:>11}  [{}, {}, {}]{lock}{ownership}\n      id={}\n      {}",
             candidate.tier(),
             candidate.usage().logical,
             candidate.kind().label(),
@@ -636,7 +808,10 @@ fn list(candidates: &[Found], tiers: TierGrant) -> Result<()> {
 fn pick(candidates: &[Found], tiers: TierGrant) -> Result<Option<Vec<CandidateId>>> {
     let choices = candidates
         .iter()
-        .filter(|found| tiers.admits(found.candidate().tier()))
+        .filter(|found| {
+            tiers.admits(found.candidate().tier())
+                && Admits::Settled.admits(found.candidate().settlement())
+        })
         .map(|found| {
             let candidate = found.candidate();
             Choice {
@@ -654,7 +829,7 @@ fn pick(candidates: &[Found], tiers: TierGrant) -> Result<Option<Vec<CandidateId
         return Ok(Some(Vec::new()));
     }
     match MultiSelect::new("Select artifacts to clean", choices)
-        .with_page_size(15)
+        .with_page_size(SELECTION_PAGE_SIZE)
         .with_help_message("Space: select · type: search · Enter: continue · Esc: cancel")
         .prompt()
     {

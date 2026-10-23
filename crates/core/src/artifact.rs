@@ -17,6 +17,8 @@ ordered! {
     #[serde(rename_all = "kebab-case")]
     pub enum Kind {
         RustTarget,
+        SwiftPackageBuild,
+        GleamBuild,
         DotNetOutput,
         SolutionBuild,
         VisualStudioCache,
@@ -34,11 +36,107 @@ ordered! {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeContents {
+    Artifacts,
+    ProducerOwned,
+    SwiftPackage,
+    Gleam,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceArea {
+    Checkouts,
+    Repositories,
+    Packages,
+    Git,
+    Other,
+}
+
+impl SourceArea {
+    #[must_use]
+    pub const fn of(component: &[u8]) -> Self {
+        match component {
+            b"checkouts" => Self::Checkouts,
+            b"repositories" => Self::Repositories,
+            b"packages" => Self::Packages,
+            b"git" => Self::Git,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitEntry {
+    RepositoryDirectory,
+    LinkedCheckout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceDisposition {
+    Preserve,
+    Disposable,
+}
+
+impl TreeContents {
+    #[must_use]
+    pub const fn git(self, area: SourceArea, entry: GitEntry) -> SourceDisposition {
+        match self {
+            Self::ProducerOwned => SourceDisposition::Disposable,
+            Self::Artifacts => SourceDisposition::Preserve,
+            Self::SwiftPackage => match entry {
+                GitEntry::LinkedCheckout => SourceDisposition::Preserve,
+                GitEntry::RepositoryDirectory => match area {
+                    SourceArea::Checkouts | SourceArea::Repositories => {
+                        SourceDisposition::Disposable
+                    },
+                    SourceArea::Packages | SourceArea::Git | SourceArea::Other => {
+                        SourceDisposition::Preserve
+                    },
+                },
+            },
+            Self::Gleam => match entry {
+                GitEntry::LinkedCheckout => SourceDisposition::Preserve,
+                GitEntry::RepositoryDirectory => match area {
+                    SourceArea::Packages | SourceArea::Git => SourceDisposition::Disposable,
+                    SourceArea::Checkouts | SourceArea::Repositories | SourceArea::Other => {
+                        SourceDisposition::Preserve
+                    },
+                },
+            },
+        }
+    }
+}
+
 impl Kind {
+    #[must_use]
+    pub const fn contents(self) -> TreeContents {
+        match self {
+            Self::OwnedScratch | Self::OwnedCache => TreeContents::ProducerOwned,
+            Self::SwiftPackageBuild => TreeContents::SwiftPackage,
+            Self::GleamBuild => TreeContents::Gleam,
+            Self::RustTarget
+            | Self::DotNetOutput
+            | Self::SolutionBuild
+            | Self::VisualStudioCache
+            | Self::GradleOutput
+            | Self::MavenTarget
+            | Self::JsOutput
+            | Self::PythonCache
+            | Self::CmakeOutput
+            | Self::NodeModules
+            | Self::PythonVenv
+            | Self::UnityOutput
+            | Self::TaggedCache => TreeContents::Artifacts,
+        }
+    }
+
     #[must_use]
     pub const fn protocol(self) -> Option<Protocol> {
         match self {
             Self::RustTarget => Some(Protocol::Cargo),
+            Self::SwiftPackageBuild => Some(Protocol::SwiftPackage),
+            Self::GleamBuild => Some(Protocol::Gleam),
             Self::OwnedScratch | Self::OwnedCache => Some(Protocol::TempOwner),
             Self::DotNetOutput
             | Self::SolutionBuild
@@ -61,6 +159,8 @@ impl Kind {
             Self::NodeModules | Self::PythonVenv | Self::TaggedCache => Tier::Reinstallable,
             Self::UnityOutput => Tier::Expensive,
             Self::RustTarget
+            | Self::SwiftPackageBuild
+            | Self::GleamBuild
             | Self::DotNetOutput
             | Self::SolutionBuild
             | Self::VisualStudioCache
@@ -78,6 +178,8 @@ impl Kind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::RustTarget => "Rust target",
+            Self::SwiftPackageBuild => "SwiftPM .build",
+            Self::GleamBuild => "Gleam build",
             Self::DotNetOutput => ".NET bin/obj",
             Self::SolutionBuild => "solution build",
             Self::VisualStudioCache => "Visual Studio .vs",
@@ -99,6 +201,8 @@ impl Kind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::RustTarget => "rust-target",
+            Self::SwiftPackageBuild => "swift-package-build",
+            Self::GleamBuild => "gleam-build",
             Self::DotNetOutput => "dotnet-output",
             Self::SolutionBuild => "solution-build",
             Self::VisualStudioCache => "visual-studio-cache",
@@ -308,6 +412,12 @@ impl Listing {
         }
         if name == "target" && files.contains("cargo.toml") {
             return Some(Kind::RustTarget);
+        }
+        if name == ".build" && files.contains("package.swift") {
+            return Some(Kind::SwiftPackageBuild);
+        }
+        if name == "build" && files.contains("gleam.toml") {
+            return Some(Kind::GleamBuild);
         }
         if name == "target" && files.contains("pom.xml") {
             return Some(Kind::MavenTarget);

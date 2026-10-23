@@ -1,8 +1,9 @@
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use serde::Serialize;
+
+use crate::location::{LocationError, Name, Syntax};
 
 pub const OBJECT_SUFFIX: &[u8] = b".rcgu.o";
 pub const INCREMENTAL: &str = "incremental";
@@ -104,16 +105,20 @@ pub struct Session<'a> {
 }
 
 fn base36(digits: &[u8]) -> Option<u128> {
+    const RADIX: u128 = 36;
+    const ALPHA_OFFSET: u8 = 10;
     if digits.is_empty() {
         return None;
     }
     digits.iter().try_fold(0u128, |value, digit| {
         let digit = match digit {
             b'0'..=b'9' => digit.checked_sub(b'0'),
-            b'a'..=b'z' => digit.checked_sub(b'a').and_then(|at| at.checked_add(10)),
+            b'a'..=b'z' => digit
+                .checked_sub(b'a')
+                .and_then(|at| at.checked_add(ALPHA_OFFSET)),
             _ => None,
         }?;
-        value.checked_mul(36)?.checked_add(u128::from(digit))
+        value.checked_mul(RADIX)?.checked_add(u128::from(digit))
     })
 }
 
@@ -141,10 +146,15 @@ impl<'a> Session<'a> {
         Some(Self { name, lock, stage })
     }
 
-    #[must_use]
-    pub fn lock_name(&self) -> String {
-        [self.lock, LOCK_SUFFIX].concat()
+    pub fn lock_name(&self) -> Result<Name, LocationError> {
+        lock_name_bytes(self.lock.as_bytes())
     }
+}
+
+pub(crate) fn lock_name_bytes(lock: &[u8]) -> Result<Name, LocationError> {
+    let mut name = lock.to_vec();
+    name.extend_from_slice(LOCK_SUFFIX.as_bytes());
+    Name::new(&name, Syntax::Windows)
 }
 
 #[must_use]
@@ -242,7 +252,10 @@ mod tests {
     fn a_session_name_carries_its_stage_and_lock() {
         let finalized = Session::parse("s-hml9l00hya-1spx8v6-503beytbg5g2o7").unwrap();
         assert_eq!(finalized.lock, "s-hml9l00hya-1spx8v6");
-        assert_eq!(finalized.lock_name(), "s-hml9l00hya-1spx8v6.lock");
+        assert_eq!(
+            finalized.lock_name().map(|name| name.as_bytes().to_vec()),
+            Ok(b"s-hml9l00hya-1spx8v6.lock".to_vec())
+        );
         assert!(matches!(finalized.stage, Stage::Finalized { .. }));
         let working = Session::parse("s-hml9l00hya-1spx8v6-working").unwrap();
         assert_eq!(working.stage, Stage::Working);

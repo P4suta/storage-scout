@@ -1,8 +1,32 @@
+min_version = "2026.10.11"
+
 [tools]
-typos = "latest"
-taplo = "latest"
-actionlint = "latest"
-lefthook = "latest"
+rust = { version = "1.99.1", profile = "minimal", components = [
+  "rustfmt",
+  "clippy",
+  "rust-src",
+  "llvm-tools",
+], targets = [
+  "thumbv7em-none-eabi",
+] }
+just = "1.59.0"
+typos = "1.51.1"
+taplo = "0.10.0"
+actionlint = "1.7.12"
+lefthook = "2.2.2"
+zizmor = "1.31.1"
+"cargo:cargo-nextest" = "0.9.149"
+"cargo:cargo-deny" = "0.20.2"
+"cargo:P4suta/OComment" = { version = "rev:e3e98c77a0d0fbdeabdd90ccbfaa6620d6d1c410", crate = "ocomment", bin = "ocomment", install_env = { RUSTUP_TOOLCHAIN = "1.99.1" } }
+
+[tasks.assure]
+description = "Source-bound Kani proofs, rejected probe, Quint/TLA+ replay, fuzz, and Miri"
+tools = { "cargo:kani-verifier" = "0.68.0", "github:Z3Prover/z3" = "z3-5.1.0", "npm:@informalsystems/quint" = "0.32.0", "cargo:cargo-fuzz" = "0.13.2", node = "26.12.0", java = "temurin-25.0.4+101.0.LTS" }
+run = ["cargo kani setup", "cargo xtask assure"]
+
+[tasks."assure:inventory"]
+description = "Reject unassessed public decisions and missing assurance inputs"
+run = "cargo xtask assurance-inventory"
 
 
 [tasks.fmt]
@@ -34,12 +58,30 @@ description = "Run documentation tests"
 run = "cargo test --workspace --doc"
 
 [tasks.check]
-description = "Everything CI runs on one platform"
+description = "Fast deterministic checks on one platform"
 depends = ["fmt:check", "clippy", "gates", "pure", "test", "test:doc", "lint:repo"]
 
 [tasks."lint:repo"]
 description = "Spelling, TOML formatting, and the workflows"
-run = ["typos", "taplo fmt --check", "actionlint"]
+run = [
+  "typos",
+  "taplo fmt --check",
+  "actionlint",
+  "zizmor --no-progress .github/workflows",
+  "ocomment check --config .ocomment.toml --format github .",
+]
+
+[tasks.dependencies]
+description = "Check dependency advisories, sources, bans, and licenses"
+run = "cargo deny check"
+
+[tasks."renovate:check"]
+description = "Validate the resolved shared dependency-update policy"
+run = "cargo xtask renovate-validate"
+
+[tasks."renovate:extract"]
+description = "Inspect dependency extraction without publishing branches or pull requests"
+run = "cargo xtask renovate-extract"
 
 [tasks.doctor]
 description = "Show what this host resolved: protected areas, gates, free space"
@@ -54,44 +96,17 @@ description = "Line coverage over the whole suite"
 run = "cargo llvm-cov nextest --workspace --html"
 
 [tasks.mutants]
-description = "Would the safety tests notice if a rule quietly changed?"
-run = "rust-mutants run"
+description = "Run upstream mutation testing over the cleanup safety contract"
+run = "mise run mutants:tool"
+
+[tasks."mutants:tool"]
+description = "Run pinned cargo-mutants with owned scratch and checked results"
+tools = { "cargo:cargo-mutants" = "27.1.0" }
+run = "cargo xtask mutants"
 
 [tasks."mutants:dry"]
-description = "How many mutants there are and roughly what they cost, running none"
-run = "rust-mutants run --dry-run"
-
-[tasks."mutants:changed"]
-description = "Only the files that differ from HEAD"
-run = "rust-mutants run --changed"
-
-[tasks."mutants:branch"]
-description = "Only the files this branch changes from main, as a pull request measures them"
-run = "rust-mutants run --changed-from origin/main"
-
-[tasks."mutants:explain"]
-description = "Account for one mutant: mise run mutants:explain -- <ID-PREFIX>"
-run = "rust-mutants explain"
-
-[tasks."mutants:report"]
-description = "One page showing every survivor in place"
-run = "rust-mutants report --format html"
-
-[tasks."mutants:doctor"]
-description = "Whether this machine can measure, and what it would cost"
-run = "rust-mutants doctor"
-
-[tasks.verify]
-description = "The full assurance contract: tests, coverage routing, mutation, soundness"
-run = "njutest verify --ui=plain"
-
-[tasks."verify:doctor"]
-description = "Whether this machine can run the assurance contract"
-run = "njutest doctor"
-
-[tasks."verify:changed"]
-description = "The contract over what differs from the default branch"
-run = "njutest verify --changed=origin/main --ui=plain"
+description = "List the mutation catalog without building or executing mutants"
+run = "mise run mutants:tool -- --list --json"
 
 [tasks."schema:bless"]
 description = "Record newly added JSON fields after reviewing the diff"

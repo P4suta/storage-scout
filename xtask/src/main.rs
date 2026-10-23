@@ -1,4 +1,6 @@
+mod assurance;
 mod comments;
+mod renovate;
 mod syntax;
 
 use std::fs;
@@ -62,9 +64,39 @@ fn main() -> ExitCode {
         .parent()
         .map(Path::to_path_buf);
     let mut out = io::stderr().lock();
+    if std::env::args().nth(1).as_deref() == Some("mutants")
+        && let Some(root) = &root
+    {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        return match assurance::runner::mutation(root, &args, &mut out) {
+            Ok(status) => match status.code() {
+                Some(code) => match u8::try_from(code) {
+                    Ok(code) => ExitCode::from(code),
+                    Err(_unrepresentable) => ExitCode::FAILURE,
+                },
+                None => ExitCode::FAILURE,
+            },
+            Err(error) => {
+                let _diagnostic = writeln!(out, "{error:#}");
+                ExitCode::FAILURE
+            },
+        };
+    }
     let result = match (std::env::args().nth(1).as_deref(), root) {
         (Some("gates"), Some(root)) => gates(&root, &mut out),
-        (Some(_) | None, _) => Err("usage: cargo xtask gates".to_owned()),
+        (Some("assure"), Some(root)) => assurance::run(&root, &mut out)
+            .map(|()| 0)
+            .map_err(|error| format!("{error:#}")),
+        (Some("assurance-inventory"), Some(root)) => assurance::inventory(&root)
+            .map(|()| 0)
+            .map_err(|error| format!("{error:#}")),
+        (Some("renovate-validate"), Some(root)) => renovate::run(&root, renovate::Mode::Validate)
+            .map(|()| 0).map_err(|error| format!("{error:#}")),
+        (Some("renovate-extract"), Some(root)) => renovate::run(&root, renovate::Mode::Extract)
+            .map(|()| 0).map_err(|error| format!("{error:#}")),
+        (Some(_) | None, _) => {
+            Err("usage: cargo xtask gates | assurance-inventory | assure | renovate-validate | renovate-extract | mutants ARGS".to_owned())
+        },
     };
     match result {
         Ok(0) => ExitCode::SUCCESS,

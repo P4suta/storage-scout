@@ -97,7 +97,7 @@ pub(super) fn facts(_path: &Path, metadata: &Metadata) -> io::Result<FileFacts> 
         } else {
             Owner::Other
         },
-        mode: if metadata.mode() & 0o111 == 0 {
+        mode: if metadata.mode() & (libc::S_IXUSR | libc::S_IXGRP | libc::S_IXOTH) == 0 {
             Mode::Plain
         } else {
             Mode::Executable

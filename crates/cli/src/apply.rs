@@ -10,10 +10,9 @@ use storage_scout_core::gate::{self, Mandate, Recheck, Verify};
 use storage_scout_core::location::Location;
 use storage_scout_core::lock::Liveness;
 use storage_scout_core::reject::Rejection;
-use storage_scout_core::size::Bytes;
+use storage_scout_core::size::{Bytes, Reclamation};
 
 use self::capability::Authorized;
-use crate::measure::Volumes;
 use crate::owners::Owners;
 use crate::scan::Found;
 use crate::{SCHEMA_VERSION, busy, measure, observe};
@@ -115,7 +114,10 @@ pub(crate) fn plan(
         }
         selected.push(chosen.clone());
     }
-    let paths = selected.iter().map(Found::path).collect::<Vec<_>>();
+    let paths = selected
+        .iter()
+        .map(|each| (each.path(), each.candidate().kind()))
+        .collect::<Vec<_>>();
     let usage = match measure::selection(&paths) {
         Ok(usage) => Some(usage),
         Err(_unmeasurable) => None,
@@ -149,8 +151,8 @@ struct Terms<'a> {
 fn check(found: &Found, terms: &Terms<'_>, mode: Mode) -> Result<Checked, Rejection> {
     let observed = observe::observe(found.path())?;
     let site = observed.site(terms.protection, terms.excludes);
-    let survey = busy::survey(&observed.path)?;
-    let ownership = terms.owners.of(&observed.path, &survey.markers);
+    let survey = terms.owners.survey(&observed.path)?;
+    let ownership = terms.owners.recheck(&observed.path, &survey.markers);
     let hold = match mode {
         Mode::DryRun => busy::probe(&survey.locks).map(|()| Hold::Probed),
         Mode::Execute => busy::lease(&survey.locks).map(Hold::Leased),
@@ -168,7 +170,7 @@ fn check(found: &Found, terms: &Terms<'_>, mode: Mode) -> Result<Checked, Reject
     };
     gate::recheck(&site, &recheck)?;
     let hold = hold.map_err(|contention| contention.rejection(observed.location.clone()))?;
-    let measured = measure::strictly(&observed.path)?;
+    let measured = measure::strictly(&observed.path, found.candidate().kind())?;
     let clearance = gate::clear(
         &site,
         &Verify {
@@ -203,22 +205,29 @@ fn settle(found: &Found, terms: &Terms<'_>, mode: Mode) -> Outcome {
 }
 
 pub(crate) fn apply(plan: &Plan, mode: Mode, protection: &Protection, owners: &Owners) -> Summary {
-    let before = match mode {
-        Mode::Execute => Some(free_space(plan)),
-        Mode::DryRun => None,
-    };
     let terms = Terms {
         mandate: &plan.mandate,
         excludes: &plan.excludes,
         protection,
         owners,
     };
-    let outcomes = plan
+    let outcomes: Vec<_> = plan
         .candidates
         .iter()
         .map(|found| settle(found, &terms, mode))
         .collect();
-    let observed_freed = before.and_then(|before| before.gained(&free_space(plan)));
+    let observed_freed = match mode {
+        Mode::DryRun => None,
+        Mode::Execute => if outcomes
+            .iter()
+            .any(|outcome| matches!(outcome.status, Status::Deleted | Status::Failed { .. }))
+        {
+            Reclamation::Unattributable
+        } else {
+            Reclamation::Unchanged
+        }
+        .observed(),
+    };
     Summary {
         schema_version: SCHEMA_VERSION,
         mode,
@@ -228,11 +237,45 @@ pub(crate) fn apply(plan: &Plan, mode: Mode, protection: &Protection, owners: &O
     }
 }
 
-fn free_space(plan: &Plan) -> Volumes {
-    Volumes::sample(plan.candidates.iter().map(|found| {
-        (
-            found.candidate().identity().volume,
-            found.path().parent().unwrap_or_else(|| found.path()),
-        )
-    }))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletion_holds_the_owner_lock_of_its_ancestor() {
+        let temp = testkit::tempdir("ancestor-lease");
+        let root = temp.path().join("work");
+        let target = testkit::write_cargo_project(&root, 4096);
+        testkit::write_owner_marker(
+            &root,
+            testkit::MarkerRole::Scratch,
+            testkit::MarkerKeep::Released,
+            None,
+        );
+        let scout =
+            crate::Scout::with(testkit::open_protection()).confined(vec![testkit::ceiling()]);
+        let report = scout
+            .discover(&crate::ScanOptions::sighting(
+                std::slice::from_ref(&root),
+                &[],
+            ))
+            .unwrap();
+        let found = report.candidates.first().unwrap();
+        assert_eq!(found.path(), target);
+        let mandate = Mandate::default();
+        let terms = Terms {
+            mandate: &mandate,
+            excludes: &[],
+            protection: scout.protection(),
+            owners: &scout.owners,
+        };
+        let checked = check(found, &terms, Mode::Execute).unwrap();
+        assert!(matches!(checked, Checked::Authorized(_, _)));
+        let lock = std::fs::File::open(root.join("owner.lock")).unwrap();
+        assert!(matches!(
+            lock.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(checked);
+    }
 }

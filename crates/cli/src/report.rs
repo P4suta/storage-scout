@@ -44,14 +44,18 @@ pub enum Color {
 }
 
 fn write_usage(label: &str, usage: &Usage, out: &mut dyn Write) -> io::Result<()> {
-    writeln!(out, "{label} logical size: {}", usage.logical)?;
+    let bound = if usage.failures == 0 { "" } else { "at least " };
+    writeln!(out, "{label} logical size: {bound}{}", usage.logical)?;
+    if usage.failures > 0 {
+        writeln!(out, "{label} measurement failures: {}", usage.failures)?;
+    }
     match usage.allocation {
         Allocation::Measured {
             allocated,
             reclaimable,
         } => {
-            writeln!(out, "{label} allocated: {allocated}")?;
-            writeln!(out, "{label} reclaimable: {reclaimable}")
+            writeln!(out, "{label} allocated: {bound}{allocated}")?;
+            writeln!(out, "{label} reclaimable: {bound}{reclaimable}")
         },
         Allocation::Unmeasured => writeln!(out, "{label} allocation: unmeasured"),
     }
@@ -67,6 +71,22 @@ pub fn render_scan(report: &ScanReport, color: Color, out: &mut dyn Write) -> io
         .join(", ");
     writeln!(out, "Roots: {roots}")?;
     write_usage("Total", &report.usage, out)?;
+    for volume in &report.volumes {
+        let account = volume.reconciliation;
+        writeln!(
+            out,
+            "Volume {}: used {}, attributed {}, unattributed {}, overcount {}",
+            volume.location,
+            account.used,
+            account.attributed,
+            account.unattributed,
+            account.overcount
+        )?;
+    }
+    for cache in &report.tool_caches {
+        writeln!(out, "Tool cache ({}): {}", cache.tool, cache.location)?;
+        write_usage("  Cache", &cache.usage, out)?;
+    }
     writeln!(
         out,
         "Scanned {} directories and {} files ({} links, {} filesystem boundaries skipped, {} errors)",

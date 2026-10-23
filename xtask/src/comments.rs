@@ -49,13 +49,21 @@ fn closes_raw(rest: &[u8], hashes: usize) -> bool {
 }
 
 fn is_character(rest: &[u8]) -> bool {
+    const TWO_BYTE_MIN: u8 = 0xc0;
+    const TWO_BYTE_MAX: u8 = 0xdf;
+    const THREE_BYTE_MIN: u8 = 0xe0;
+    const THREE_BYTE_MAX: u8 = 0xef;
+    const FOUR_BYTE_MIN: u8 = 0xf0;
+    const FOUR_BYTE_MAX: u8 = 0xf7;
+    const THREE_BYTES: usize = 3;
+    const FOUR_BYTES: usize = 4;
     match rest {
         [b'\'', b'\\', ..] | [b'\'', _, b'\'', ..] => true,
         [b'\'', first, ..] => {
             let width: usize = match first {
-                0xC0..=0xDF => 2,
-                0xE0..=0xEF => 3,
-                0xF0..=0xF7 => 4,
+                TWO_BYTE_MIN..=TWO_BYTE_MAX => 2,
+                THREE_BYTE_MIN..=THREE_BYTE_MAX => THREE_BYTES,
+                FOUR_BYTE_MIN..=FOUR_BYTE_MAX => FOUR_BYTES,
                 _ => return false,
             };
             rest.get(width.saturating_add(1)) == Some(&b'\'')

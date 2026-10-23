@@ -12,6 +12,7 @@ keywords = ["cleanup", "storage", "policy"]
 categories = ["filesystem", "no-std"]
 
 [dependencies]
+hex.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

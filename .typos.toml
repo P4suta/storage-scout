@@ -1,5 +1,3 @@
-# typos: spell-checker configuration.
-# Build artifacts have hash-like names that trip the checker; never scan them.
 
 [files]
 extend-exclude = ["target/"]

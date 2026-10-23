@@ -7,23 +7,34 @@ use storage_scout_core::candidate::Identity;
 use storage_scout_core::gate::{Boundary, Shape};
 use storage_scout_core::share::{Extras, Failure, Filesystem, Method, Mode, Owner, Sharing, Step};
 
-#[cfg_attr(target_os = "macos", path = "platform/events_macos.rs")]
-#[cfg_attr(target_os = "linux", path = "platform/events_linux.rs")]
-#[cfg_attr(windows, path = "platform/events_windows.rs")]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", windows)),
-    path = "platform/events_none.rs"
-)]
+pub(crate) mod engine;
+#[cfg(target_os = "macos")]
+#[path = "platform/events_macos.rs"]
 mod events;
-#[cfg_attr(unix, path = "platform/unix.rs")]
-#[cfg_attr(windows, path = "platform/windows.rs")]
+#[cfg(target_os = "linux")]
+#[path = "platform/events_linux.rs"]
+mod events;
+#[cfg(windows)]
+#[path = "platform/events_windows.rs"]
+mod events;
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+#[path = "platform/events_none.rs"]
+mod events;
+#[cfg(unix)]
+#[path = "platform/unix.rs"]
 mod imp;
-#[cfg_attr(target_os = "macos", path = "platform/share_macos.rs")]
-#[cfg_attr(target_os = "linux", path = "platform/share_linux.rs")]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    path = "platform/share_none.rs"
-)]
+#[cfg(windows)]
+#[path = "platform/windows.rs"]
+mod imp;
+pub(crate) mod release_socket;
+#[cfg(target_os = "macos")]
+#[path = "platform/share_macos.rs"]
+mod share;
+#[cfg(target_os = "linux")]
+#[path = "platform/share_linux.rs"]
+mod share;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[path = "platform/share_none.rs"]
 mod share;
 pub(crate) mod spawn;
 
@@ -89,6 +100,16 @@ pub(crate) fn background() {
 pub(crate) struct Watcher(events::Source);
 
 impl Watcher {
+    pub(crate) fn barrier(&self) -> io::Result<()> {
+        self.0.barrier()
+    }
+    pub(crate) fn release(
+        paths: &[PathBuf],
+        deliver: impl Fn(Change) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        events::Source::start_release(paths, Box::new(deliver)).map(Self)
+    }
+
     pub(crate) fn start(
         paths: &[PathBuf],
         notification: &str,
@@ -186,7 +207,26 @@ pub(crate) fn file_measure(path: &Path) -> io::Result<FileMeasure> {
 }
 
 pub(crate) fn free_space(path: &Path) -> io::Result<u64> {
-    imp::free_space(path)
+    volume_space(path).map(|space| space.available)
+}
+
+pub(crate) fn swift_lock_path(root: &Path) -> io::Result<PathBuf> {
+    imp::swift_lock_path(root)
+}
+
+pub(crate) fn user_temporary(path: &Path) -> io::Result<bool> {
+    imp::user_temporary(path)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VolumeSpace {
+    pub total: u64,
+    pub free: u64,
+    pub available: u64,
+}
+
+pub(crate) fn volume_space(path: &Path) -> io::Result<VolumeSpace> {
+    imp::volume_space(path)
 }
 
 pub(crate) fn shape(metadata: &Metadata) -> Shape {

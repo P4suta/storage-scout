@@ -26,6 +26,7 @@ pub mod git;
 pub mod location;
 pub mod lock;
 pub mod macho;
+pub mod managed;
 pub mod ownership;
 pub mod platform;
 pub mod prune;
@@ -34,3 +35,6 @@ pub mod select;
 pub mod share;
 pub mod size;
 pub mod table;
+
+#[cfg(kani)]
+mod proofs;
