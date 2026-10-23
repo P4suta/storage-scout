@@ -5,6 +5,13 @@
   ],
   "packageRules": [
     {
+      "description": "Compare Temurin source and lock versions without treating the vendor prefix as a version.",
+      "matchManagers": ["mise"],
+      "matchDepNames": ["java"],
+      "matchDatasources": ["java-version"],
+      "versioning": "regex:^(?:temurin-)?(?<major>\\d+)(?:\\.(?<minor>\\d+))?(?:\\.(?<patch>\\d+))?(?:\\+(?<build>\\d+)(?:\\.(?<revision>\\d+))?(?:\\.LTS)?)?$"
+    },
+    {
       "description": "The mise Cargo manager treats repository-backed tools as registry crates.",
       "matchManagers": [
         "mise"
