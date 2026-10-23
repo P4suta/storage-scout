@@ -9,7 +9,7 @@ rust = { version = "1.99.1", profile = "minimal", components = [
 ], targets = [
   "thumbv7em-none-eabi",
 ] }
-just = "1.58.0"
+just = "1.59.0"
 typos = "1.51.1"
 taplo = "0.10.0"
 actionlint = "1.7.12"
@@ -21,7 +21,7 @@ zizmor = "1.31.1"
 
 [tasks.assure]
 description = "Source-bound Kani proofs, rejected probe, Quint/TLA+ replay, fuzz, and Miri"
-tools = { "cargo:kani-verifier" = "0.68.0", "github:Z3Prover/z3" = "z3-5.1.0", "npm:@informalsystems/quint" = "0.32.0", "cargo:cargo-fuzz" = "0.13.2", node = "26.11.1", java = "temurin-25.0.4+101.0.LTS" }
+tools = { "cargo:kani-verifier" = "0.68.0", "github:Z3Prover/z3" = "z3-5.1.0", "npm:@informalsystems/quint" = "0.32.0", "cargo:cargo-fuzz" = "0.13.2", node = "26.12.0", java = "temurin-25.0.4+101.0.LTS" }
 run = ["cargo kani setup", "cargo xtask assure"]
 
 [tasks."assure:inventory"]
