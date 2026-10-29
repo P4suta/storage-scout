@@ -23,6 +23,25 @@ pub struct Explanation {
     pub ownership: Option<Ownership>,
 }
 
+impl Explanation {
+    const fn new(
+        location: Location,
+        stages: Vec<Stage>,
+        rejection: Option<Rejection>,
+        ownership: Option<Ownership>,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            command: "explain",
+            location,
+            stages,
+            eligible: rejection.is_none(),
+            rejection,
+            ownership,
+        }
+    }
+}
+
 pub(crate) fn explain(
     path: &Path,
     excludes: &[PathBuf],
@@ -48,7 +67,17 @@ pub(crate) fn explain(
     let (mut stages, ownership) = if refused {
         (unasked, None)
     } else {
-        let survey = owners.survey(&observed.path)?;
+        let survey = match owners.survey(&observed.path) {
+            Ok(survey) => survey,
+            Err(rejection) => {
+                return Ok(Explanation::new(
+                    observed.location,
+                    unasked,
+                    Some(rejection),
+                    None,
+                ));
+            },
+        };
         let ownership = owners.recheck(&observed.path, &survey.markers);
         let liveness = match busy::probe(&survey.locks) {
             Ok(()) => Liveness::Free,
@@ -110,13 +139,10 @@ pub(crate) fn explain(
         Outcome::Reject { rejection } => Some(rejection.clone()),
         Outcome::Pass { .. } | Outcome::Abstain | Outcome::NotReached => None,
     });
-    Ok(Explanation {
-        schema_version: SCHEMA_VERSION,
-        command: "explain",
-        location: observed.location,
-        eligible: rejection.is_none(),
+    Ok(Explanation::new(
+        observed.location,
+        stages,
         rejection,
         ownership,
-        stages,
-    })
+    ))
 }
