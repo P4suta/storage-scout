@@ -256,6 +256,41 @@ fn released_cache(directory: &Path, retired: &Path) {
     write_sized(&directory.join("artifact"), 4096);
 }
 
+fn assert_unsupported_swift_lock(document: &Value, build: &Path, outside: &Path) {
+    assert_eq!(document.get("eligible").unwrap(), false);
+    let rejection = document.get("rejection").unwrap();
+    assert_eq!(rejection.get("reason").unwrap(), "io");
+    assert_eq!(rejection.get("operation").unwrap(), "lock");
+    let failure = rejection.get("failure").unwrap();
+    assert_eq!(failure.get("kind").unwrap(), "unsupported");
+    assert_eq!(failure.get("code").unwrap(), &Value::Null);
+    assert_eq!(
+        rejection.get("location").unwrap(),
+        document.get("location").unwrap()
+    );
+    assert_eq!(document.get("ownership").unwrap(), &Value::Null);
+    let stages = document.get("stages").unwrap().as_array().unwrap();
+    for gate in ["ownership", "busy"] {
+        let stage = stages
+            .iter()
+            .find(|stage| stage.get("gate").and_then(Value::as_str) == Some(gate))
+            .unwrap();
+        assert_eq!(
+            stage.get("outcome").unwrap().get("outcome").unwrap(),
+            "abstain"
+        );
+    }
+    let shape = stages.first().unwrap();
+    assert_eq!(shape.get("gate").unwrap(), "shape");
+    assert_eq!(
+        shape.get("outcome").unwrap().get("outcome").unwrap(),
+        "pass"
+    );
+    testkit::assert_present(build);
+    assert_eq!(fs::read(build.join("debug/app")).unwrap(), vec![b'x'; 32]);
+    assert_eq!(fs::read(outside.join("payload")).unwrap(), vec![b'x'; 1024]);
+}
+
 #[test]
 fn swift_build_links_are_unlinked_only_after_the_real_workspace_lock_is_free() {
     let temp = tempdir("swift-links");
@@ -276,11 +311,19 @@ fn swift_build_links_are_unlinked_only_after_the_real_workspace_lock_is_free() {
     let Some(_) = link_dir(&build.join("external"), &outside).or_decline("a directory link") else {
         return;
     };
+    let links = [build.join("release"), build.join("external")].map(|link| {
+        let target = fs::read_link(&link).unwrap();
+        (link, target)
+    });
     let absent = isolated_user(&["explain", build.to_str().unwrap(), "--json"], &home);
+    assert_eq!(absent.status.code(), Some(1), "{absent:?}");
     let absent = json(&absent);
+    assert_eq!(absent["schema_version"], SCHEMA_VERSION);
+    for (link, target) in links {
+        assert_eq!(fs::read_link(link).unwrap(), target);
+    }
     if !testkit::native_checkout_events() {
-        assert_eq!(absent["eligible"], false);
-        assert_eq!(absent["rejection"]["reason"], "io");
+        assert_unsupported_swift_lock(&absent, &build, &outside);
         return;
     }
     assert_eq!(

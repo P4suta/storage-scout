@@ -234,11 +234,12 @@ fn an_idle_local_peer_cannot_block_revoking_a_checkout_release() {
         })
         .unwrap();
     let socket = PathBuf::from(fs::read_to_string(&endpoint).unwrap());
-    let client = testkit::idle_local_client(&socket).unwrap();
-    drop(lease);
-    testkit::assert_absent(endpoint);
-    assert_eq!(settlement(&scout, &work, &target), Settlement::Active);
-    drop(client);
+    {
+        let _client = testkit::idle_local_client(&socket).unwrap();
+        drop(lease);
+        testkit::assert_absent(endpoint);
+        assert_eq!(settlement(&scout, &work, &target), Settlement::Active);
+    }
 }
 
 #[test]

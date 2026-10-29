@@ -106,24 +106,71 @@ fn fixture_lease(directory: &Path) -> Option<File> {
     Some(lock)
 }
 
-fn tidy_fixtures(base: &Path) -> std::io::Result<()> {
-    let parent_lease = match fs::symlink_metadata(base.join("owner.json")) {
+#[derive(Debug)]
+struct FixtureMaintenanceError {
+    operation: &'static str,
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+impl FixtureMaintenanceError {
+    fn new(operation: &'static str, path: &Path, source: std::io::Error) -> Self {
+        Self {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for FixtureMaintenanceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "failed to {} {}",
+            self.operation,
+            self.path.display()
+        )?;
+        write!(formatter, ": {}", self.source)
+    }
+}
+
+impl std::error::Error for FixtureMaintenanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn tidy_fixtures(base: &Path) -> Result<(), FixtureMaintenanceError> {
+    let parent_marker = base.join("owner.json");
+    let parent_lease = match fs::symlink_metadata(&parent_marker) {
         Ok(_) if exact_marker(base, SCRATCH_OWNER) => match fixture_lease(base) {
             Some(lease) => Some(lease),
             None => return Ok(()),
         },
         Ok(_) => return Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(FixtureMaintenanceError::new(
+                "inspect parent fixture marker",
+                &parent_marker,
+                error,
+            ));
+        },
     };
-    for entry in fs::read_dir(base)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir()
-            || !entry.file_name().as_encoded_bytes().starts_with(b".run-")
-        {
+    let entries = fs::read_dir(base)
+        .map_err(|error| FixtureMaintenanceError::new("list fixture directory", base, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            FixtureMaintenanceError::new("read fixture directory entry", base, error)
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            FixtureMaintenanceError::new("inspect fixture entry type", &path, error)
+        })?;
+        if !file_type.is_dir() || !entry.file_name().as_encoded_bytes().starts_with(b".run-") {
             continue;
         }
-        let path = entry.path();
         if !exact_marker(&path, SCRATCH_OWNER) {
             continue;
         }
@@ -133,14 +180,18 @@ fn tidy_fixtures(base: &Path) -> std::io::Result<()> {
         if !exact_marker(&path, SCRATCH_OWNER) {
             continue;
         }
-        let staged = tempfile::Builder::new().prefix(".reap-").tempdir_in(base)?;
-        match fs::rename(&path, staged.path().join("run")) {
+        match fs::remove_dir_all(&path) {
             Ok(()) => {},
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(FixtureMaintenanceError::new(
+                    "remove released fixture",
+                    &path,
+                    error,
+                ));
+            },
         }
         drop(lease);
-        drop(staged);
     }
     drop(parent_lease);
     Ok(())
@@ -151,7 +202,7 @@ static HELD: OnceLock<Mutex<Weak<FixtureOwner>>> = OnceLock::new();
 #[derive(Debug)]
 struct FixtureOwner {
     root: tempfile::TempDir,
-    lock: Option<File>,
+    _lease: File,
 }
 
 impl FixtureOwner {
@@ -171,16 +222,7 @@ impl FixtureOwner {
         lock.lock_shared().expect("the tests' owner lease");
         fs::write(root.path().join("owner.json"), SCRATCH_OWNER)
             .expect("the released fixture marker");
-        Self {
-            root,
-            lock: Some(lock),
-        }
-    }
-}
-
-impl Drop for FixtureOwner {
-    fn drop(&mut self) {
-        drop(self.lock.take());
+        Self { root, _lease: lock }
     }
 }
 

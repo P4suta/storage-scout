@@ -261,7 +261,7 @@ mod tests {
             ))
             .unwrap();
         let found = report.candidates.first().unwrap();
-        assert_eq!(found.path(), target);
+        assert_eq!(found.path(), std::fs::canonicalize(&target).unwrap());
         let mandate = Mandate::default();
         let terms = Terms {
             mandate: &mandate,

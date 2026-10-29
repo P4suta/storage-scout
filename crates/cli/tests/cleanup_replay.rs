@@ -144,6 +144,7 @@ fn replay(trace: Trace, operations: &mut BTreeSet<Operation>) {
         match state.operation {
             Operation::Init => assert_eq!(state.phase, Phase::Empty),
             Operation::Plan => {
+                let canonical_target = fs::canonicalize(&target).unwrap();
                 let survey =
                     Scout::with(testkit::open_protection()).confined(vec![testkit::ceiling()]);
                 let report = survey
@@ -152,7 +153,7 @@ fn replay(trace: Trace, operations: &mut BTreeSet<Operation>) {
                 let candidates = report
                     .candidates
                     .iter()
-                    .filter(|found| found.path() == target)
+                    .filter(|found| found.path() == canonical_target.as_path())
                     .cloned()
                     .collect::<Vec<_>>();
                 assert_eq!(candidates.len(), 1);
