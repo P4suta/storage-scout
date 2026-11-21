@@ -2,6 +2,6 @@
   "name": "mise-npm-install",
   "private": true,
   "dependencies": {
-    "@informalsystems/quint": "0.32.0"
+    "@informalsystems/quint": "0.33.1"
   }
 }
