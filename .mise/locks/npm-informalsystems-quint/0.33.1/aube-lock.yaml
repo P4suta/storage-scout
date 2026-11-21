@@ -9,13 +9,13 @@ importers:
   .:
     dependencies:
       '@informalsystems/quint':
-        specifier: 0.32.0
-        version: 0.32.0
+        specifier: 0.33.1
+        version: 0.33.1
 
 packages:
 
-  '@grpc/grpc-js@1.14.6':
-    resolution: {integrity: sha512-SgC/B3/VZ8lTyOZ4Cwk6f1skWhmkNAaVfiX90qd5u1rRXGKk1//8FTUEN9GvOUq7rfWIqAYkA3CoyumYVpOS6g==}
+  '@grpc/grpc-js@1.14.7':
+    resolution: {integrity: sha512-W4W/fcBMGRVtG6dW2c7cw2mnpS3hvbBd+oQXjh2iYFTZDk1JJmcNqkM5KSaPubQpamlUUurrlb7G1s9NJeERmQ==}
     engines: {node: '>=12.10.0'}
 
   '@grpc/proto-loader@0.7.15':
@@ -28,8 +28,8 @@ packages:
     engines: {node: '>=6'}
     hasBin: true
 
-  '@informalsystems/quint@0.32.0':
-    resolution: {integrity: sha512-9Yoji7DU6moRm1ofDaN+ftdxNcEGciiGbm7eN4MjlcCbfv7/Y/zchadcXXRmMZmN9oTPXUk9GmhjQOhADJsiSQ==}
+  '@informalsystems/quint@0.33.1':
+    resolution: {integrity: sha512-EYsgxr9SEsumYiix6pD8jbXPiPJoNbQaUxnrLE+dSVL+B9eQHPkVjSW7CBFEoBeMhau/1n70DAQOKvgxa1pVfw==}
     engines: {node: '>=18'}
     hasBin: true
 
@@ -103,15 +103,15 @@ packages:
   '@types/lodash@4.17.27':
     resolution: {integrity: sha512-VenMRv/eKNrspX9v3H4dbmjsrnCOYdYBG3kxXKk3dG6X+urBGcj2Prww3xw1U5K4FV/mE4h5GbWd0szEKf+9ew==}
 
-  '@types/node@26.6.5':
-    resolution: {integrity: sha512-uMzsv9stDdofIZBx4UGh4Z9ZgXnGC9seRDscilBcTHAeOFk67MZg/k9bWVfO+bk4qZmG+l52hRnLwUiH2LnJTg==}
+  '@types/node@26.6.6':
+    resolution: {integrity: sha512-MzQj+8Kx3XI40OmUAE6Qoh58ZMNstNNMwn2nfd3qWsfe7nDNSqJNzes4njhz6AHwrSHOffSLwXU6yb474Q4aog==}
 
   '@types/seedrandom@3.0.8':
     resolution: {integrity: sha512-TY1eezMU2zH2ozQoAFAQFOPpvP15g+ZgSfTZt31AUUH/Rxtnz3H+A/Sv1Snw2/amp//omibc+AEkTaA8KUeOLQ==}
 
-  adm-zip@0.5.18:
-    resolution: {integrity: sha512-ufJnssQGbxzLNS1Ho9bCtX4rQKCCvoVuDLHoJyc3F9dOGDB4BkWs2Ci0kv53lqocAEQ/Cbi+I2XCsNYGqVYqng==}
-    engines: {node: '>=12.0'}
+  adm-zip@0.6.1:
+    resolution: {integrity: sha512-Xwrja8nx9e5o2N1my4DsKCeKpdrnACyr1wtbPxBDgGzKzKyE9kRtBFA8mWldI+RVlD7CBZNWY/wQ2+ydwOR6kQ==}
+    engines: {node: '>=14.0'}
 
   ansi-regex@5.0.1:
     resolution: {integrity: sha512-quJQXlTSUGL2LH9SUXo8VwsY4soanhgo6LNSm84E1LBcE8s3O0wpdiRzyR9z/ZZJMlMWv37qOOb9pdJlMUEKFQ==}
@@ -256,8 +256,8 @@ packages:
     resolution: {integrity: sha512-qpCAvRl9stuOHveKsn7HncJRvv501qIacKzQlO/+Lwxc9+0q2wLyv4Dfvt80/DPn2pqOBsJdDiogXGR9+OvwRw==}
     engines: {node: '>=8'}
 
-  tar@7.5.22:
-    resolution: {integrity: sha512-MFO/QzvtAOmJbkhOaCTvbGcFN9L9b+JunIsDwaKljSOdcLMea3NJ1k9Usz/rjdfSXTq4dfzfeS7W4p4YOAAHeA==}
+  tar@7.5.23:
+    resolution: {integrity: sha512-lkukzdoGngZHJZXxW4S/E4Fp9ghTDlyZXrQGRNoJ/LXvDKcXUTq2sg5yQe74po7Voea6n/IN09+wE/QvJMiifA==}
     engines: {node: '>=18'}
 
   undici-types@8.9.0:
@@ -296,7 +296,7 @@ packages:
 
 snapshots:
 
-  '@grpc/grpc-js@1.14.6':
+  '@grpc/grpc-js@1.14.7':
     dependencies:
       '@grpc/proto-loader': 0.8.1
       '@js-sdsl/ordered-map': 4.4.2
@@ -315,9 +315,9 @@ snapshots:
       protobufjs: 7.6.6
       yargs: 17.7.3
 
-  '@informalsystems/quint@0.32.0':
+  '@informalsystems/quint@0.33.1':
     dependencies:
-      '@grpc/grpc-js': 1.14.6
+      '@grpc/grpc-js': 1.14.7
       '@grpc/proto-loader': 0.7.15
       '@octokit/request': 8.4.1
       '@sweet-monads/either': 3.2.0
@@ -325,7 +325,7 @@ snapshots:
       '@types/line-column': 1.0.2
       '@types/lodash.clonedeep': 4.5.0
       '@types/seedrandom': 3.0.8
-      adm-zip: 0.5.18
+      adm-zip: 0.6.1
       antlr4ts: 0.5.0-alpha.4
       chalk: 4.1.2
       cli-progress: 3.12.0
@@ -336,8 +336,9 @@ snapshots:
       line-column: 1.0.2
       lodash: 4.18.1
       lodash.clonedeep: 4.5.0
+      protobufjs: 7.6.6
       seedrandom: 3.0.5
-      tar: 7.5.22
+      tar: 7.5.23
       yargs: 17.7.3
 
   '@isaacs/fs-minipass@4.0.1':
@@ -408,13 +409,13 @@ snapshots:
 
   '@types/lodash@4.17.27': {}
 
-  '@types/node@26.6.5':
+  '@types/node@26.6.6':
     dependencies:
       undici-types: 8.9.0
 
   '@types/seedrandom@3.0.8': {}
 
-  adm-zip@0.5.18: {}
+  adm-zip@0.6.1: {}
 
   ansi-regex@5.0.1: {}
 
@@ -519,7 +520,7 @@ snapshots:
       '@protobufjs/path': 1.1.2
       '@protobufjs/pool': 1.1.0
       '@protobufjs/utf8': 1.1.2
-      '@types/node': 26.6.5
+      '@types/node': 26.6.6
       long: 5.3.2
 
   require-directory@2.1.1: {}
@@ -546,7 +547,7 @@ snapshots:
     dependencies:
       has-flag: 4.0.0
 
-  tar@7.5.22:
+  tar@7.5.23:
     dependencies:
       '@isaacs/fs-minipass': 4.0.1
       chownr: 3.0.0
